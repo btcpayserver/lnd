@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"io"
 	"math"
 	"net/http"
@@ -618,7 +619,15 @@ func (r *rpcServer) Start() error {
 		return err
 	}
 	for _, restEndpoint := range cfg.RESTListeners {
-		lis, err := lncfg.TLSListenOnAddress(restEndpoint, r.tlsCfg)
+		var (
+			lis net.Listener
+			err error
+		)
+		if !cfg.DisableTLS {
+			lis, err = lncfg.TLSListenOnAddress(restEndpoint, r.tlsCfg)
+		} else {
+			lis, err = net.Listen("tcp", restEndpoint.String())
+		}
 		if err != nil {
 			ltndLog.Errorf(
 				"gRPC proxy unable to listen on %s",
