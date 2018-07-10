@@ -358,7 +358,15 @@ func lndMain() error {
 		return err
 	}
 	for _, restEndpoint := range cfg.RESTListeners {
-		lis, err := lncfg.TLSListenOnAddress(restEndpoint, tlsConf)
+		var (
+			lis net.Listener
+			err error
+		)
+		if !cfg.DisableTLS {
+			lis, err = lncfg.TLSListenOnAddress(restEndpoint, tlsConf)
+		} else {
+			lis, err = net.Listen("tcp", restEndpoint.String())
+		}
 		if err != nil {
 			ltndLog.Errorf(
 				"gRPC proxy unable to listen on %s",
