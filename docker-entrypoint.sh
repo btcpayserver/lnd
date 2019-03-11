@@ -8,6 +8,16 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
 	${LND_EXTRA_ARGS}
 	EOF
 
+    if [[ "${LND_EXTERNALIP}" ]]; then
+        # This allow to strip this parameter if LND_EXTERNALIP is not a proper domain
+        LND_EXTERNAL_HOST=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 1)
+        LND_EXTERNAL_PORT=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 2)
+        if [[ "$LND_EXTERNAL_HOST" ]] && [[ "$LND_EXTERNAL_PORT" ]]; then
+            echo "externalip=$LND_EXTERNALIP" >> "$LND_DATA/lnd.conf"
+            echo "externalip=$LND_EXTERNALIP added to $LND_DATA/lnd.conf"
+        fi
+    fi
+
     if [[ $LND_CHAIN && $LND_ENVIRONMENT ]]; then
         echo "LND_CHAIN=$LND_CHAIN"
         echo "LND_ENVIRONMENT=$LND_ENVIRONMENT"
