@@ -937,20 +937,6 @@ func loadConfig() (*config, error) {
 		}
 	}
 
-	// Ensure that we are only listening on localhost if Tor inbound support
-	// is enabled.
-	if cfg.Tor.V2 || cfg.Tor.V3 {
-		for _, addr := range cfg.Listeners {
-			if lncfg.IsLoopback(addr.String()) {
-				continue
-			}
-
-			return nil, errors.New("lnd must *only* be listening " +
-				"on localhost when running with Tor inbound " +
-				"support enabled")
-		}
-	}
-
 	// Finally, ensure that the user's color is correctly formatted,
 	// otherwise the server will not be able to start after the unlocking
 	// the wallet.
