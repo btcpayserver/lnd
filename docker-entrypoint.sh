@@ -18,6 +18,13 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         fi
     fi
 
+    if [[ "${LND_ALIAS}" ]]; then
+        # This allow to strip this parameter if LND_ALIAS is empty or null, and truncate it
+        LND_ALIAS="$(echo "$LND_ALIAS" | cut -c -32)"
+        echo "alias=$LND_ALIAS" >> "$LND_DATA/lnd.conf"
+        echo "alias=$LND_ALIAS added to $LND_DATA/lnd.conf"
+    fi
+
     if [[ $LND_CHAIN && $LND_ENVIRONMENT ]]; then
         echo "LND_CHAIN=$LND_CHAIN"
         echo "LND_ENVIRONMENT=$LND_ENVIRONMENT"
