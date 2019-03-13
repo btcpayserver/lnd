@@ -5,7 +5,13 @@ FROM golang:1.11.5-stretch as builder
 ENV GODEBUG netdns=cgo
 
 # Install dependencies and build the binaries.
-RUN apt-get -y update && apt-get -y install git make
+RUN apt-get -y update && apt-get -y install git make wget \
+    && apt-get install -qq --no-install-recommends qemu qemu-user-static qemu-user binfmt-support
+
+RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-armhf" \
+    && echo "01b54b934d5f5deb32aa4eb4b0f71d0e76324f4f0237cc262d59376bf2bdc269 /opt/tini" | sha256sum -c - \
+    && chmod +x /opt/tini
+
 ENV GOARM=7	GOARCH=arm
 WORKDIR /go/src/github.com/lightningnetwork/lnd
 COPY . .
@@ -13,29 +19,17 @@ COPY . .
 RUN make \
 &&  make install
 
-# This is a manifest image, will pull the image with the same arch as the builder machine
-FROM microsoft/dotnet:2.1.500-sdk AS dotnetbuilder
-
-RUN apt-get -y update && apt-get -y install git
-
-WORKDIR /source
-
-RUN git clone https://github.com/dgarage/NBXplorer && cd NBXplorer && git checkout de6245f0c90a07a676a2df2531bc8e553150a558
-
-# Cache some dependencies
-RUN cd NBXplorer/NBXplorer.NodeWaiter && dotnet restore && cd ..
-RUN cd NBXplorer/NBXplorer.NodeWaiter && \
-    dotnet publish --output /app/ --configuration Release
-
 # Force the builder machine to take make an arm runtime image. This is fine as long as the builder does not run any program
-FROM microsoft/dotnet:2.1.6-runtime-stretch-slim-arm32v7 as final
+FROM arm32v7/debian:stretch-slim as final
+
+COPY --from=builder /opt/tini /usr/bin/tini
+COPY --from=builder /usr/bin/qemu-arm-static /usr/bin/qemu-arm-static
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
 ENV GODEBUG netdns=cgo
-#EnableQEMU COPY qemu-arm-static /usr/bin
 # Add bash and ca-certs, for quality of life and SSL-related reasons.
-RUN apt-get -y update && apt-get install -y bash ca-certificates  && rm -rf /var/lib/apt/lists/*
+RUN apt-get -y update && apt-get install -y bash ca-certificates && rm -rf /var/lib/apt/lists/*
 
 ENV LND_DATA /data
 ENV LND_BITCOIND /deps/.bitcoin
@@ -58,9 +52,9 @@ VOLUME /data
 # Copy the binaries from the builder image.
 COPY --from=builder /go/bin/linux_arm/lncli /bin/
 COPY --from=builder /go/bin/linux_arm/lnd /bin/
-COPY --from=dotnetbuilder /app /opt/NBXplorer.NodeWaiter
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 # Specify the start command and entrypoint as the lnd daemon.
-ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["lnd"]
+ENTRYPOINT  [ "/usr/bin/tini", "-g", "--", "/docker-entrypoint.sh" ]
+CMD [ "lnd" ]
+

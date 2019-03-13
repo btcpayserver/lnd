@@ -8,6 +8,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
 	${LND_EXTRA_ARGS}
 	EOF
 
+    NBXPLORER_DATA_DIR_NAME=""
     if [[ "${LND_EXTERNALIP}" ]]; then
         # This allow to strip this parameter if LND_EXTERNALIP is not a proper domain
         LND_EXTERNAL_HOST=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 1)
@@ -43,10 +44,13 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         ENV=""
         # Make sure we use correct casing for LND_Environment
         if [[ $LND_ENVIRONMENT == "mainnet" ]]; then
+            NBXPLORER_DATA_DIR_NAME="Main"
             ENV="mainnet"
         elif [[ $LND_ENVIRONMENT == "testnet" ]]; then
+            NBXPLORER_DATA_DIR_NAME="TestNet"
             ENV="testnet"
         elif [[ $LND_ENVIRONMENT == "regtest" ]]; then
+            NBXPLORER_DATA_DIR_NAME="RegTest"
             ENV="regtest"
         else
             echo "Unknwon value for LND_ENVIRONMENT, expected mainnet, testnet or regtest"
@@ -64,6 +68,13 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         fi
     fi
 
+    if [[ "${LND_NBXPLORER_ROOT}" ]]; then
+        NBXPLORER_READY_FILE="${LND_NBXPLORER_ROOT}/${NBXPLORER_DATA_DIR_NAME}/${LND_CHAIN}_fully_synched"
+        echo "Waiting $NBXPLORER_READY_FILE to be signaled by nbxplorer..."
+        while [ ! -f "$NBXPLORER_READY_FILE" ]; do sleep 1; done
+        echo "The chain is fully synched"
+    fi
+
     ln -sfn "$LND_DATA" /root/.lnd
     ln -sfn "$LND_BITCOIND" /root/.bitcoin
     ln -sfn "$LND_LITECOIND" /root/.litecoin
@@ -73,10 +84,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         echo "LTC on testnet is not supported, let's sleep instead!"
         while true; do sleep 86400; done
     else
-        # NBXplorer.NodeWaiter.dll is a wrapper which wait the full node to be fully synced before starting LND
-        # it also correctly handle SIGINT and SIGTERM so this container can die properly if SIGKILL or SIGTERM is sent
-        exec dotnet /opt/NBXplorer.NodeWaiter/NBXplorer.NodeWaiter.dll --chains "$LND_CHAIN" --network "$LND_ENVIRONMENT" --explorerurl "$LND_EXPLORERURL" -- \
-             $@
+        exec "$@"
     fi
 else
 	exec "$@"
