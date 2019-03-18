@@ -69,8 +69,8 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         echo "Waiting $LND_HIDDENSERVICE_HOSTNAME_FILE to be created by tor..."
         while [ ! -f "$LND_HIDDENSERVICE_HOSTNAME_FILE" ]; do sleep 1; done
         HIDDENSERVICE_ONION="$(head -n 1 "$LND_HIDDENSERVICE_HOSTNAME_FILE"):${LND_PORT}"
-        echo "externalip=$HIDDENSERVICE_ONION" >> "$LIGHTNINGD_DATA/config"
-        echo "externalip=$HIDDENSERVICE_ONION added to $LIGHTNINGD_DATA/config"
+        echo "externalip=$HIDDENSERVICE_ONION" >> "$LND_DATA/lnd.conf"
+        echo "externalip=$HIDDENSERVICE_ONION added to $LND_DATA/lnd.conf"
     fi
 
     ln -sfn "$LND_DATA" /root/.lnd
