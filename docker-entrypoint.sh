@@ -10,13 +10,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
 	EOF
 
     if [[ "${LND_EXTERNALIP}" ]]; then
-        # This allow to strip this parameter if LND_EXTERNALIP is not a proper domain
-        LND_EXTERNAL_HOST=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 1)
-        LND_EXTERNAL_PORT=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 2)
-        if [[ "$LND_EXTERNAL_HOST" ]]; then
-            echo "externalip=$LND_EXTERNALIP" >> "$LND_DATA/lnd.conf"
-            echo "externalip=$LND_EXTERNALIP added to $LND_DATA/lnd.conf"
-        fi
+        echo "externalip=$LND_EXTERNALIP" >> "$LND_DATA/lnd.conf"
     fi
 
     if [[ "${LND_ALIAS}" ]]; then
