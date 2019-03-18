@@ -33,6 +33,7 @@ ENV LND_DATA /data
 ENV LND_BITCOIND /deps/.bitcoin
 ENV LND_LITECOIND /deps/.litecoin
 ENV LND_BTCD /deps/.btcd
+ENV LND_PORT 9735
 
 RUN mkdir "$LND_DATA" && \
     mkdir "/deps" && \
@@ -53,5 +54,6 @@ COPY --from=builder /go/bin/lnd /bin/
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 # Specify the start command and entrypoint as the lnd daemon.
+EXPOSE 9735
 ENTRYPOINT  [ "/sbin/tini", "-g", "--", "/docker-entrypoint.sh" ]
 CMD [ "lnd" ]

@@ -6,14 +6,14 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
 
 	cat <<-EOF > "$LND_DATA/lnd.conf"
 	${LND_EXTRA_ARGS}
+    listen=0.0.0.0:${LND_PORT}
 	EOF
 
-    NBXPLORER_DATA_DIR_NAME=""
     if [[ "${LND_EXTERNALIP}" ]]; then
         # This allow to strip this parameter if LND_EXTERNALIP is not a proper domain
         LND_EXTERNAL_HOST=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 1)
         LND_EXTERNAL_PORT=$(echo ${LND_EXTERNALIP} | cut -d ':' -f 2)
-        if [[ "$LND_EXTERNAL_HOST" ]] && [[ "$LND_EXTERNAL_PORT" ]]; then
+        if [[ "$LND_EXTERNAL_HOST" ]]; then
             echo "externalip=$LND_EXTERNALIP" >> "$LND_DATA/lnd.conf"
             echo "externalip=$LND_EXTERNALIP added to $LND_DATA/lnd.conf"
         fi
@@ -44,13 +44,10 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         ENV=""
         # Make sure we use correct casing for LND_Environment
         if [[ $LND_ENVIRONMENT == "mainnet" ]]; then
-            NBXPLORER_DATA_DIR_NAME="Main"
             ENV="mainnet"
         elif [[ $LND_ENVIRONMENT == "testnet" ]]; then
-            NBXPLORER_DATA_DIR_NAME="TestNet"
             ENV="testnet"
         elif [[ $LND_ENVIRONMENT == "regtest" ]]; then
-            NBXPLORER_DATA_DIR_NAME="RegTest"
             ENV="regtest"
         else
             echo "Unknwon value for LND_ENVIRONMENT, expected mainnet, testnet or regtest"
@@ -68,11 +65,18 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         fi
     fi
 
-    if [[ "${LND_NBXPLORER_ROOT}" ]]; then
-        NBXPLORER_READY_FILE="${LND_NBXPLORER_ROOT}/${NBXPLORER_DATA_DIR_NAME}/${LND_CHAIN}_fully_synched"
-        echo "Waiting $NBXPLORER_READY_FILE to be signaled by nbxplorer..."
-        while [ ! -f "$NBXPLORER_READY_FILE" ]; do sleep 1; done
+    if [[ "${LND_READY_FILE}" ]]; then
+        echo "Waiting $LND_READY_FILE to be created..."
+        while [ ! -f "$LND_READY_FILE" ]; do sleep 1; done
         echo "The chain is fully synched"
+    fi
+
+    if [[ "${LND_HIDDENSERVICE_HOSTNAME_FILE}" ]]; then
+        echo "Waiting $LND_HIDDENSERVICE_HOSTNAME_FILE to be created by tor..."
+        while [ ! -f "$LND_HIDDENSERVICE_HOSTNAME_FILE" ]; do sleep 1; done
+        HIDDENSERVICE_ONION="$(head -n 1 "$LND_HIDDENSERVICE_HOSTNAME_FILE")"
+        echo "externalip=$HIDDENSERVICE_ONION" >> "$LIGHTNINGD_DATA/config"
+        echo "externalip=$HIDDENSERVICE_ONION added to $LIGHTNINGD_DATA/config"
     fi
 
     ln -sfn "$LND_DATA" /root/.lnd
