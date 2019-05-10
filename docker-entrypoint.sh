@@ -78,12 +78,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     ln -sfn "$LND_LITECOIND" /root/.litecoin
     ln -sfn "$LND_BTCD" /root/.btcd
 
-    if [[ "$LND_CHAIN" == "ltc" && "$LND_ENVIRONMENT" == "testnet" ]]; then
-        echo "LTC on testnet is not supported, let's sleep instead!"
-        while true; do sleep 86400; done
-    else
-        exec "$@"
-    fi
+    exec "$@"
 else
 	exec "$@"
 fi
