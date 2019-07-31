@@ -50,7 +50,6 @@ VOLUME /data
 
 # Copy the binaries from the builder image.
 COPY --from=builder /go/bin/lncli /bin/
-COPY --from=builder /go/bin/lnwallet /bin/
 COPY --from=builder /go/bin/lnd /bin/
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh

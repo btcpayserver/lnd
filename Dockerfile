@@ -27,7 +27,6 @@ RUN apk --no-cache add \
 
 # Copy the binaries from the builder image.
 COPY --from=builder /go/bin/lncli /bin/
-COPY --from=builder /go/bin/lnwallet /bin/
 COPY --from=builder /go/bin/lnd /bin/
 
 # Expose lnd ports (p2p, rpc).
