@@ -53,6 +53,11 @@ COPY --from=builder /go/bin/lncli /bin/
 COPY --from=builder /go/bin/lnd /bin/
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
+
+# Copy script for automatic init and unlock of lnd, need jq for parsing JSON and curl for LND Rest
+RUN apk --no-cache add jq curl
+COPY docker-initunlocklnd.sh /docker-initunlocklnd.sh
+
 # Specify the start command and entrypoint as the lnd daemon.
 EXPOSE 9735
 ENTRYPOINT  [ "/sbin/tini", "-g", "--", "/docker-entrypoint.sh" ]
