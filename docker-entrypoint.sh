@@ -84,7 +84,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
     else
     # else hit up the auto initializer and unlocker to do it's work
-        nohup ./docker-initunlocklnd.sh $NETWORK $ENV &
+        ./docker-initunlocklnd.sh $NETWORK $ENV &
     fi
 
     ln -sfn "$LND_DATA" /root/.lnd
