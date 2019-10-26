@@ -57,7 +57,7 @@ COPY --from=builder /go/bin/linux_arm64/lnd /bin/
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 
 # Copy script for automatic init and unlock of lnd, need jq for parsing JSON and curl for LND Rest
-RUN apt-get -y update && apt-get -y install jq curl
+RUN apt-get -y update && apt-get -y install jq curl && rm -rf /var/lib/apt/lists/*
 COPY docker-initunlocklnd.sh /docker-initunlocklnd.sh
 
 # Specify the start command and entrypoint as the lnd daemon.
