@@ -14,7 +14,8 @@ GOACC_BIN := $(GO_BIN)/go-acc
 
 BTCD_DIR :=${GOPATH}/src/$(BTCD_PKG)
 
-COMMIT := $(shell git describe --abbrev=40 --dirty)
+COMMIT_INFO := $(shell git describe --abbrev=40 --dirty)
+COMMIT := $(subst -dirty,-fresh-btcpay,$(COMMIT_INFO))
 LDFLAGS := -ldflags "-X $(PKG)/build.Commit=$(COMMIT)"
 
 BTCD_COMMIT := $(shell cat go.mod | \
