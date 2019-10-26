@@ -1,20 +1,17 @@
 #!/bin/bash
 
-CA_CERT="$LND_DATA/tls.cert"
-LND_WALLET_DIR="$LND_DATA/data/chain/$1/$2/"
-WALLET_FILE="$LND_WALLET_DIR/wallet.db"
-LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
-MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
-MACAROON_HEADER="r0ckstar:dev"
-if [ -f "$MACAROON_FILE" ]; then
-    MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -ps -u -c 1000 "$MACAROON_FILE")"
-fi 
-
 echo "[lnd_unlock] Waiting 2 seconds for lnd..."
 sleep 2
 
 # ensure that lnd is up and running before proceeding
-while : ; do
+while : ; do    
+    CA_CERT="$LND_DATA/tls.cert"
+    MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
+    MACAROON_HEADER="r0ckstar:dev"
+    if [ -f "$MACAROON_FILE" ]; then
+        MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -ps -u -c 1000 "$MACAROON_FILE")"
+    fi
+
     STATUS_CODE=$(curl -s --cacert "$CA_CERT" -H $MACAROON_HEADER -o /dev/null -w "%{http_code}" https://localhost:8080/v1/getinfo)
     # if lnd is running it'll either return 200 if unlocked (noseedbackup=1) or 404 if it needs initialization/unlock
     if [ "$STATUS_CODE"=="200" ] || [ "$STATUS_CODE"=="404" ] ; then
@@ -24,6 +21,17 @@ while : ; do
         sleep 2
     fi
 done
+
+# read variables after we ensured that lnd is up
+CA_CERT="$LND_DATA/tls.cert"
+LND_WALLET_DIR="$LND_DATA/data/chain/$1/$2/"
+WALLET_FILE="$LND_WALLET_DIR/wallet.db"
+LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
+MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
+MACAROON_HEADER="r0ckstar:dev"
+if [ -f "$MACAROON_FILE" ]; then
+    MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -ps -u -c 1000 "$MACAROON_FILE")"
+fi
 
 
 if [ -f "$WALLET_FILE" ]; then
