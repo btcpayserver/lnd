@@ -57,7 +57,7 @@ else
     CIPHER_ARRAY_EXTRACTED=$(echo $GENSEED_RESP | jq -c -r '.cipher_seed_mnemonic')
 
     # using static default password per feedback, randomly generated password would still be stored in cleartext
-    WALLETPASS="hello"
+    WALLETPASS="hellorockstar"
 
     # save all the the data to unlock file we'll use for future unlocks
     RESULTJSON=$(echo '{"wallet_password":"'$WALLETPASS'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}')
