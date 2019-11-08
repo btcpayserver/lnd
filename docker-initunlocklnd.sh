@@ -7,10 +7,11 @@ sleep 2
 # ensure that lnd is up and running before proceeding
 while
     CA_CERT="$LND_DATA/tls.cert"
+    LND_WALLET_DIR="$LND_DATA/data/chain/$1/$2/"
     MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
     MACAROON_HEADER="r0ckstar:dev"
     if [ -f "$MACAROON_FILE" ]; then
-        MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -ps -u -c 1000 "$MACAROON_FILE")"
+        MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -p -c 10000 "$MACAROON_FILE" | tr -d ' ')"
     fi
 
     STATUS_CODE=$(curl -s --cacert "$CA_CERT" -H $MACAROON_HEADER -o /dev/null -w "%{http_code}" https://localhost:8080/v1/getinfo)
@@ -26,15 +27,14 @@ do true; done
 # read variables after we ensured that lnd is up
 CA_CERT="$LND_DATA/tls.cert"
 LND_WALLET_DIR="$LND_DATA/data/chain/$1/$2/"
-WALLET_FILE="$LND_WALLET_DIR/wallet.db"
-LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
 MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
 MACAROON_HEADER="r0ckstar:dev"
 if [ -f "$MACAROON_FILE" ]; then
-    MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -ps -u -c 1000 "$MACAROON_FILE")"
+    MACAROON_HEADER="Grpc-Metadata-macaroon:$(xxd -p -c 10000 "$MACAROON_FILE" | tr -d ' ')"
 fi
 
-
+WALLET_FILE="$LND_WALLET_DIR/wallet.db"
+LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
 if [ -f "$WALLET_FILE" ]; then
     if [ ! -f "$LNDUNLOCK_FILE" ]; then
         echo "[lnd_unlock] WARNING: UNLOCK FILE DOESN'T EXIST! MIGRATE LEGACY INSTALLATION TO NEW VERSION ASAP"
