@@ -5,7 +5,7 @@ echo "[lnd_unlock] Waiting 2 seconds for lnd..."
 sleep 2
 
 # ensure that lnd is up and running before proceeding
-while : ; do    
+while
     CA_CERT="$LND_DATA/tls.cert"
     MACAROON_FILE="$LND_WALLET_DIR/admin.macaroon"
     MACAROON_HEADER="r0ckstar:dev"
@@ -21,7 +21,7 @@ while : ; do
         echo "[lnd_unlock] LND still didn't start, got $STATUS_CODE status code back... waiting another 2 seconds..."
         sleep 2
     fi
-done
+do true; done
 
 # read variables after we ensured that lnd is up
 CA_CERT="$LND_DATA/tls.cert"
