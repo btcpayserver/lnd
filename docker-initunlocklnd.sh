@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 echo "[lnd_unlock] Waiting 2 seconds for lnd..."
 sleep 2
@@ -14,7 +15,7 @@ while : ; do
 
     STATUS_CODE=$(curl -s --cacert "$CA_CERT" -H $MACAROON_HEADER -o /dev/null -w "%{http_code}" https://localhost:8080/v1/getinfo)
     # if lnd is running it'll either return 200 if unlocked (noseedbackup=1) or 404 if it needs initialization/unlock
-    if [ "$STATUS_CODE"=="200" ] || [ "$STATUS_CODE"=="404" ] ; then
+    if [ "$STATUS_CODE" == "200" ] || [ "$STATUS_CODE" == "404" ] ; then
         break
     else    
         echo "[lnd_unlock] LND still didn't start, got $STATUS_CODE status code back... waiting another 2 seconds..."
@@ -42,7 +43,7 @@ if [ -f "$WALLET_FILE" ]; then
         echo "[lnd_unlock] Wallet and Unlock files are present... parsing wallet password and unlocking lnd"
 
         # parse wallet password from unlock file
-        WALLETPASS=$(cat $LNDUNLOCK_FILE | jq -c -r '.wallet_password')
+        WALLETPASS=$(jq -c -r '.wallet_password' $LNDUNLOCK_FILE)
         WALLETPASS_BASE64=$(echo $WALLETPASS|base64|tr -d '\n\r')
 
         # execute unlockwallet call
@@ -60,13 +61,13 @@ else
     WALLETPASS="hellorockstar"
 
     # save all the the data to unlock file we'll use for future unlocks
-    RESULTJSON=$(echo '{"wallet_password":"'$WALLETPASS'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}')
+    RESULTJSON='{"wallet_password":"'$WALLETPASS'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
     mkdir -p $LND_WALLET_DIR
     echo $RESULTJSON > $LNDUNLOCK_FILE
 
     # prepare initwallet call json with wallet password and chipher seed mnemonic
     WALLETPASS_BASE64=$(echo $WALLETPASS|base64|tr -d '\n\r')
-    INITWALLET_REQ=$(echo '{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}')
+    INITWALLET_REQ='{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
 
     # execute initwallet call
     curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" https://localhost:8080/v1/initwallet
