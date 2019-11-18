@@ -44,6 +44,8 @@ if [ -f "$WALLET_FILE" ]; then
 
         # parse wallet password from unlock file
         WALLETPASS=$(jq -c -r '.wallet_password' $LNDUNLOCK_FILE)
+        # Caused by nicolas but who was deleting the password from the file in btcpayserver
+        [ "$WALLETPASS" == "" ] && WALLETPASS="hellorockstar"
         WALLETPASS_BASE64=$(echo $WALLETPASS|base64|tr -d '\n\r')
 
         # execute unlockwallet call
