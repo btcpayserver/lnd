@@ -21,6 +21,9 @@ ANDROID_BUILD := $(ANDROID_BUILD_DIR)/Lndmobile.aar
 
 COMMIT := $(shell git describe --tags --dirty)
 
+COMMIT := $(subst -dirty,-fresh-btcpay,$(COMMIT))
+LDFLAGS := -ldflags "-X $(PKG)/build.Commit=$(COMMIT)"
+
 # Determine the minor version of the active Go installation.
 ACTIVE_GO_VERSION := $(shell $(GOCC) version | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
 ACTIVE_GO_VERSION_MINOR := $(shell echo $(ACTIVE_GO_VERSION) | cut -d. -f2)
