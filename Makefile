@@ -21,6 +21,9 @@ ANDROID_BUILD := $(ANDROID_BUILD_DIR)/Lndmobile.aar
 
 COMMIT := $(shell git describe --tags --dirty)
 
+COMMIT := $(subst -dirty,-fresh-btcpay,$(COMMIT))
+LDFLAGS := -ldflags "-X $(PKG)/build.Commit=$(COMMIT)"
+
 GOBUILD := go build -v
 GOINSTALL := go install -v
 GOTEST := go test
