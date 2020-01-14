@@ -35,7 +35,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         elif [[ $LND_CHAIN == "ltc" ]]; then
             NETWORK="litecoin"
         else
-            echo "Unknwon value for LND_CHAIN, expected btc or ltc"
+            echo "Unknown value for LND_CHAIN, expected btc or ltc"
         fi
 
         ENV=""
@@ -47,7 +47,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         elif [[ $LND_ENVIRONMENT == "regtest" ]]; then
             ENV="regtest"
         else
-            echo "Unknwon value for LND_ENVIRONMENT, expected mainnet, testnet or regtest"
+            echo "Unknown value for LND_ENVIRONMENT, expected mainnet, testnet or regtest"
         fi
         shopt -u nocasematch
 
