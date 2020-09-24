@@ -3,12 +3,12 @@ package lnd
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"runtime"
 	"sort"
@@ -46,7 +46,6 @@ import (
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/labels"
-	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
@@ -510,9 +509,10 @@ type rpcServer struct {
 	// restProxyDest is the address to forward REST requests to.
 	restProxyDest string
 
-	// tlsCfg is the TLS config that allows the REST server proxy to
-	// connect to the main gRPC server to proxy all incoming requests.
-	tlsCfg *tls.Config
+	// restListen is a function closure that allows the REST server proxy to
+	// connect to the main gRPC server to proxy all incoming requests,
+	// applying the current TLS configuration, if any.
+	restListen func(net.Addr) (net.Listener, error)
 
 	// routerBackend contains the backend implementation of the router
 	// rpc sub server.
@@ -549,7 +549,8 @@ func newRPCServer(cfg *Config, s *server, macService *macaroons.Service,
 	subServerCgs *subRPCServerConfigs, serverOpts []grpc.ServerOption,
 	restDialOpts []grpc.DialOption, restProxyDest string,
 	atpl *autopilot.Manager, invoiceRegistry *invoices.InvoiceRegistry,
-	tower *watchtower.Standalone, tlsCfg *tls.Config,
+	tower *watchtower.Standalone,
+	restListen func(net.Addr) (net.Listener, error),
 	getListeners rpcListeners,
 	chanPredicate *chanacceptor.ChainedAcceptor) (*rpcServer, error) {
 
@@ -752,7 +753,7 @@ func newRPCServer(cfg *Config, s *server, macService *macaroons.Service,
 		listenerCleanUp: []func(){cleanup},
 		restProxyDest:   restProxyDest,
 		subServers:      subServers,
-		tlsCfg:          tlsCfg,
+		restListen:      restListen,
 		grpcServer:      grpcServer,
 		server:          s,
 		routerBackend:   routerBackend,
@@ -899,7 +900,7 @@ func (r *rpcServer) Start() error {
 	// Now spin up a network listener for each requested port and start a
 	// goroutine that serves REST with the created mux there.
 	for _, restEndpoint := range r.cfg.RESTListeners {
-		lis, err := lncfg.TLSListenOnAddress(restEndpoint, r.tlsCfg)
+		lis, err := r.restListen(restEndpoint)
 		if err != nil {
 			ltndLog.Errorf("gRPC proxy unable to listen on %s",
 				restEndpoint)
