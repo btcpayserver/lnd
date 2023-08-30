@@ -15,7 +15,7 @@ ENV GODEBUG netdns=cgo
 # Install dependencies.
 RUN apk add --no-cache --update alpine-sdk \
     git \
-    make 
+    make
 
 # Copy in the local repository to build from.
 COPY . /go/src/github.com/lightningnetwork/lnd
@@ -23,7 +23,7 @@ COPY . /go/src/github.com/lightningnetwork/lnd
 #  Install/build lnd.
 RUN cd /go/src/github.com/lightningnetwork/lnd \
 &&  make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc peersrpc"
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc peersrpc watchtowerrpc"
 
 # Start a new, final image to reduce size.
 FROM alpine as final

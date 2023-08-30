@@ -14,7 +14,7 @@ WORKDIR /go/src/github.com/lightningnetwork/lnd
 COPY . .
 
 RUN make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc"
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc"
 
 
 # Build loop binary
