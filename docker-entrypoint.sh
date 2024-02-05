@@ -87,7 +87,9 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     fi
 
     # hit up the auto initializer and unlocker on separate process to do it's work
-    ./docker-initunlocklnd.sh $NETWORK $ENV &
+    if [[ "${LND_SKIP_INITUNLOCK}" != "true" ]]; then
+        ./docker-initunlocklnd.sh $NETWORK $ENV &
+    fi
 
     ln -sfn "$LND_DATA" /root/.lnd
     ln -sfn "$LND_BITCOIND" /root/.bitcoin
