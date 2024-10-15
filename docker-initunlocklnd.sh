@@ -79,8 +79,6 @@ if [ -f "$WALLET_FILE" ]; then
                 $LND_REST_LISTEN_HOST/v1/changepassword)
 
             # make sure the log end with a newline.
-            echo $change_password_response
-
             echo -n "[initunlocklnd] Changed wallet password removing the \"line feed\" character at the end. "
             echo "The password can be found in $LNDUNLOCK_FILE"
         else
