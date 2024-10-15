@@ -12,7 +12,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
@@ -262,6 +261,9 @@ type TxPublisherConfig struct {
 // until the tx is confirmed or the fee rate reaches the maximum fee rate
 // specified by the caller.
 type TxPublisher struct {
+	started atomic.Bool
+	stopped atomic.Bool
+
 	wg sync.WaitGroup
 
 	// cfg specifies the configuration of the TxPublisher.
@@ -313,10 +315,8 @@ func (t *TxPublisher) isNeutrinoBackend() bool {
 //
 // NOTE: part of the Bumper interface.
 func (t *TxPublisher) Broadcast(req *BumpRequest) (<-chan *BumpResult, error) {
-	log.Tracef("Received broadcast request: %s", newLogClosure(
-		func() string {
-			return spew.Sdump(req)
-		})())
+	log.Tracef("Received broadcast request: %s", lnutils.SpewLogClosure(
+		req))
 
 	// Attempt an initial broadcast which is guaranteed to comply with the
 	// RBF rules.
@@ -427,7 +427,7 @@ func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
 			fallthrough
 
 		// We are not paying enough fees so we increase it.
-		case errors.Is(err, rpcclient.ErrInsufficientFee):
+		case errors.Is(err, chain.ErrInsufficientFee):
 			increased := false
 
 			// Keep calling the fee function until the fee rate is
@@ -669,7 +669,10 @@ type monitorRecord struct {
 // off the monitor loop.
 func (t *TxPublisher) Start() error {
 	log.Info("TxPublisher starting...")
-	defer log.Debugf("TxPublisher started")
+
+	if t.started.Swap(true) {
+		return fmt.Errorf("TxPublisher started more than once")
+	}
 
 	blockEvent, err := t.cfg.Notifier.RegisterBlockEpochNtfn(nil)
 	if err != nil {
@@ -679,17 +682,25 @@ func (t *TxPublisher) Start() error {
 	t.wg.Add(1)
 	go t.monitor(blockEvent)
 
+	log.Debugf("TxPublisher started")
+
 	return nil
 }
 
 // Stop stops the publisher and waits for the monitor loop to exit.
-func (t *TxPublisher) Stop() {
+func (t *TxPublisher) Stop() error {
 	log.Info("TxPublisher stopping...")
-	defer log.Debugf("TxPublisher stopped")
+
+	if t.stopped.Swap(true) {
+		return fmt.Errorf("TxPublisher stopped more than once")
+	}
 
 	close(t.quit)
-
 	t.wg.Wait()
+
+	log.Debug("TxPublisher stopped")
+
+	return nil
 }
 
 // monitor is the main loop driven by new blocks. Whevenr a new block arrives,
@@ -934,7 +945,7 @@ func (t *TxPublisher) createAndPublishTx(requestID uint64,
 	// - if the deadline is close, we expect the fee function to give us a
 	//   higher fee rate. If the fee rate cannot satisfy the RBF rules, it
 	//   means the budget is not enough.
-	if errors.Is(err, rpcclient.ErrInsufficientFee) ||
+	if errors.Is(err, chain.ErrInsufficientFee) ||
 		errors.Is(err, lnwallet.ErrMempoolFee) {
 
 		log.Debugf("Failed to bump tx %v: %v", oldTx.TxHash(), err)
@@ -989,7 +1000,7 @@ func (t *TxPublisher) createAndPublishTx(requestID uint64,
 	//
 	// NOTE: we may get this error if we've bypassed the mempool check,
 	// which means we are suing neutrino backend.
-	if errors.Is(result.Err, rpcclient.ErrInsufficientFee) ||
+	if errors.Is(result.Err, chain.ErrInsufficientFee) ||
 		errors.Is(result.Err, lnwallet.ErrMempoolFee) {
 
 		log.Debugf("Failed to bump tx %v: %v", oldTx.TxHash(), err)

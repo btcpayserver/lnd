@@ -38,6 +38,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/peersrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
@@ -167,6 +168,17 @@ const (
 	defaultRSTimeout  = time.Second * 1
 	defaultRSBackoff  = time.Second * 30
 	defaultRSAttempts = 1
+
+	// Set defaults for a health check which ensures that the leader
+	// election is functioning correctly. Although this check is off by
+	// default (as etcd leader election is only used in a clustered setup),
+	// we still set the default values so that the health check can be
+	// easily enabled with sane defaults. Note that by default we only run
+	// this check once, as it is critical for the node's operation.
+	defaultLeaderCheckInterval = time.Minute
+	defaultLeaderCheckTimeout  = time.Second * 5
+	defaultLeaderCheckBackoff  = time.Second * 5
+	defaultLeaderCheckAttempts = 1
 
 	// defaultRemoteMaxHtlcs specifies the default limit for maximum
 	// concurrent HTLCs the remote party may add to commitment transactions.
@@ -440,7 +452,7 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	DustThreshold uint64 `long:"dust-threshold" description:"Sets the dust sum threshold in satoshis for a channel after which dust HTLC's will be failed."`
+	MaxFeeExposure uint64 `long:"dust-threshold" description:"Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed."`
 
 	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
@@ -671,6 +683,12 @@ func DefaultConfig() Config {
 				Attempts: defaultRSAttempts,
 				Backoff:  defaultRSBackoff,
 			},
+			LeaderCheck: &lncfg.CheckConfig{
+				Interval: defaultLeaderCheckInterval,
+				Timeout:  defaultLeaderCheckTimeout,
+				Attempts: defaultLeaderCheckAttempts,
+				Backoff:  defaultLeaderCheckBackoff,
+			},
 		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
@@ -680,10 +698,19 @@ func DefaultConfig() Config {
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
 		},
+		Routing: &lncfg.Routing{
+			BlindedPaths: lncfg.BlindedPaths{
+				MinNumRealHops:           lncfg.DefaultMinNumRealBlindedPathHops,
+				NumHops:                  lncfg.DefaultNumBlindedPathHops,
+				MaxNumPaths:              lncfg.DefaultMaxNumBlindedPaths,
+				PolicyIncreaseMultiplier: lncfg.DefaultBlindedPathPolicyIncreaseMultiplier,
+				PolicyDecreaseMultiplier: lncfg.DefaultBlindedPathPolicyDecreaseMultiplier,
+			},
+		},
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		DustThreshold:             uint64(htlcswitch.DefaultDustThreshold.ToSatoshis()),
+		MaxFeeExposure:            uint64(htlcswitch.DefaultMaxFeeExposure.ToSatoshis()),
 		LogWriter:                 build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
@@ -771,7 +798,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 		// If it's a parsing related error, then we'll return
 		// immediately, otherwise we can proceed as possibly the config
 		// file doesn't exist which is OK.
-		if _, ok := err.(*flags.IniError); ok {
+		if lnutils.ErrorAs[*flags.IniError](err) ||
+			lnutils.ErrorAs[*flags.Error](err) {
+
 			return nil, err
 		}
 
@@ -1653,18 +1682,6 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
 
-	// Log a warning if our expiry delta is not greater than our incoming
-	// broadcast delta. We do not fail here because this value may be set
-	// to zero to intentionally keep lnd's behavior unchanged from when we
-	// didn't auto-cancel these invoices.
-	if cfg.Invoices.HoldExpiryDelta <= lncfg.DefaultIncomingBroadcastDelta {
-		ltndLog.Warnf("Invoice hold expiry delta: %v <= incoming "+
-			"delta: %v, accepted hold invoices will force close "+
-			"channels if they are not canceled manually",
-			cfg.Invoices.HoldExpiryDelta,
-			lncfg.DefaultIncomingBroadcastDelta)
-	}
-
 	// If the experimental protocol options specify any protocol messages
 	// that we want to handle as custom messages, set them now.
 	customMsg := cfg.ProtocolOptions.CustomMessageOverrides()
@@ -1687,6 +1704,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.RemoteSigner,
 		cfg.Sweeper,
 		cfg.Htlcswitch,
+		cfg.Invoices,
+		cfg.Routing,
 	)
 	if err != nil {
 		return nil, err

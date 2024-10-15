@@ -17,10 +17,53 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
+// DecodeOption is a type that can be used to supply functional options to the
+// Decode function.
+type DecodeOption func(*decodeOptions)
+
+// WithKnownFeatureBits is a functional option that overwrites the set of
+// known feature bits. If not set, then LND's lnwire.Features variable will be
+// used by default.
+func WithKnownFeatureBits(features map[lnwire.FeatureBit]string) DecodeOption {
+	return func(options *decodeOptions) {
+		options.knownFeatureBits = features
+	}
+}
+
+// WithErrorOnUnknownFeatureBit is a functional option that will cause the
+// Decode function to return an error if the decoded invoice contains an unknown
+// feature bit.
+func WithErrorOnUnknownFeatureBit() DecodeOption {
+	return func(options *decodeOptions) {
+		options.errorOnUnknownFeature = true
+	}
+}
+
+// decodeOptions holds the set of Decode options.
+type decodeOptions struct {
+	knownFeatureBits      map[lnwire.FeatureBit]string
+	errorOnUnknownFeature bool
+}
+
+// newDecodeOptions constructs the default decodeOptions struct.
+func newDecodeOptions() *decodeOptions {
+	return &decodeOptions{
+		knownFeatureBits:      lnwire.Features,
+		errorOnUnknownFeature: false,
+	}
+}
+
 // Decode parses the provided encoded invoice and returns a decoded Invoice if
 // it is valid by BOLT-0011 and matches the provided active network.
-func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
-	decodedInvoice := Invoice{}
+func Decode(invoice string, net *chaincfg.Params, opts ...DecodeOption) (
+	*Invoice, error) {
+
+	options := newDecodeOptions()
+	for _, o := range opts {
+		o(options)
+	}
+
+	var decodedInvoice Invoice
 
 	// Before bech32 decoding the invoice, make sure that it is not too large.
 	// This is done as an anti-DoS measure since bech32 decoding is expensive.
@@ -134,7 +177,7 @@ func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
 	// If no feature vector was decoded, populate an empty one.
 	if decodedInvoice.Features == nil {
 		decodedInvoice.Features = lnwire.NewFeatureVector(
-			nil, lnwire.Features,
+			nil, options.knownFeatureBits,
 		)
 	}
 
@@ -142,6 +185,24 @@ func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
 	// fields set.
 	if err := validateInvoice(&decodedInvoice); err != nil {
 		return nil, err
+	}
+
+	if options.errorOnUnknownFeature {
+		// Make sure that we understand all the required feature bits
+		// in the invoice.
+		unknownFeatureBits := decodedInvoice.Features.
+			UnknownRequiredFeatures()
+
+		if len(unknownFeatureBits) > 0 {
+			errStr := fmt.Sprintf("invoice contains " +
+				"unknown feature bits:")
+
+			for _, bit := range unknownFeatureBits {
+				errStr += fmt.Sprintf(" %d,", bit)
+			}
+
+			return nil, fmt.Errorf(strings.TrimRight(errStr, ","))
+		}
 	}
 
 	return &decodedInvoice, nil
@@ -215,6 +276,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.PaymentHash, err = parse32Bytes(base32Data)
+
 		case fieldTypeS:
 			if invoice.PaymentAddr != nil {
 				// We skip the field if we have already seen a
@@ -223,6 +285,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.PaymentAddr, err = parse32Bytes(base32Data)
+
 		case fieldTypeD:
 			if invoice.Description != nil {
 				// We skip the field if we have already seen a
@@ -231,6 +294,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.Description, err = parseDescription(base32Data)
+
 		case fieldTypeM:
 			if invoice.Metadata != nil {
 				// We skip the field if we have already seen a
@@ -248,6 +312,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.Destination, err = parseDestination(base32Data)
+
 		case fieldTypeH:
 			if invoice.DescriptionHash != nil {
 				// We skip the field if we have already seen a
@@ -256,6 +321,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.DescriptionHash, err = parse32Bytes(base32Data)
+
 		case fieldTypeX:
 			if invoice.expiry != nil {
 				// We skip the field if we have already seen a
@@ -264,6 +330,7 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.expiry, err = parseExpiry(base32Data)
+
 		case fieldTypeC:
 			if invoice.minFinalCLTVExpiry != nil {
 				// We skip the field if we have already seen a
@@ -271,7 +338,9 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 				continue
 			}
 
-			invoice.minFinalCLTVExpiry, err = parseMinFinalCLTVExpiry(base32Data)
+			invoice.minFinalCLTVExpiry, err =
+				parseMinFinalCLTVExpiry(base32Data)
+
 		case fieldTypeF:
 			if invoice.FallbackAddr != nil {
 				// We skip the field if we have already seen a
@@ -279,7 +348,10 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 				continue
 			}
 
-			invoice.FallbackAddr, err = parseFallbackAddr(base32Data, net)
+			invoice.FallbackAddr, err = parseFallbackAddr(
+				base32Data, net,
+			)
+
 		case fieldTypeR:
 			// An `r` field can be included in an invoice multiple
 			// times, so we won't skip it if we have already seen
@@ -289,7 +361,10 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 				return err
 			}
 
-			invoice.RouteHints = append(invoice.RouteHints, routeHint)
+			invoice.RouteHints = append(
+				invoice.RouteHints, routeHint,
+			)
+
 		case fieldType9:
 			if invoice.Features != nil {
 				// We skip the field if we have already seen a
@@ -298,6 +373,19 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			}
 
 			invoice.Features, err = parseFeatures(base32Data)
+
+		case fieldTypeB:
+			blindedPaymentPath, err := parseBlindedPaymentPath(
+				base32Data,
+			)
+			if err != nil {
+				return err
+			}
+
+			invoice.BlindedPaymentPaths = append(
+				invoice.BlindedPaymentPaths, blindedPaymentPath,
+			)
+
 		default:
 			// Ignore unknown type.
 		}
@@ -493,6 +581,17 @@ func parseRouteHint(data []byte) ([]HopHint, error) {
 	}
 
 	return routeHint, nil
+}
+
+// parseBlindedPaymentPath attempts to parse a BlindedPaymentPath from the given
+// byte slice.
+func parseBlindedPaymentPath(data []byte) (*BlindedPaymentPath, error) {
+	base256Data, err := bech32.ConvertBits(data, 5, 8, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return DecodeBlindedPayment(bytes.NewReader(base256Data))
 }
 
 // parseFeatures decodes any feature bits directly from the base32

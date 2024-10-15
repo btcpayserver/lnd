@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -20,9 +21,9 @@ import (
 )
 
 const (
-	// queryPaginationLimit is used in the LIMIT clause of the SQL queries
-	// to limit the number of rows returned.
-	queryPaginationLimit = 100
+	// defaultQueryPaginationLimit is used in the LIMIT clause of the SQL
+	// queries to limit the number of rows returned.
+	defaultQueryPaginationLimit = 100
 )
 
 // SQLInvoiceQueries is an interface that defines the set of operations that can
@@ -45,6 +46,9 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 
 	GetInvoice(ctx context.Context,
 		arg sqlc.GetInvoiceParams) ([]sqlc.Invoice, error)
+
+	GetInvoiceBySetID(ctx context.Context, setID []byte) ([]sqlc.Invoice,
+		error)
 
 	GetInvoiceFeatures(ctx context.Context,
 		invoiceID int64) ([]sqlc.InvoiceFeature, error)
@@ -152,16 +156,47 @@ type BatchedSQLInvoiceQueries interface {
 type SQLStore struct {
 	db    BatchedSQLInvoiceQueries
 	clock clock.Clock
+	opts  SQLStoreOptions
+}
+
+// SQLStoreOptions holds the options for the SQL store.
+type SQLStoreOptions struct {
+	paginationLimit int
+}
+
+// defaultSQLStoreOptions returns the default options for the SQL store.
+func defaultSQLStoreOptions() SQLStoreOptions {
+	return SQLStoreOptions{
+		paginationLimit: defaultQueryPaginationLimit,
+	}
+}
+
+// SQLStoreOption is a functional option that can be used to optionally modify
+// the behavior of the SQL store.
+type SQLStoreOption func(*SQLStoreOptions)
+
+// WithPaginationLimit sets the pagination limit for the SQL store queries that
+// paginate results.
+func WithPaginationLimit(limit int) SQLStoreOption {
+	return func(o *SQLStoreOptions) {
+		o.paginationLimit = limit
+	}
 }
 
 // NewSQLStore creates a new SQLStore instance given a open
 // BatchedSQLInvoiceQueries storage backend.
 func NewSQLStore(db BatchedSQLInvoiceQueries,
-	clock clock.Clock) *SQLStore {
+	clock clock.Clock, options ...SQLStoreOption) *SQLStore {
+
+	opts := defaultSQLStoreOptions()
+	for _, applyOption := range options {
+		applyOption(&opts)
+	}
 
 	return &SQLStore{
 		db:    db,
 		clock: clock,
+		opts:  opts,
 	}
 }
 
@@ -202,7 +237,7 @@ func (i *SQLStore) AddInvoice(ctx context.Context,
 			CltvDelta: sqldb.SQLInt32(
 				newInvoice.Terms.FinalCltvDelta,
 			),
-			Expiry: int32(newInvoice.Terms.Expiry),
+			Expiry: int32(newInvoice.Terms.Expiry.Seconds()),
 			// Note: keysend invoices don't have a payment request.
 			PaymentRequest: sqldb.SQLStr(string(
 				newInvoice.PaymentRequest),
@@ -312,7 +347,22 @@ func (i *SQLStore) fetchInvoice(ctx context.Context,
 		params.SetID = ref.SetID()[:]
 	}
 
-	rows, err := db.GetInvoice(ctx, params)
+	var (
+		rows []sqlc.Invoice
+		err  error
+	)
+
+	// We need to split the query based on how we intend to look up the
+	// invoice. If only the set ID is given then we want to have an exact
+	// match on the set ID. If other fields are given, we want to match on
+	// those fields and the set ID but with a less strict join condition.
+	if params.Hash == nil && params.PaymentAddr == nil &&
+		params.SetID != nil {
+
+		rows, err = db.GetInvoiceBySetID(ctx, params.SetID)
+	} else {
+		rows, err = db.GetInvoice(ctx, params)
+	}
 	switch {
 	case len(rows) == 0:
 		return nil, ErrInvoiceNotFound
@@ -320,8 +370,8 @@ func (i *SQLStore) fetchInvoice(ctx context.Context,
 	case len(rows) > 1:
 		// In case the reference is ambiguous, meaning it matches more
 		// than	one invoice, we'll return an error.
-		return nil, fmt.Errorf("ambiguous invoice ref: %s",
-			ref.String())
+		return nil, fmt.Errorf("ambiguous invoice ref: %s: %s",
+			ref.String(), spew.Sdump(rows))
 
 	case err != nil:
 		return nil, fmt.Errorf("unable to fetch invoice: %w", err)
@@ -617,13 +667,11 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 
 	readTxOpt := NewSQLInvoiceQueryReadTx()
 	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		limit := queryPaginationLimit
-
 		return queryWithLimit(func(offset int) (int, error) {
 			params := sqlc.FilterInvoicesParams{
 				PendingOnly: true,
 				NumOffset:   int32(offset),
-				NumLimit:    int32(limit),
+				NumLimit:    int32(i.opts.paginationLimit),
 				Reverse:     false,
 			}
 
@@ -646,7 +694,7 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 			}
 
 			return len(rows), nil
-		}, limit)
+		}, i.opts.paginationLimit)
 	}, func() {
 		invoices = make(map[lntypes.Hash]Invoice)
 	})
@@ -660,8 +708,7 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 
 // InvoicesSettledSince can be used by callers to catch up any settled invoices
 // they missed within the settled invoice time series. We'll return all known
-// settled invoice that have a settle index higher than the passed
-// sinceSettleIndex.
+// settled invoice that have a settle index higher than the passed idx.
 //
 // NOTE: The index starts from 1. As a result we enforce that specifying a value
 // below the starting index value is a noop.
@@ -676,14 +723,11 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 
 	readTxOpt := NewSQLInvoiceQueryReadTx()
 	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		settleIdx := idx
-		limit := queryPaginationLimit
-
 		err := queryWithLimit(func(offset int) (int, error) {
 			params := sqlc.FilterInvoicesParams{
-				SettleIndexGet: sqldb.SQLInt64(settleIdx + 1),
-				NumLimit:       int32(limit),
+				SettleIndexGet: sqldb.SQLInt64(idx + 1),
 				NumOffset:      int32(offset),
+				NumLimit:       int32(i.opts.paginationLimit),
 				Reverse:        false,
 			}
 
@@ -707,10 +751,8 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 				invoices = append(invoices, *invoice)
 			}
 
-			settleIdx += uint64(limit)
-
 			return len(rows), nil
-		}, limit)
+		}, i.opts.paginationLimit)
 		if err != nil {
 			return err
 		}
@@ -777,7 +819,7 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 
 // InvoicesAddedSince can be used by callers to seek into the event time series
 // of all the invoices added in the database. This method will return all
-// invoices with an add index greater than the specified sinceAddIndex.
+// invoices with an add index greater than the specified idx.
 //
 // NOTE: The index starts from 1. As a result we enforce that specifying a value
 // below the starting index value is a noop.
@@ -792,14 +834,11 @@ func (i *SQLStore) InvoicesAddedSince(ctx context.Context, idx uint64) (
 
 	readTxOpt := NewSQLInvoiceQueryReadTx()
 	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		addIdx := idx
-		limit := queryPaginationLimit
-
 		return queryWithLimit(func(offset int) (int, error) {
 			params := sqlc.FilterInvoicesParams{
-				AddIndexGet: sqldb.SQLInt64(addIdx + 1),
-				NumLimit:    int32(limit),
+				AddIndexGet: sqldb.SQLInt64(idx + 1),
 				NumOffset:   int32(offset),
+				NumLimit:    int32(i.opts.paginationLimit),
 				Reverse:     false,
 			}
 
@@ -821,10 +860,8 @@ func (i *SQLStore) InvoicesAddedSince(ctx context.Context, idx uint64) (
 				result = append(result, *invoice)
 			}
 
-			addIdx += uint64(limit)
-
 			return len(rows), nil
-		}, limit)
+		}, i.opts.paginationLimit)
 	}, func() {
 		result = nil
 	})
@@ -851,21 +888,18 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 
 	readTxOpt := NewSQLInvoiceQueryReadTx()
 	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		limit := queryPaginationLimit
-
 		return queryWithLimit(func(offset int) (int, error) {
 			params := sqlc.FilterInvoicesParams{
 				NumOffset:   int32(offset),
-				NumLimit:    int32(limit),
+				NumLimit:    int32(i.opts.paginationLimit),
 				PendingOnly: q.PendingOnly,
+				Reverse:     q.Reversed,
 			}
 
 			if q.Reversed {
-				idx := int32(q.IndexOffset)
-
 				// If the index offset was not set, we want to
 				// fetch from the lastest invoice.
-				if idx == 0 {
+				if q.IndexOffset == 0 {
 					params.AddIndexLet = sqldb.SQLInt64(
 						int64(math.MaxInt64),
 					)
@@ -873,19 +907,15 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 					// The invoice with index offset id must
 					// not be included in the results.
 					params.AddIndexLet = sqldb.SQLInt64(
-						idx - int32(offset) - 1,
+						q.IndexOffset - 1,
 					)
 				}
-
-				params.Reverse = true
 			} else {
 				// The invoice with index offset id must not be
 				// included in the results.
 				params.AddIndexGet = sqldb.SQLInt64(
-					q.IndexOffset + uint64(offset) + 1,
+					q.IndexOffset + 1,
 				)
-
-				params.Reverse = false
 			}
 
 			if q.CreationDateStart != 0 {
@@ -895,8 +925,10 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 			}
 
 			if q.CreationDateEnd != 0 {
+				// We need to add 1 to the end date as we're
+				// checking less than the end date in SQL.
 				params.CreatedBefore = sqldb.SQLTime(
-					time.Unix(q.CreationDateEnd, 0).UTC(),
+					time.Unix(q.CreationDateEnd+1, 0).UTC(),
 				)
 			}
 
@@ -923,7 +955,7 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 			}
 
 			return len(rows), nil
-		}, limit)
+		}, i.opts.paginationLimit)
 	}, func() {
 		invoices = nil
 	})
@@ -1105,6 +1137,9 @@ func (s *sqlInvoiceUpdater) AddAmpHtlcPreimage(setID [32]byte,
 			SetID:     setID[:],
 			HtlcID:    int64(circuitKey.HtlcID),
 			Preimage:  preimage[:],
+			ChanID: strconv.FormatUint(
+				circuitKey.ChanID.ToUint64(), 10,
+			),
 		},
 	)
 	if err != nil {
@@ -1269,6 +1304,13 @@ func (s *sqlInvoiceUpdater) UpdateAmpState(setID [32]byte,
 		return err
 	}
 
+	if settleIndex.Valid {
+		updatedState := s.invoice.AMPState[setID]
+		updatedState.SettleIndex = uint64(settleIndex.Int64)
+		updatedState.SettleDate = s.updateTime.UTC()
+		s.invoice.AMPState[setID] = updatedState
+	}
+
 	return nil
 }
 
@@ -1287,13 +1329,24 @@ func (s *sqlInvoiceUpdater) Finalize(_ UpdateType) error {
 // invoice and is therefore atomic. The fields to update are controlled by the
 // supplied callback.
 func (i *SQLStore) UpdateInvoice(ctx context.Context, ref InvoiceRef,
-	_ *SetID, callback InvoiceUpdateCallback) (
+	setID *SetID, callback InvoiceUpdateCallback) (
 	*Invoice, error) {
 
 	var updatedInvoice *Invoice
 
 	txOpt := SQLInvoiceQueriesTxOptions{readOnly: false}
 	txErr := i.db.ExecTx(ctx, &txOpt, func(db SQLInvoiceQueries) error {
+		if setID != nil {
+			// Make sure to use the set ID if this is an AMP update.
+			var setIDBytes [32]byte
+			copy(setIDBytes[:], setID[:])
+			ref.setID = &setIDBytes
+
+			// If we're updating an AMP invoice, we'll also only
+			// need to fetch the HTLCs for the given set ID.
+			ref.refModifier = HtlcSetOnlyModifier
+		}
+
 		invoice, err := i.fetchInvoice(ctx, db, ref)
 		if err != nil {
 			return err
@@ -1587,6 +1640,8 @@ func unmarshalInvoice(row sqlc.Invoice) (*lntypes.Hash, *Invoice,
 		cltvDelta = row.CltvDelta.Int32
 	}
 
+	expiry := time.Duration(row.Expiry) * time.Second
+
 	invoice := &Invoice{
 		SettleIndex:    uint64(settleIndex),
 		SettleDate:     settledAt,
@@ -1595,7 +1650,7 @@ func unmarshalInvoice(row sqlc.Invoice) (*lntypes.Hash, *Invoice,
 		CreationDate:   row.CreatedAt.Local(),
 		Terms: ContractTerm{
 			FinalCltvDelta:  cltvDelta,
-			Expiry:          time.Duration(row.Expiry),
+			Expiry:          expiry,
 			PaymentPreimage: preimage,
 			Value:           lnwire.MilliSatoshi(row.AmountMsat),
 			PaymentAddr:     paymentAddr,

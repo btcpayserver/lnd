@@ -280,7 +280,7 @@ func (r *RouterBackend) parseQueryRoutesRequest(in *lnrpc.QueryRoutesRequest) (
 	var (
 		targetPubKey   *route.Vertex
 		routeHintEdges map[route.Vertex][]routing.AdditionalEdge
-		blindedPmt     *routing.BlindedPayment
+		blindedPathSet *routing.BlindedPaymentPathSet
 
 		// finalCLTVDelta varies depending on whether we're sending to
 		// a blinded route or an unblinded node. For blinded paths,
@@ -297,13 +297,14 @@ func (r *RouterBackend) parseQueryRoutesRequest(in *lnrpc.QueryRoutesRequest) (
 	// Validate that the fields provided in the request are sane depending
 	// on whether it is using a blinded path or not.
 	if len(in.BlindedPaymentPaths) > 0 {
-		blindedPmt, err = parseBlindedPayment(in)
+		blindedPathSet, err = parseBlindedPaymentPaths(in)
 		if err != nil {
 			return nil, err
 		}
 
-		if blindedPmt.Features != nil {
-			destinationFeatures = blindedPmt.Features.Clone()
+		pathFeatures := blindedPathSet.Features()
+		if pathFeatures != nil {
+			destinationFeatures = pathFeatures.Clone()
 		}
 	} else {
 		// If we do not have a blinded path, a target pubkey must be
@@ -387,10 +388,10 @@ func (r *RouterBackend) parseQueryRoutesRequest(in *lnrpc.QueryRoutesRequest) (
 				fromNode, toNode, amt, capacity,
 			)
 		},
-		DestCustomRecords: record.CustomSet(in.DestCustomRecords),
-		CltvLimit:         cltvLimit,
-		DestFeatures:      destinationFeatures,
-		BlindedPayment:    blindedPmt,
+		DestCustomRecords:     record.CustomSet(in.DestCustomRecords),
+		CltvLimit:             cltvLimit,
+		DestFeatures:          destinationFeatures,
+		BlindedPaymentPathSet: blindedPathSet,
 	}
 
 	// Pass along an outgoing channel restriction if specified.
@@ -419,37 +420,22 @@ func (r *RouterBackend) parseQueryRoutesRequest(in *lnrpc.QueryRoutesRequest) (
 
 	return routing.NewRouteRequest(
 		sourcePubKey, targetPubKey, amt, in.TimePref, restrictions,
-		customRecords, routeHintEdges, blindedPmt, finalCLTVDelta,
+		customRecords, routeHintEdges, blindedPathSet,
+		finalCLTVDelta,
 	)
 }
 
-func parseBlindedPayment(in *lnrpc.QueryRoutesRequest) (
-	*routing.BlindedPayment, error) {
+func parseBlindedPaymentPaths(in *lnrpc.QueryRoutesRequest) (
+	*routing.BlindedPaymentPathSet, error) {
 
 	if len(in.PubKey) != 0 {
 		return nil, fmt.Errorf("target pubkey: %x should not be set "+
 			"when blinded path is provided", in.PubKey)
 	}
 
-	if len(in.BlindedPaymentPaths) != 1 {
-		return nil, errors.New("query routes only supports a single " +
-			"blinded path")
-	}
-
-	blindedPath := in.BlindedPaymentPaths[0]
-
 	if len(in.RouteHints) > 0 {
 		return nil, errors.New("route hints and blinded path can't " +
 			"both be set")
-	}
-
-	blindedPmt, err := unmarshalBlindedPayment(blindedPath)
-	if err != nil {
-		return nil, fmt.Errorf("parse blinded payment: %w", err)
-	}
-
-	if err := blindedPmt.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid blinded path: %w", err)
 	}
 
 	if in.FinalCltvDelta != 0 {
@@ -466,7 +452,21 @@ func parseBlindedPayment(in *lnrpc.QueryRoutesRequest) (
 			"be populated in blinded path")
 	}
 
-	return blindedPmt, nil
+	paths := make([]*routing.BlindedPayment, len(in.BlindedPaymentPaths))
+	for i, paymentPath := range in.BlindedPaymentPaths {
+		blindedPmt, err := unmarshalBlindedPayment(paymentPath)
+		if err != nil {
+			return nil, fmt.Errorf("parse blinded payment: %w", err)
+		}
+
+		if err := blindedPmt.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid blinded path: %w", err)
+		}
+
+		paths[i] = blindedPmt
+	}
+
+	return routing.NewBlindedPaymentPathSet(paths)
 }
 
 func unmarshalBlindedPayment(rpcPayment *lnrpc.BlindedPaymentPath) (
@@ -999,6 +999,28 @@ func (r *RouterBackend) extractIntentFromSendRequest(
 		payIntent.PaymentAddr = payAddr
 		payIntent.PaymentRequest = []byte(rpcPayReq.PaymentRequest)
 		payIntent.Metadata = payReq.Metadata
+
+		if len(payReq.BlindedPaymentPaths) > 0 {
+			pathSet, err := BuildBlindedPathSet(
+				payReq.BlindedPaymentPaths,
+			)
+			if err != nil {
+				return nil, err
+			}
+			payIntent.BlindedPathSet = pathSet
+
+			// Replace the target node with the target public key
+			// of the blinded path set.
+			copy(
+				payIntent.Target[:],
+				pathSet.TargetPubKey().SerializeCompressed(),
+			)
+
+			pathFeatures := pathSet.Features()
+			if !pathFeatures.IsEmpty() {
+				payIntent.DestFeatures = pathFeatures.Clone()
+			}
+		}
 	} else {
 		// Otherwise, If the payment request field was not specified
 		// (and a custom route wasn't specified), construct the payment
@@ -1135,6 +1157,46 @@ func (r *RouterBackend) extractIntentFromSendRequest(
 	}
 
 	return payIntent, nil
+}
+
+// BuildBlindedPathSet marshals a set of zpay32.BlindedPaymentPath and uses
+// the result to build a new routing.BlindedPaymentPathSet.
+func BuildBlindedPathSet(paths []*zpay32.BlindedPaymentPath) (
+	*routing.BlindedPaymentPathSet, error) {
+
+	marshalledPaths := make([]*routing.BlindedPayment, len(paths))
+	for i, path := range paths {
+		paymentPath := marshalBlindedPayment(path)
+
+		err := paymentPath.Validate()
+		if err != nil {
+			return nil, err
+		}
+
+		marshalledPaths[i] = paymentPath
+	}
+
+	return routing.NewBlindedPaymentPathSet(marshalledPaths)
+}
+
+// marshalBlindedPayment marshals a zpay32.BLindedPaymentPath into a
+// routing.BlindedPayment.
+func marshalBlindedPayment(
+	path *zpay32.BlindedPaymentPath) *routing.BlindedPayment {
+
+	return &routing.BlindedPayment{
+		BlindedPath: &sphinx.BlindedPath{
+			IntroductionPoint: path.Hops[0].BlindedNodePub,
+			BlindingPoint:     path.FirstEphemeralBlindingPoint,
+			BlindedHops:       path.Hops,
+		},
+		BaseFee:             path.FeeBaseMsat,
+		ProportionalFeeRate: path.FeeRate,
+		CltvExpiryDelta:     path.CltvExpiryDelta,
+		HtlcMinimum:         path.HTLCMinMsat,
+		HtlcMaximum:         path.HTLCMaxMsat,
+		Features:            path.Features,
+	}
 }
 
 // unmarshallRouteHints unmarshalls a list of route hints.
@@ -1685,6 +1747,9 @@ func marshallPaymentFailureReason(reason *channeldb.FailureReason) (
 
 	case channeldb.FailureReasonInsufficientBalance:
 		return lnrpc.PaymentFailureReason_FAILURE_REASON_INSUFFICIENT_BALANCE, nil
+
+	case channeldb.FailureReasonCanceled:
+		return lnrpc.PaymentFailureReason_FAILURE_REASON_CANCELED, nil
 	}
 
 	return 0, errors.New("unknown failure reason")

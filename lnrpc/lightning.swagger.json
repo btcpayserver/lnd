@@ -1204,6 +1204,13 @@
             "required": true,
             "type": "string",
             "format": "uint64"
+          },
+          {
+            "name": "chan_point",
+            "description": "The channel point of the channel in format funding_txid:output_index. If\nchan_id is specified, this field is ignored.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -3537,6 +3544,34 @@
         }
       }
     },
+    "lnrpcBlindedPathConfig": {
+      "type": "object",
+      "properties": {
+        "min_num_real_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The minimum number of real hops to include in a blinded path. This doesn't\ninclude our node, so if the minimum is 1, then the path will contain at\nminimum our node along with an introduction node hop. If it is zero then\nthe shortest path will use our node as an introduction node."
+        },
+        "num_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of hops to include in a blinded path. This doesn't include our\nnode, so if it is 1, then the path will contain our node along with an\nintroduction node or dummy node hop. If paths shorter than NumHops is\nfound, then they will be padded using dummy hops."
+        },
+        "max_num_paths": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The maximum number of blinded paths to select and add to an invoice."
+        },
+        "node_omission_list": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "A list of node IDs of nodes that should not be used in any of our generated\nblinded paths."
+        }
+      }
+    },
     "lnrpcBlindedPaymentPath": {
       "type": "object",
       "properties": {
@@ -5483,6 +5518,14 @@
           },
           "description": "Maps a 32-byte hex-encoded set ID to the sub-invoice AMP state for the\ngiven set ID. This field is always populated for AMP invoices, and can be\nused along side LookupInvoice to obtain the HTLC information related to a\ngiven sub-invoice.\nNote: Output only, don't specify for creating an invoice.",
           "title": "[EXPERIMENTAL]:"
+        },
+        "is_blinded": {
+          "type": "boolean",
+          "description": "Signals that the invoice should include blinded paths to hide the true\nidentity of the recipient."
+        },
+        "blinded_path_config": {
+          "$ref": "#/definitions/lnrpcBlindedPathConfig",
+          "description": "Config values to use when creating blinded paths for this invoice. These\ncan be used to override the defaults config values provided in by the\nglobal config. This field is only used if is_blinded is true."
         }
       }
     },
@@ -6292,6 +6335,12 @@
           "additionalProperties": {
             "$ref": "#/definitions/lnrpcFeature"
           }
+        },
+        "blinded_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcBlindedPaymentPath"
+          }
         }
       }
     },
@@ -6379,10 +6428,11 @@
         "FAILURE_REASON_NO_ROUTE",
         "FAILURE_REASON_ERROR",
         "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
-        "FAILURE_REASON_INSUFFICIENT_BALANCE"
+        "FAILURE_REASON_INSUFFICIENT_BALANCE",
+        "FAILURE_REASON_CANCELED"
       ],
       "default": "FAILURE_REASON_NONE",
-      "description": " - FAILURE_REASON_NONE: Payment isn't failed (yet).\n - FAILURE_REASON_TIMEOUT: There are more routes to try, but the payment timeout was exceeded.\n - FAILURE_REASON_NO_ROUTE: All possible routes were tried and failed permanently. Or were no\nroutes to the destination at all.\n - FAILURE_REASON_ERROR: A non-recoverable error has occured.\n - FAILURE_REASON_INCORRECT_PAYMENT_DETAILS: Payment details incorrect (unknown hash, invalid amt or\ninvalid final cltv delta)\n - FAILURE_REASON_INSUFFICIENT_BALANCE: Insufficient local balance."
+      "description": " - FAILURE_REASON_NONE: Payment isn't failed (yet).\n - FAILURE_REASON_TIMEOUT: There are more routes to try, but the payment timeout was exceeded.\n - FAILURE_REASON_NO_ROUTE: All possible routes were tried and failed permanently. Or were no\nroutes to the destination at all.\n - FAILURE_REASON_ERROR: A non-recoverable error has occured.\n - FAILURE_REASON_INCORRECT_PAYMENT_DETAILS: Payment details incorrect (unknown hash, invalid amt or\ninvalid final cltv delta)\n - FAILURE_REASON_INSUFFICIENT_BALANCE: Insufficient local balance.\n - FAILURE_REASON_CANCELED: The payment was canceled."
     },
     "lnrpcPeer": {
       "type": "object",
@@ -6947,7 +6997,7 @@
         },
         "send_all": {
           "type": "boolean",
-          "description": "If set, then the amount field will be ignored, and lnd will attempt to\nsend all the coins under control of the internal wallet to the specified\naddress."
+          "description": "If set, the amount field should be unset. It indicates lnd will send all\nwallet coins or all selected coins to the specified address."
         },
         "label": {
           "type": "string",
@@ -6965,6 +7015,13 @@
         "coin_selection_strategy": {
           "$ref": "#/definitions/lnrpcCoinSelectionStrategy",
           "description": "The strategy to use for selecting coins."
+        },
+        "outpoints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcOutPoint"
+          },
+          "description": "A list of selected outpoints as inputs for the transaction."
         }
       }
     },

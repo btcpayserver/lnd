@@ -115,13 +115,15 @@ func createTestPeerWithChannel(t *testing.T, updateChan func(a,
 	)
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        aliceDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      btcutil.Amount(rand.Int63()),
 			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutAlice),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: aliceDustLimit,
+			CsvDelay:  uint16(csvTimeoutAlice),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
@@ -140,13 +142,15 @@ func createTestPeerWithChannel(t *testing.T, updateChan func(a,
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        bobDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      btcutil.Amount(rand.Int63()),
 			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutBob),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: bobDustLimit,
+			CsvDelay:  uint16(csvTimeoutBob),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
@@ -337,6 +341,7 @@ func createTestPeerWithChannel(t *testing.T, updateChan func(a,
 		notifier:   notifier,
 		publishTx:  publishTx,
 		mockSwitch: mockSwitch,
+		mockConn:   params.mockConn,
 	}, nil
 }
 
@@ -489,10 +494,14 @@ func (m *mockMessageConn) Flush() (int, error) {
 // the bytes sent into the mock's writtenMessages channel.
 func (m *mockMessageConn) WriteMessage(msg []byte) error {
 	m.writeRaceDetectingCounter++
+
+	msgCopy := make([]byte, len(msg))
+	copy(msgCopy, msg)
+
 	select {
-	case m.writtenMessages <- msg:
+	case m.writtenMessages <- msgCopy:
 	case <-time.After(timeout):
-		m.t.Fatalf("timeout sending message: %v", msg)
+		m.t.Fatalf("timeout sending message: %v", msgCopy)
 	}
 
 	return nil
@@ -709,6 +718,11 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 			return nil
 		},
 		PongBuf: make([]byte, lnwire.MaxPongBytes),
+		FetchLastChanUpdate: func(chanID lnwire.ShortChannelID,
+		) (*lnwire.ChannelUpdate, error) {
+
+			return &lnwire.ChannelUpdate{}, nil
+		},
 	}
 
 	alicePeer := NewBrontide(*cfg)

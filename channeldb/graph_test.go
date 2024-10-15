@@ -141,7 +141,7 @@ func TestNodeInsertionAndDeletion(t *testing.T) {
 
 	// Next, fetch the node from the database to ensure everything was
 	// serialized properly.
-	dbNode, err := graph.FetchLightningNode(nil, testPub)
+	dbNode, err := graph.FetchLightningNode(testPub)
 	require.NoError(t, err, "unable to locate node")
 
 	if _, exists, err := graph.HasLightningNode(dbNode.PubKeyBytes); err != nil {
@@ -164,7 +164,7 @@ func TestNodeInsertionAndDeletion(t *testing.T) {
 
 	// Finally, attempt to fetch the node again. This should fail as the
 	// node should have been deleted from the database.
-	_, err = graph.FetchLightningNode(nil, testPub)
+	_, err = graph.FetchLightningNode(testPub)
 	if err != ErrGraphNodeNotFound {
 		t.Fatalf("fetch after delete should fail!")
 	}
@@ -192,7 +192,7 @@ func TestPartialNode(t *testing.T) {
 
 	// Next, fetch the node from the database to ensure everything was
 	// serialized properly.
-	dbNode, err := graph.FetchLightningNode(nil, testPub)
+	dbNode, err := graph.FetchLightningNode(testPub)
 	require.NoError(t, err, "unable to locate node")
 
 	if _, exists, err := graph.HasLightningNode(dbNode.PubKeyBytes); err != nil {
@@ -222,7 +222,7 @@ func TestPartialNode(t *testing.T) {
 
 	// Finally, attempt to fetch the node again. This should fail as the
 	// node should have been deleted from the database.
-	_, err = graph.FetchLightningNode(nil, testPub)
+	_, err = graph.FetchLightningNode(testPub)
 	if err != ErrGraphNodeNotFound {
 		t.Fatalf("fetch after delete should fail!")
 	}
@@ -1055,7 +1055,7 @@ func TestGraphTraversal(t *testing.T) {
 	// outgoing channels for a particular node.
 	numNodeChans := 0
 	firstNode, secondNode := nodeList[0], nodeList[1]
-	err = graph.ForEachNodeChannel(nil, firstNode.PubKeyBytes,
+	err = graph.ForEachNodeChannel(firstNode.PubKeyBytes,
 		func(_ kvdb.RTx, _ *models.ChannelEdgeInfo, outEdge,
 			inEdge *models.ChannelEdgePolicy) error {
 
@@ -1980,9 +1980,9 @@ func TestFilterKnownChanIDs(t *testing.T) {
 			t.Fatalf("unable to create channel edge: %v", err)
 		}
 
-		chanIDs = append(chanIDs, ChannelUpdateInfo{
-			ShortChannelID: chanID,
-		})
+		chanIDs = append(chanIDs, NewChannelUpdateInfo(
+			chanID, time.Time{}, time.Time{},
+		))
 	}
 
 	const numZombies = 5
@@ -2024,20 +2024,28 @@ func TestFilterKnownChanIDs(t *testing.T) {
 		// should get the same set back.
 		{
 			queryIDs: []ChannelUpdateInfo{
-				{ShortChannelID: lnwire.ShortChannelID{
-					BlockHeight: 99,
-				}},
-				{ShortChannelID: lnwire.ShortChannelID{
-					BlockHeight: 100,
-				}},
+				{
+					ShortChannelID: lnwire.ShortChannelID{
+						BlockHeight: 99,
+					},
+				},
+				{
+					ShortChannelID: lnwire.ShortChannelID{
+						BlockHeight: 100,
+					},
+				},
 			},
 			resp: []ChannelUpdateInfo{
-				{ShortChannelID: lnwire.ShortChannelID{
-					BlockHeight: 99,
-				}},
-				{ShortChannelID: lnwire.ShortChannelID{
-					BlockHeight: 100,
-				}},
+				{
+					ShortChannelID: lnwire.ShortChannelID{
+						BlockHeight: 99,
+					},
+				},
+				{
+					ShortChannelID: lnwire.ShortChannelID{
+						BlockHeight: 100,
+					},
+				},
 			},
 		},
 
@@ -2419,7 +2427,7 @@ func TestFilterChannelRange(t *testing.T) {
 		)
 	)
 
-	updateTimeSeed := int64(1)
+	updateTimeSeed := time.Now().Unix()
 	maybeAddPolicy := func(chanID uint64, node *LightningNode,
 		node2 bool) time.Time {
 
@@ -2428,7 +2436,7 @@ func TestFilterChannelRange(t *testing.T) {
 			chanFlags = lnwire.ChanUpdateDirection
 		}
 
-		var updateTime time.Time
+		var updateTime = time.Unix(0, 0)
 		if rand.Int31n(2) == 0 {
 			updateTime = time.Unix(updateTimeSeed, 0)
 			err = graph.UpdateEdgePolicy(&models.ChannelEdgePolicy{
@@ -2456,11 +2464,16 @@ func TestFilterChannelRange(t *testing.T) {
 		)
 		require.NoError(t, graph.AddChannelEdge(&channel2))
 
+		chanInfo1 := NewChannelUpdateInfo(
+			chanID1, time.Time{}, time.Time{},
+		)
+		chanInfo2 := NewChannelUpdateInfo(
+			chanID2, time.Time{}, time.Time{},
+		)
 		channelRanges = append(channelRanges, BlockChannelRange{
 			Height: chanHeight,
 			Channels: []ChannelUpdateInfo{
-				{ShortChannelID: chanID1},
-				{ShortChannelID: chanID2},
+				chanInfo1, chanInfo2,
 			},
 		})
 
@@ -2471,20 +2484,17 @@ func TestFilterChannelRange(t *testing.T) {
 			time4 = maybeAddPolicy(channel2.ChannelID, node2, true)
 		)
 
+		chanInfo1 = NewChannelUpdateInfo(
+			chanID1, time1, time2,
+		)
+		chanInfo2 = NewChannelUpdateInfo(
+			chanID2, time3, time4,
+		)
 		channelRangesWithTimestamps = append(
 			channelRangesWithTimestamps, BlockChannelRange{
 				Height: chanHeight,
 				Channels: []ChannelUpdateInfo{
-					{
-						ShortChannelID:       chanID1,
-						Node1UpdateTimestamp: time1,
-						Node2UpdateTimestamp: time2,
-					},
-					{
-						ShortChannelID:       chanID2,
-						Node1UpdateTimestamp: time3,
-						Node2UpdateTimestamp: time4,
-					},
+					chanInfo1, chanInfo2,
 				},
 			},
 		)
@@ -2685,7 +2695,7 @@ func TestFetchChanInfos(t *testing.T) {
 	// We'll now attempt to query for the range of channel ID's we just
 	// inserted into the database. We should get the exact same set of
 	// edges back.
-	resp, err := graph.FetchChanInfos(nil, edgeQuery)
+	resp, err := graph.FetchChanInfos(edgeQuery)
 	require.NoError(t, err, "unable to fetch chan edges")
 	if len(resp) != len(edges) {
 		t.Fatalf("expected %v edges, instead got %v", len(edges),
@@ -2737,7 +2747,7 @@ func TestIncompleteChannelPolicies(t *testing.T) {
 	// Ensure that channel is reported with unknown policies.
 	checkPolicies := func(node *LightningNode, expectedIn, expectedOut bool) {
 		calls := 0
-		err := graph.ForEachNodeChannel(nil, node.PubKeyBytes,
+		err := graph.ForEachNodeChannel(node.PubKeyBytes,
 			func(_ kvdb.RTx, _ *models.ChannelEdgeInfo, outEdge,
 				inEdge *models.ChannelEdgePolicy) error {
 
@@ -3014,7 +3024,7 @@ func TestPruneGraphNodes(t *testing.T) {
 
 	// Finally, we'll ensure that node3, the only fully unconnected node as
 	// properly deleted from the graph and not another node in its place.
-	_, err = graph.FetchLightningNode(nil, node3.PubKeyBytes)
+	_, err = graph.FetchLightningNode(node3.PubKeyBytes)
 	if err == nil {
 		t.Fatalf("node 3 should have been deleted!")
 	}
@@ -3048,13 +3058,13 @@ func TestAddChannelEdgeShellNodes(t *testing.T) {
 
 	// Ensure that node1 was inserted as a full node, while node2 only has
 	// a shell node present.
-	node1, err = graph.FetchLightningNode(nil, node1.PubKeyBytes)
+	node1, err = graph.FetchLightningNode(node1.PubKeyBytes)
 	require.NoError(t, err, "unable to fetch node1")
 	if !node1.HaveNodeAnnouncement {
 		t.Fatalf("have shell announcement for node1, shouldn't")
 	}
 
-	node2, err = graph.FetchLightningNode(nil, node2.PubKeyBytes)
+	node2, err = graph.FetchLightningNode(node2.PubKeyBytes)
 	require.NoError(t, err, "unable to fetch node2")
 	if node2.HaveNodeAnnouncement {
 		t.Fatalf("should have shell announcement for node2, but is full")
@@ -3688,7 +3698,7 @@ func TestLightningNodeSigVerification(t *testing.T) {
 	}
 }
 
-// TestComputeFee tests fee calculation based on both in- and outgoing amt.
+// TestComputeFee tests fee calculation based on the outgoing amt.
 func TestComputeFee(t *testing.T) {
 	var (
 		policy = models.ChannelEdgePolicy{
@@ -3702,11 +3712,6 @@ func TestComputeFee(t *testing.T) {
 	fee := policy.ComputeFee(outgoingAmt)
 	if fee != expectedFee {
 		t.Fatalf("expected fee %v, got %v", expectedFee, fee)
-	}
-
-	fwdFee := policy.ComputeFeeFromIncoming(outgoingAmt + fee)
-	if fwdFee != expectedFee {
-		t.Fatalf("expected fee %v, but got %v", fee, fwdFee)
 	}
 }
 
@@ -4031,4 +4036,29 @@ func TestGraphLoading(t *testing.T) {
 		t, graph.graphCache.nodeFeatures,
 		graphReloaded.graphCache.nodeFeatures,
 	)
+}
+
+// TestClosedScid tests that we can correctly insert a SCID into the index of
+// closed short channel ids.
+func TestClosedScid(t *testing.T) {
+	t.Parallel()
+
+	graph, err := MakeTestGraph(t)
+	require.Nil(t, err)
+
+	scid := lnwire.ShortChannelID{}
+
+	// The scid should not exist in the closedScidBucket.
+	exists, err := graph.IsClosedScid(scid)
+	require.Nil(t, err)
+	require.False(t, exists)
+
+	// After we call PutClosedScid, the call to IsClosedScid should return
+	// true.
+	err = graph.PutClosedScid(scid)
+	require.Nil(t, err)
+
+	exists, err = graph.IsClosedScid(scid)
+	require.Nil(t, err)
+	require.True(t, exists)
 }

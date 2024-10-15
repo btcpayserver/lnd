@@ -444,7 +444,7 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -2071,6 +2071,8 @@ type mockPeer struct {
 func (m *mockPeer) QuitSignal() <-chan struct{} {
 	return m.quit
 }
+
+func (m *mockPeer) Disconnect(err error) {}
 
 var _ lnpeer.Peer = (*mockPeer)(nil)
 
@@ -4471,9 +4473,19 @@ func TestChannelLinkUpdateCommitFee(t *testing.T) {
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that exceeds its maximum fee allocation should result in a fee rate
-	// corresponding to the maximum fee allocation.
+	// corresponding to the maximum fee allocation. Increase the dust
+	// threshold so that we don't trigger that logic.
+	highFeeExposure := lnwire.NewMSatFromSatoshis(
+		2 * btcutil.SatoshiPerBitcoin,
+	)
 	const maxFeeRate chainfee.SatPerKWeight = 207180182
+	n.aliceChannelLink.cfg.MaxFeeExposure = highFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = highFeeExposure
 	triggerFeeUpdate(maxFeeRate+1, minRelayFee, maxFeeRate, true)
+
+	// Decrease the max fee exposure back to normal.
+	n.aliceChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that is below the current min relay fee rate should result in a fee
@@ -6308,7 +6320,7 @@ func TestChannelLinkCanceledInvoice(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -6364,7 +6376,7 @@ type hodlInvoiceTestCtx struct {
 
 func newHodlInvoiceTestCtx(t *testing.T) (*hodlInvoiceTestCtx, error) {
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")

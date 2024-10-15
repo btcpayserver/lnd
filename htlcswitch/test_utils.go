@@ -138,24 +138,28 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	csvTimeoutBob := uint32(4)
 	isAliceInitiator := true
 
-	aliceConstraints := &channeldb.ChannelConstraints{
-		DustLimit: btcutil.Amount(200),
+	aliceBounds := channeldb.ChannelStateBounds{
 		MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 			channelCapacity),
 		ChanReserve:      aliceReserve,
 		MinHTLC:          0,
 		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-		CsvDelay:         uint16(csvTimeoutAlice),
+	}
+	aliceCommitParams := channeldb.CommitmentParams{
+		DustLimit: btcutil.Amount(200),
+		CsvDelay:  uint16(csvTimeoutAlice),
 	}
 
-	bobConstraints := &channeldb.ChannelConstraints{
-		DustLimit: btcutil.Amount(800),
+	bobBounds := channeldb.ChannelStateBounds{
 		MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 			channelCapacity),
 		ChanReserve:      bobReserve,
 		MinHTLC:          0,
 		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-		CsvDelay:         uint16(csvTimeoutBob),
+	}
+	bobCommitParams := channeldb.CommitmentParams{
+		DustLimit: btcutil.Amount(800),
+		CsvDelay:  uint16(csvTimeoutBob),
 	}
 
 	var hash [sha256.Size]byte
@@ -172,7 +176,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	fundingTxIn := wire.NewTxIn(prevOut, nil, nil)
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: *aliceConstraints,
+		ChannelStateBounds: aliceBounds,
+		CommitmentParams:   aliceCommitParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
 		},
@@ -190,7 +195,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: *bobConstraints,
+		ChannelStateBounds: bobBounds,
+		CommitmentParams:   bobCommitParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
 		},
@@ -1053,17 +1059,17 @@ func serverOptionRejectHtlc(alice, bob, carol bool) serverOption {
 	}
 }
 
-// createTwoClusterChannels creates lightning channels which are needed for
-// a 2 hop network cluster to be initialized.
-func createTwoClusterChannels(t *testing.T, aliceToBob,
-	bobToCarol btcutil.Amount) (*testLightningChannel,
+// createMirroredChannel creates two LightningChannel objects which represent
+// the state machines on either side of a single channel between alice and bob.
+func createMirroredChannel(t *testing.T, aliceToBob,
+	bobToAlice btcutil.Amount) (*testLightningChannel,
 	*testLightningChannel, error) {
 
 	_, _, firstChanID, _ := genIDs()
 
-	// Create lightning channels between Alice<->Bob and Bob<->Carol
+	// Create lightning channels between Alice<->Bob for Alice and Bob
 	alice, bob, err := createTestChannel(t, alicePrivKey, bobPrivKey,
-		aliceToBob, aliceToBob, 0, 0, firstChanID,
+		aliceToBob, bobToAlice, 0, 0, firstChanID,
 	)
 	if err != nil {
 		return nil, nil, errors.Errorf("unable to create "+

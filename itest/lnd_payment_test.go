@@ -1,6 +1,7 @@
 package itest
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,13 +10,327 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
+	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/stretchr/testify/require"
 )
+
+// testPaymentSucceededHTLCRemoteSwept checks that when an outgoing HTLC is
+// timed out and is swept by the remote via the direct preimage spend path, the
+// payment will be marked as succeeded. This test creates a topology from Alice
+// -> Bob, and let Alice send payments to Bob. Bob then goes offline, such that
+// Alice's outgoing HTLC will time out. Once the force close transaction is
+// broadcast by Alice, she then goes offline and Bob comes back online to take
+// her outgoing HTLC. And Alice should mark this payment as succeeded after she
+// comes back online again.
+func testPaymentSucceededHTLCRemoteSwept(ht *lntest.HarnessTest) {
+	// Set the feerate to be 10 sat/vb.
+	ht.SetFeeEstimate(2500)
+
+	// Open a channel with 100k satoshis between Alice and Bob with Alice
+	// being the sole funder of the channel.
+	chanAmt := btcutil.Amount(100_000)
+	openChannelParams := lntest.OpenChannelParams{
+		Amt: chanAmt,
+	}
+
+	// Create a two hop network: Alice -> Bob.
+	chanPoints, nodes := createSimpleNetwork(ht, nil, 2, openChannelParams)
+	chanPoint := chanPoints[0]
+	alice, bob := nodes[0], nodes[1]
+
+	// We now create two payments, one above dust and the other below dust,
+	// and we should see different behavior in terms of when the payment
+	// will be marked as failed due to the HTLC timeout.
+	//
+	// First, create random preimages.
+	preimage := ht.RandomPreimage()
+	dustPreimage := ht.RandomPreimage()
+
+	// Get the preimage hashes.
+	payHash := preimage.Hash()
+	dustPayHash := dustPreimage.Hash()
+
+	// Create an hold invoice for Bob which expects a payment of 10k
+	// satoshis from Alice.
+	const paymentAmt = 10_000
+	req := &invoicesrpc.AddHoldInvoiceRequest{
+		Value: paymentAmt,
+		Hash:  payHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	invoice := bob.RPC.AddHoldInvoice(req)
+
+	// Create another hold invoice for Bob which expects a payment of 1k
+	// satoshis from Alice.
+	const dustAmt = 1000
+	req = &invoicesrpc.AddHoldInvoiceRequest{
+		Value: dustAmt,
+		Hash:  dustPayHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	dustInvoice := bob.RPC.AddHoldInvoice(req)
+
+	// Alice now sends both payments to Bob.
+	payReq := &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice.PaymentRequest,
+		TimeoutSeconds: 3600,
+	}
+	dustPayReq := &routerrpc.SendPaymentRequest{
+		PaymentRequest: dustInvoice.PaymentRequest,
+		TimeoutSeconds: 3600,
+	}
+
+	// We expect the payment to stay in-flight from both streams.
+	ht.SendPaymentAssertInflight(alice, payReq)
+	ht.SendPaymentAssertInflight(alice, dustPayReq)
+
+	// We also check the payments are marked as IN_FLIGHT in Alice's
+	// database.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_IN_FLIGHT)
+
+	// Bob should have two incoming HTLC.
+	ht.AssertIncomingHTLCActive(bob, chanPoint, payHash[:])
+	ht.AssertIncomingHTLCActive(bob, chanPoint, dustPayHash[:])
+
+	// Alice should have two outgoing HTLCs.
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, payHash[:])
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, dustPayHash[:])
+
+	// Let Bob go offline.
+	restartBob := ht.SuspendNode(bob)
+
+	// Alice force closes the channel, which puts her commitment tx into
+	// the mempool.
+	ht.CloseChannelAssertPending(alice, chanPoint, true)
+
+	// We now let Alice go offline to avoid her sweeping her outgoing htlc.
+	restartAlice := ht.SuspendNode(alice)
+
+	// Mine one block to confirm Alice's force closing tx.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Restart Bob to settle the invoice and sweep the htlc output.
+	require.NoError(ht, restartBob())
+
+	// Bob now settles the invoices, since his link with Alice is broken,
+	// Alice won't know the preimages.
+	bob.RPC.SettleInvoice(preimage[:])
+	bob.RPC.SettleInvoice(dustPreimage[:])
+
+	// Once Bob comes back up, he should find the force closing transaction
+	// from Alice and try to sweep the non-dust outgoing htlc via the
+	// direct preimage spend.
+	ht.AssertNumPendingSweeps(bob, 1)
+
+	// Mine a block to trigger the sweep.
+	//
+	// TODO(yy): remove it once `blockbeat` is implemented.
+	ht.MineEmptyBlocks(1)
+
+	// Mine Bob's sweeping tx.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Let Alice come back up. Since the channel is now closed, we expect
+	// different behaviors based on whether the HTLC is a dust.
+	// - For dust payment, it should be failed now as the HTLC won't go
+	//   onchain.
+	// - For non-dust payment, it should be marked as succeeded since her
+	//   outgoing htlc is swept by Bob.
+	require.NoError(ht, restartAlice())
+
+	// Since Alice is restarted, we need to track the payments again.
+	payStream := alice.RPC.TrackPaymentV2(payHash[:])
+	dustPayStream := alice.RPC.TrackPaymentV2(dustPayHash[:])
+
+	// Check that the dust payment is failed in both the stream and DB.
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_FAILED)
+	ht.AssertPaymentStatusFromStream(dustPayStream, lnrpc.Payment_FAILED)
+
+	// We expect the non-dust payment to marked as succeeded in Alice's
+	// database and also from her stream.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_SUCCEEDED)
+	ht.AssertPaymentStatusFromStream(payStream, lnrpc.Payment_SUCCEEDED)
+}
+
+// testPaymentFailedHTLCLocalSwept checks that when an outgoing HTLC is timed
+// out and claimed onchain via the timeout path, the payment will be marked as
+// failed. This test creates a topology from Alice -> Bob, and let Alice send
+// payments to Bob. Bob then goes offline, such that Alice's outgoing HTLC will
+// time out. Alice will also be restarted to make sure resumed payments are
+// also marked as failed.
+func testPaymentFailedHTLCLocalSwept(ht *lntest.HarnessTest) {
+	success := ht.Run("fail payment", func(t *testing.T) {
+		st := ht.Subtest(t)
+		runTestPaymentHTLCTimeout(st, false)
+	})
+	if !success {
+		return
+	}
+
+	ht.Run("fail resumed payment", func(t *testing.T) {
+		st := ht.Subtest(t)
+		runTestPaymentHTLCTimeout(st, true)
+	})
+}
+
+// runTestPaymentHTLCTimeout is the helper function that actually runs the
+// testPaymentFailedHTLCLocalSwept.
+func runTestPaymentHTLCTimeout(ht *lntest.HarnessTest, restartAlice bool) {
+	// Set the feerate to be 10 sat/vb.
+	ht.SetFeeEstimate(2500)
+
+	// Open a channel with 100k satoshis between Alice and Bob with Alice
+	// being the sole funder of the channel.
+	chanAmt := btcutil.Amount(100_000)
+	openChannelParams := lntest.OpenChannelParams{
+		Amt: chanAmt,
+	}
+
+	// Create a two hop network: Alice -> Bob.
+	chanPoints, nodes := createSimpleNetwork(ht, nil, 2, openChannelParams)
+	chanPoint := chanPoints[0]
+	alice, bob := nodes[0], nodes[1]
+
+	// We now create two payments, one above dust and the other below dust,
+	// and we should see different behavior in terms of when the payment
+	// will be marked as failed due to the HTLC timeout.
+	//
+	// First, create random preimages.
+	preimage := ht.RandomPreimage()
+	dustPreimage := ht.RandomPreimage()
+
+	// Get the preimage hashes.
+	payHash := preimage.Hash()
+	dustPayHash := dustPreimage.Hash()
+
+	// Create an hold invoice for Bob which expects a payment of 10k
+	// satoshis from Alice.
+	const paymentAmt = 20_000
+	req := &invoicesrpc.AddHoldInvoiceRequest{
+		Value: paymentAmt,
+		Hash:  payHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	invoice := bob.RPC.AddHoldInvoice(req)
+
+	// Create another hold invoice for Bob which expects a payment of 1k
+	// satoshis from Alice.
+	const dustAmt = 1000
+	req = &invoicesrpc.AddHoldInvoiceRequest{
+		Value: dustAmt,
+		Hash:  dustPayHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	dustInvoice := bob.RPC.AddHoldInvoice(req)
+
+	// Alice now sends both the payments to Bob.
+	payReq := &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice.PaymentRequest,
+		TimeoutSeconds: 3600,
+	}
+	dustPayReq := &routerrpc.SendPaymentRequest{
+		PaymentRequest: dustInvoice.PaymentRequest,
+		TimeoutSeconds: 3600,
+	}
+
+	// We expect the payment to stay in-flight from both streams.
+	ht.SendPaymentAssertInflight(alice, payReq)
+	ht.SendPaymentAssertInflight(alice, dustPayReq)
+
+	// We also check the payments are marked as IN_FLIGHT in Alice's
+	// database.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_IN_FLIGHT)
+
+	// Bob should have two incoming HTLC.
+	ht.AssertIncomingHTLCActive(bob, chanPoint, payHash[:])
+	ht.AssertIncomingHTLCActive(bob, chanPoint, dustPayHash[:])
+
+	// Alice should have two outgoing HTLCs.
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, payHash[:])
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, dustPayHash[:])
+
+	// Let Bob go offline.
+	ht.Shutdown(bob)
+
+	// We'll now mine enough blocks to trigger Alice to broadcast her
+	// commitment transaction due to the fact that the HTLC is about to
+	// timeout. With the default outgoing broadcast delta of zero, this
+	// will be the same height as the htlc expiry height.
+	numBlocks := padCLTV(
+		uint32(req.CltvExpiry - lncfg.DefaultOutgoingBroadcastDelta),
+	)
+	ht.MineBlocks(int(numBlocks))
+
+	// Restart Alice if requested.
+	if restartAlice {
+		// Restart Alice to test the resumed payment is canceled.
+		ht.RestartNode(alice)
+	}
+
+	// We now subscribe to the payment status.
+	payStream := alice.RPC.TrackPaymentV2(payHash[:])
+	dustPayStream := alice.RPC.TrackPaymentV2(dustPayHash[:])
+
+	// Mine a block to confirm Alice's closing transaction.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Now the channel is closed, we expect different behaviors based on
+	// whether the HTLC is a dust. For dust payment, it should be failed
+	// now as the HTLC won't go onchain. For non-dust payment, it should
+	// still be inflight. It won't be marked as failed unless the outgoing
+	// HTLC is resolved onchain.
+	//
+	// NOTE: it's possible for Bob to race against Alice using the
+	// preimage path. If Bob successfully claims the HTLC, Alice should
+	// mark the non-dust payment as succeeded.
+	//
+	// Check that the dust payment is failed in both the stream and DB.
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_FAILED)
+	ht.AssertPaymentStatusFromStream(dustPayStream, lnrpc.Payment_FAILED)
+
+	// Check that the non-dust payment is still in-flight.
+	//
+	// NOTE: we don't check the payment status from the stream here as
+	// there's no new status being sent.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+
+	// We now have two possible cases for the non-dust payment:
+	// - Bob stays offline, and Alice will sweep her outgoing HTLC, which
+	//   makes the payment failed.
+	// - Bob comes back online, and claims the HTLC on Alice's commitment
+	//   via direct preimage spend, hence racing against Alice onchain. If
+	//   he succeeds, Alice should mark the payment as succeeded.
+	//
+	// TODO(yy): test the second case once we have the RPC to clean
+	// mempool.
+
+	// Since Alice's force close transaction has been confirmed, she should
+	// sweep her outgoing HTLC in next block.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Cleanup the channel.
+	ht.CleanupForceClose(alice)
+
+	// We expect the non-dust payment to marked as failed in Alice's
+	// database and also from her stream.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_FAILED)
+	ht.AssertPaymentStatusFromStream(payStream, lnrpc.Payment_FAILED)
+}
 
 // testSendDirectPayment creates a topology Alice->Bob and then tests that
 // Alice can send a direct payment to Bob. This test modifies the fee estimator
@@ -25,7 +340,7 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 	alice, bob := ht.Alice, ht.Bob
 
 	// Create a list of commitment types we want to test.
-	commitTyes := []lnrpc.CommitmentType{
+	commitmentTypes := []lnrpc.CommitmentType{
 		lnrpc.CommitmentType_ANCHORS,
 		lnrpc.CommitmentType_SIMPLE_TAPROOT,
 	}
@@ -109,7 +424,7 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 	}
 
 	// Run the test cases.
-	for _, ct := range commitTyes {
+	for _, ct := range commitmentTypes {
 		ht.Run(ct.String(), func(t *testing.T) {
 			st := ht.Subtest(t)
 
@@ -132,8 +447,9 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 			}
 
 			// Open private channel for taproot channels.
-			params.Private = ct ==
-				lnrpc.CommitmentType_SIMPLE_TAPROOT
+			if ct == lnrpc.CommitmentType_SIMPLE_TAPROOT {
+				params.Private = true
+			}
 
 			testSendPayment(st, params)
 		})
@@ -429,7 +745,7 @@ func runAsyncPayments(ht *lntest.HarnessTest, alice, bob *node.HarnessNode,
 	// likely be lower, but we can't guarantee that any more HTLCs will
 	// succeed due to the limited path diversity and inability of the router
 	// to retry via another path.
-	numInvoices := int(input.MaxHTLCNumber / 2)
+	numInvoices := input.MaxHTLCNumber / 2
 
 	bobAmt := int64(numInvoices * paymentAmt)
 	aliceAmt := info.LocalBalance - bobAmt
@@ -504,7 +820,7 @@ func testBidirectionalAsyncPayments(ht *lntest.HarnessTest) {
 	args := []string{
 		// Increase the dust threshold to avoid the payments fail due
 		// to threshold limit reached.
-		"--dust-threshold=5000000",
+		"--dust-threshold=10000000",
 
 		// Increase the pending commit interval since there are lots of
 		// commitment dances.
@@ -534,10 +850,10 @@ func testBidirectionalAsyncPayments(ht *lntest.HarnessTest) {
 
 	// We'll create a number of invoices equal the max number of HTLCs that
 	// can be carried in one direction. The number on the commitment will
-	// likely be lower, but we can't guarantee that any more HTLCs will
-	// succeed due to the limited path diversity and inability of the router
-	// to retry via another path.
-	numInvoices := int(input.MaxHTLCNumber / 2)
+	// likely be lower, but we can't guarantee that more HTLCs will succeed
+	// due to the limited path diversity and inability of the router to
+	// retry via another path.
+	numInvoices := input.MaxHTLCNumber / 2
 
 	// Nodes should exchange the same amount of money and because of this
 	// at the end balances should remain the same.
@@ -597,7 +913,7 @@ func testBidirectionalAsyncPayments(ht *lntest.HarnessTest) {
 	assertChannelState(ht, alice, chanPoint, aliceAmt, bobAmt)
 
 	// Next query for Bob's and Alice's channel states, in order to confirm
-	// that all payment have been successful transmitted.
+	// that all payment have been successfully transmitted.
 	assertChannelState(ht, bob, chanPoint, bobAmt, aliceAmt)
 
 	// Finally, immediately close the channel. This function will also
@@ -662,7 +978,7 @@ func testInvoiceSubscriptions(ht *lntest.HarnessTest) {
 
 	// Now that the set of invoices has been added, we'll re-register for
 	// streaming invoice notifications for Bob, this time specifying the
-	// add invoice of the last prior invoice.
+	// add index of the last prior invoice.
 	req = &lnrpc.InvoiceSubscription{AddIndex: lastAddIndex}
 	bobInvoiceSubscription = bob.RPC.SubscribeInvoices(req)
 
@@ -765,4 +1081,350 @@ func assertChannelState(ht *lntest.HarnessTest, hn *node.HarnessNode,
 		return nil
 	}, lntest.DefaultTimeout)
 	require.NoError(ht, err, "timeout while chekcing for balance")
+}
+
+// testPaymentFailureReasonCanceled ensures that the cancellation of a
+// SendPayment request results in the payment failure reason
+// FAILURE_REASON_CANCELED. This failure reason indicates that the context was
+// cancelled manually by the user. It does not interrupt the current payment
+// attempt, but will prevent any further payment attempts. The test steps are:
+// 1.) Alice pays Carol's invoice through Bob.
+// 2.) Bob intercepts the htlc, keeping the payment pending.
+// 3.) Alice cancels the payment context, the payment is still pending.
+// 4.) Bob fails OR resumes the intercepted HTLC.
+// 5.) Alice observes a failed OR succeeded payment with failure reason
+// FAILURE_REASON_CANCELED which suppresses further payment attempts.
+func testPaymentFailureReasonCanceled(ht *lntest.HarnessTest) {
+	// Initialize the test context with 3 connected nodes.
+	ts := newInterceptorTestScenario(ht)
+
+	alice, bob, carol := ts.alice, ts.bob, ts.carol
+
+	// Open and wait for channels.
+	const chanAmt = btcutil.Amount(300000)
+	p := lntest.OpenChannelParams{Amt: chanAmt}
+	reqs := []*lntest.OpenChannelRequest{
+		{Local: alice, Remote: bob, Param: p},
+		{Local: bob, Remote: carol, Param: p},
+	}
+	resp := ht.OpenMultiChannelsAsync(reqs)
+	cpAB, cpBC := resp[0], resp[1]
+
+	// Make sure Alice is aware of channel Bob=>Carol.
+	ht.AssertTopologyChannelOpen(alice, cpBC)
+
+	// First we check that the payment is successful when bob resumes the
+	// htlc even though the payment context was canceled before invoice
+	// settlement.
+	sendPaymentInterceptAndCancel(
+		ht, ts, cpAB, routerrpc.ResolveHoldForwardAction_RESUME,
+		lnrpc.Payment_SUCCEEDED,
+	)
+
+	// Next we check that the context cancellation results in the expected
+	// failure reason while the htlc is being held and failed after
+	// cancellation.
+	// Note that we'd have to reset Alice's mission control if we tested the
+	// htlc fail case before the htlc resume case.
+	sendPaymentInterceptAndCancel(
+		ht, ts, cpAB, routerrpc.ResolveHoldForwardAction_FAIL,
+		lnrpc.Payment_FAILED,
+	)
+
+	// Finally, close channels.
+	ht.CloseChannel(alice, cpAB)
+	ht.CloseChannel(bob, cpBC)
+}
+
+func sendPaymentInterceptAndCancel(ht *lntest.HarnessTest,
+	ts *interceptorTestScenario, cpAB *lnrpc.ChannelPoint,
+	interceptorAction routerrpc.ResolveHoldForwardAction,
+	expectedPaymentStatus lnrpc.Payment_PaymentStatus) {
+
+	// Prepare the test cases.
+	alice, bob, carol := ts.alice, ts.bob, ts.carol
+
+	// Connect the interceptor.
+	interceptor, cancelInterceptor := bob.RPC.HtlcInterceptor()
+
+	// Prepare the test cases.
+	addResponse := carol.RPC.AddInvoice(&lnrpc.Invoice{
+		ValueMsat: 1000,
+	})
+	invoice := carol.RPC.LookupInvoice(addResponse.RHash)
+
+	// We initiate a payment from Alice and define the payment context
+	// cancellable.
+	ctx, cancelPaymentContext := context.WithCancel(context.Background())
+	var paymentStream rpc.PaymentClient
+	go func() {
+		req := &routerrpc.SendPaymentRequest{
+			PaymentRequest: invoice.PaymentRequest,
+			TimeoutSeconds: 60,
+			FeeLimitSat:    100000,
+			Cancelable:     true,
+		}
+
+		paymentStream = alice.RPC.SendPaymentWithContext(ctx, req)
+	}()
+
+	// We start the htlc interceptor with a simple implementation that
+	// saves all intercepted packets. These packets are held to simulate a
+	// pending payment.
+	packet := ht.ReceiveHtlcInterceptor(interceptor)
+
+	// Here we should wait for the channel to contain a pending htlc, and
+	// also be shown as being active.
+	ht.AssertIncomingHTLCActive(bob, cpAB, invoice.RHash)
+
+	// Ensure that Alice's payment is in-flight because Bob is holding the
+	// htlc.
+	ht.AssertPaymentStatusFromStream(paymentStream, lnrpc.Payment_IN_FLIGHT)
+
+	// Cancel the payment context. This should end the payment stream
+	// context, but the payment should still be in state in-flight without a
+	// failure reason.
+	cancelPaymentContext()
+
+	var preimage lntypes.Preimage
+	copy(preimage[:], invoice.RPreimage)
+	payment := ht.AssertPaymentStatus(
+		alice, preimage, lnrpc.Payment_IN_FLIGHT,
+	)
+	reasonNone := lnrpc.PaymentFailureReason_FAILURE_REASON_NONE
+	require.Equal(ht, reasonNone, payment.FailureReason)
+
+	// Bob sends the interceptor action to the intercepted htlc.
+	err := interceptor.Send(&routerrpc.ForwardHtlcInterceptResponse{
+		IncomingCircuitKey: packet.IncomingCircuitKey,
+		Action:             interceptorAction,
+	})
+	require.NoError(ht, err, "failed to send request")
+
+	// Assert that the payment status is as expected.
+	ht.AssertPaymentStatus(alice, preimage, expectedPaymentStatus)
+
+	// Since the payment context was cancelled, no further payment attempts
+	// should've been made, and we observe FAILURE_REASON_CANCELED.
+	expectedReason := lnrpc.PaymentFailureReason_FAILURE_REASON_CANCELED
+	ht.AssertPaymentFailureReason(alice, preimage, expectedReason)
+
+	// Cancel the context, which will disconnect the above interceptor.
+	cancelInterceptor()
+}
+
+// testSendToRouteFailHTLCTimeout is similar to
+// testPaymentFailedHTLCLocalSwept. The only difference is the `SendPayment` is
+// replaced with `SendToRouteV2`. It checks that when an outgoing HTLC is timed
+// out and claimed onchain via the timeout path, the payment will be marked as
+// failed. This test creates a topology from Alice -> Bob, and let Alice send
+// payments to Bob. Bob then goes offline, such that Alice's outgoing HTLC will
+// time out. Alice will also be restarted to make sure resumed payments are
+// also marked as failed.
+func testSendToRouteFailHTLCTimeout(ht *lntest.HarnessTest) {
+	success := ht.Run("fail payment", func(t *testing.T) {
+		st := ht.Subtest(t)
+		runSendToRouteFailHTLCTimeout(st, false)
+	})
+	if !success {
+		return
+	}
+
+	ht.Run("fail resumed payment", func(t *testing.T) {
+		st := ht.Subtest(t)
+		runTestPaymentHTLCTimeout(st, true)
+	})
+}
+
+// runSendToRouteFailHTLCTimeout is the helper function that actually runs the
+// testSendToRouteFailHTLCTimeout.
+func runSendToRouteFailHTLCTimeout(ht *lntest.HarnessTest, restartAlice bool) {
+	// Set the feerate to be 10 sat/vb.
+	ht.SetFeeEstimate(2500)
+
+	// Open a channel with 100k satoshis between Alice and Bob with Alice
+	// being the sole funder of the channel.
+	chanAmt := btcutil.Amount(100_000)
+	openChannelParams := lntest.OpenChannelParams{
+		Amt: chanAmt,
+	}
+
+	// Create a two hop network: Alice -> Bob.
+	chanPoints, nodes := createSimpleNetwork(ht, nil, 2, openChannelParams)
+	chanPoint := chanPoints[0]
+	alice, bob := nodes[0], nodes[1]
+
+	// We now create two payments, one above dust and the other below dust,
+	// and we should see different behavior in terms of when the payment
+	// will be marked as failed due to the HTLC timeout.
+	//
+	// First, create random preimages.
+	preimage := ht.RandomPreimage()
+	dustPreimage := ht.RandomPreimage()
+
+	// Get the preimage hashes.
+	payHash := preimage.Hash()
+	dustPayHash := dustPreimage.Hash()
+
+	// Create an hold invoice for Bob which expects a payment of 10k
+	// satoshis from Alice.
+	const paymentAmt = 20_000
+	req := &invoicesrpc.AddHoldInvoiceRequest{
+		Value: paymentAmt,
+		Hash:  payHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	invoice := bob.RPC.AddHoldInvoice(req)
+
+	// Create another hold invoice for Bob which expects a payment of 1k
+	// satoshis from Alice.
+	const dustAmt = 1000
+	req = &invoicesrpc.AddHoldInvoiceRequest{
+		Value: dustAmt,
+		Hash:  dustPayHash[:],
+		// Use a small CLTV value so we can mine fewer blocks.
+		CltvExpiry: finalCltvDelta,
+	}
+	dustInvoice := bob.RPC.AddHoldInvoice(req)
+
+	// Construct a route to send the non-dust payment.
+	go func() {
+		// Query the route to send the payment.
+		routesReq := &lnrpc.QueryRoutesRequest{
+			PubKey:         bob.PubKeyStr,
+			Amt:            paymentAmt,
+			FinalCltvDelta: finalCltvDelta,
+		}
+		routes := alice.RPC.QueryRoutes(routesReq)
+		require.Len(ht, routes.Routes, 1)
+
+		route := routes.Routes[0]
+		require.Len(ht, route.Hops, 1)
+
+		// Modify the hop to include MPP info.
+		route.Hops[0].MppRecord = &lnrpc.MPPRecord{
+			PaymentAddr: invoice.PaymentAddr,
+			TotalAmtMsat: int64(
+				lnwire.NewMSatFromSatoshis(paymentAmt),
+			),
+		}
+
+		// Send the payment with the modified value.
+		req := &routerrpc.SendToRouteRequest{
+			PaymentHash: payHash[:],
+			Route:       route,
+		}
+
+		// Send the payment and expect no error.
+		attempt := alice.RPC.SendToRouteV2(req)
+		require.Equal(ht, lnrpc.HTLCAttempt_FAILED, attempt.Status)
+	}()
+
+	// Check that the payment is in-flight.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+
+	// Construct a route to send the dust payment.
+	go func() {
+		// Query the route to send the payment.
+		routesReq := &lnrpc.QueryRoutesRequest{
+			PubKey:         bob.PubKeyStr,
+			Amt:            dustAmt,
+			FinalCltvDelta: finalCltvDelta,
+		}
+		routes := alice.RPC.QueryRoutes(routesReq)
+		require.Len(ht, routes.Routes, 1)
+
+		route := routes.Routes[0]
+		require.Len(ht, route.Hops, 1)
+
+		// Modify the hop to include MPP info.
+		route.Hops[0].MppRecord = &lnrpc.MPPRecord{
+			PaymentAddr: dustInvoice.PaymentAddr,
+			TotalAmtMsat: int64(
+				lnwire.NewMSatFromSatoshis(dustAmt),
+			),
+		}
+
+		// Send the payment with the modified value.
+		req := &routerrpc.SendToRouteRequest{
+			PaymentHash: dustPayHash[:],
+			Route:       route,
+		}
+
+		// Send the payment and expect no error.
+		attempt := alice.RPC.SendToRouteV2(req)
+		require.Equal(ht, lnrpc.HTLCAttempt_FAILED, attempt.Status)
+	}()
+
+	// Check that the dust payment is in-flight.
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_IN_FLIGHT)
+
+	// Bob should have two incoming HTLC.
+	ht.AssertIncomingHTLCActive(bob, chanPoint, payHash[:])
+	ht.AssertIncomingHTLCActive(bob, chanPoint, dustPayHash[:])
+
+	// Alice should have two outgoing HTLCs.
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, payHash[:])
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, dustPayHash[:])
+
+	// Let Bob go offline.
+	ht.Shutdown(bob)
+
+	// We'll now mine enough blocks to trigger Alice to broadcast her
+	// commitment transaction due to the fact that the HTLC is about to
+	// timeout. With the default outgoing broadcast delta of zero, this
+	// will be the same height as the htlc expiry height.
+	numBlocks := padCLTV(
+		uint32(req.CltvExpiry - lncfg.DefaultOutgoingBroadcastDelta),
+	)
+	ht.MineEmptyBlocks(int(numBlocks - 1))
+
+	// Restart Alice if requested.
+	if restartAlice {
+		// Restart Alice to test the resumed payment is canceled.
+		ht.RestartNode(alice)
+	}
+
+	// We now subscribe to the payment status.
+	payStream := alice.RPC.TrackPaymentV2(payHash[:])
+	dustPayStream := alice.RPC.TrackPaymentV2(dustPayHash[:])
+
+	// Mine a block to confirm Alice's closing transaction.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Now the channel is closed, we expect different behaviors based on
+	// whether the HTLC is a dust. For dust payment, it should be failed
+	// now as the HTLC won't go onchain. For non-dust payment, it should
+	// still be inflight. It won't be marked as failed unless the outgoing
+	// HTLC is resolved onchain.
+	//
+	// Check that the dust payment is failed in both the stream and DB.
+	ht.AssertPaymentStatus(alice, dustPreimage, lnrpc.Payment_FAILED)
+	ht.AssertPaymentStatusFromStream(dustPayStream, lnrpc.Payment_FAILED)
+
+	// Check that the non-dust payment is still in-flight.
+	//
+	// NOTE: we don't check the payment status from the stream here as
+	// there's no new status being sent.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+
+	// We now have two possible cases for the non-dust payment:
+	// - Bob stays offline, and Alice will sweep her outgoing HTLC, which
+	//   makes the payment failed.
+	// - Bob comes back online, and claims the HTLC on Alice's commitment
+	//   via direct preimage spend, hence racing against Alice onchain. If
+	//   he succeeds, Alice should mark the payment as succeeded.
+	//
+	// TODO(yy): test the second case once we have the RPC to clean
+	// mempool.
+
+	// Since Alice's force close transaction has been confirmed, she should
+	// sweep her outgoing HTLC in next block.
+	ht.MineBlocksAndAssertNumTxes(2, 1)
+
+	// We expect the non-dust payment to marked as failed in Alice's
+	// database and also from her stream.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_FAILED)
+	ht.AssertPaymentStatusFromStream(payStream, lnrpc.Payment_FAILED)
 }

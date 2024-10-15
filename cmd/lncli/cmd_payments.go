@@ -139,6 +139,17 @@ var (
 		Usage: "(blinded paths) the total cltv delay for the " +
 			"blinded portion of the route",
 	}
+
+	cancelableFlag = cli.BoolFlag{
+		Name: "cancelable",
+		Usage: "if set to true, the payment loop can be interrupted " +
+			"by manually canceling the payment context, even " +
+			"before the payment timeout is reached. Note that " +
+			"the payment may still succeed after cancellation, " +
+			"as in-flight attempts can still settle afterwards. " +
+			"Canceling will only prevent further attempts from " +
+			"being sent",
+	}
 )
 
 // paymentFlags returns common flags for sendpayment and payinvoice.
@@ -166,6 +177,7 @@ func paymentFlags() []cli.Flag {
 				"after the timeout has elapsed",
 			Value: paymentTimeout,
 		},
+		cancelableFlag,
 		cltvLimitFlag,
 		lastHopFlag,
 		cli.Int64SliceFlag{
@@ -328,14 +340,16 @@ func sendPayment(ctx *cli.Context) error {
 			PaymentRequest:    stripPrefix(ctx.String("pay_req")),
 			Amt:               ctx.Int64("amt"),
 			DestCustomRecords: make(map[uint64][]byte),
+			Amp:               ctx.Bool(ampFlag.Name),
+			Cancelable:        ctx.Bool(cancelableFlag.Name),
 		}
 
 		// We'll attempt to parse a payment address as well, given that
 		// if the user is using an AMP invoice, then they may be trying
 		// to specify that value manually.
 		//
-		// Don't parse unnamed arguments to prevent confusion with the main
-		// unnamed argument format for non-AMP payments.
+		// Don't parse unnamed arguments to prevent confusion with the
+		// main unnamed argument format for non-AMP payments.
 		payAddr, err := parsePayAddr(ctx, nil)
 		if err != nil {
 			return err
@@ -386,6 +400,7 @@ func sendPayment(ctx *cli.Context) error {
 		Amt:               amount,
 		DestCustomRecords: make(map[uint64][]byte),
 		Amp:               ctx.Bool(ampFlag.Name),
+		Cancelable:        ctx.Bool(cancelableFlag.Name),
 	}
 
 	var rHash []byte
@@ -887,6 +902,7 @@ func payInvoice(ctx *cli.Context) error {
 		Amt:               ctx.Int64("amt"),
 		DestCustomRecords: make(map[uint64][]byte),
 		Amp:               ctx.Bool(ampFlag.Name),
+		Cancelable:        ctx.Bool(cancelableFlag.Name),
 	}
 
 	return sendPaymentRequest(ctx, req)
@@ -1083,8 +1099,13 @@ var queryRoutesCommand = cli.Command{
 		},
 		cli.Int64Flag{
 			Name: "final_cltv_delta",
-			Usage: "(optional) number of blocks the last hop has to reveal " +
-				"the preimage",
+			Usage: "(optional) number of blocks the last hop has " +
+				"to reveal the preimage. Note that this " +
+				"should not be set in the case where the " +
+				"path includes a blinded path since in " +
+				"that case, the receiver will already have " +
+				"accounted for this value in the " +
+				"blinded_cltv value",
 		},
 		cli.BoolFlag{
 			Name:  "use_mc",
@@ -1220,6 +1241,13 @@ func parseBlindedPaymentParameters(ctx *cli.Context) (
 	// blinded path.
 	if !ctx.IsSet(blindingPointFlag.Name) {
 		return nil, nil
+	}
+
+	// If a blinded path has been provided, then the final_cltv_delta flag
+	// should not be provided since this value will be ignored.
+	if ctx.IsSet("final_cltv_delta") {
+		return nil, fmt.Errorf("`final_cltv_delta` should not be " +
+			"provided if a blinded path is provided")
 	}
 
 	// If any one of our blinding related flags is set, we expect the

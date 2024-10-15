@@ -288,10 +288,11 @@ var sendCoinsCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name: "sweepall",
-			Usage: "if set, then the amount field will be ignored, " +
-				"and the wallet will attempt to sweep all " +
-				"outputs within the wallet to the target " +
-				"address",
+			Usage: "if set, then the amount field should be " +
+				"unset. This indicates that the wallet will " +
+				"attempt to sweep all outputs within the " +
+				"wallet or all funds in select utxos (when " +
+				"supplied) to the target address",
 		},
 		cli.Int64Flag{
 			Name:  "amt",
@@ -330,6 +331,17 @@ var sendCoinsCommand = cli.Command{
 				"scripts",
 		},
 		coinSelectionStrategyFlag,
+		cli.StringSliceFlag{
+			Name: "utxo",
+			Usage: "a utxo specified as outpoint(tx:idx) which " +
+				"will be used as input for the transaction. " +
+				"This flag can be repeatedly used to specify " +
+				"multiple utxos as inputs. The selected " +
+				"utxos can either be entirely spent by " +
+				"specifying the sweepall flag or a specified " +
+				"amount can be spent in the utxos through " +
+				"the amt flag",
+		},
 		txLabelFlag,
 	},
 	Action: actionDecorator(sendCoins),
@@ -337,9 +349,10 @@ var sendCoinsCommand = cli.Command{
 
 func sendCoins(ctx *cli.Context) error {
 	var (
-		addr string
-		amt  int64
-		err  error
+		addr      string
+		amt       int64
+		err       error
+		outpoints []*lnrpc.OutPoint
 	)
 	ctxc := getContext()
 	args := ctx.Args()
@@ -417,6 +430,15 @@ func sendCoins(ctx *cli.Context) error {
 		displayAmt = balanceResponse.GetConfirmedBalance()
 	}
 
+	if ctx.IsSet("utxo") {
+		utxos := ctx.StringSlice("utxo")
+
+		outpoints, err = UtxosToOutpoints(utxos)
+		if err != nil {
+			return fmt.Errorf("unable to decode utxos: %w", err)
+		}
+	}
+
 	// Ask for confirmation if we're on an actual terminal and the output is
 	// not being redirected to another command. This prevents existing shell
 	// scripts from breaking.
@@ -440,6 +462,7 @@ func sendCoins(ctx *cli.Context) error {
 		MinConfs:              minConfs,
 		SpendUnconfirmed:      minConfs == 0,
 		CoinSelectionStrategy: coinSelectionStrategy,
+		Outpoints:             outpoints,
 	}
 	txid, err := client.SendCoins(ctxc, req)
 	if err != nil {
@@ -1309,7 +1332,7 @@ func abandonChannel(ctx *cli.Context) error {
 }
 
 // parseChannelPoint parses a funding txid and output index from the command
-// line. Both named options as well as unnamed parameters are supported.
+// line. Both named options and unnamed parameters are supported.
 func parseChannelPoint(ctx *cli.Context) (*lnrpc.ChannelPoint, error) {
 	channelPoint := &lnrpc.ChannelPoint{}
 	var err error
@@ -1632,7 +1655,7 @@ func listChannels(ctx *cli.Context) error {
 		peerKey = pk[:]
 	}
 
-	// By default we will look up the peers' alias information unless the
+	// By default, we will look up the peers' alias information unless the
 	// skip_peer_alias_lookup flag indicates otherwise.
 	lookupPeerAlias := !ctx.Bool("skip_peer_alias_lookup")
 
@@ -1787,8 +1810,16 @@ var getChanInfoCommand = cli.Command{
 	ArgsUsage: "chan_id",
 	Flags: []cli.Flag{
 		cli.Uint64Flag{
-			Name:  "chan_id",
-			Usage: "the 8-byte compact channel ID to query for",
+			Name: "chan_id",
+			Usage: "The 8-byte compact channel ID to query for. " +
+				"If this is set the chan_point param is " +
+				"ignored.",
+		},
+		cli.StringFlag{
+			Name: "chan_point",
+			Usage: "The channel point in format txid:index. If " +
+				"the chan_id param is set this param is " +
+				"ignored.",
 		},
 	},
 	Action: actionDecorator(getChanInfo),
@@ -1800,24 +1831,31 @@ func getChanInfo(ctx *cli.Context) error {
 	defer cleanUp()
 
 	var (
-		chanID uint64
-		err    error
+		chanID    uint64
+		chanPoint string
+		err       error
 	)
 
 	switch {
 	case ctx.IsSet("chan_id"):
 		chanID = ctx.Uint64("chan_id")
+
 	case ctx.Args().Present():
 		chanID, err = strconv.ParseUint(ctx.Args().First(), 10, 64)
 		if err != nil {
 			return fmt.Errorf("error parsing chan_id: %w", err)
 		}
+
+	case ctx.IsSet("chan_point"):
+		chanPoint = ctx.String("chan_point")
+
 	default:
-		return fmt.Errorf("chan_id argument missing")
+		return fmt.Errorf("chan_id or chan_point argument missing")
 	}
 
 	req := &lnrpc.ChanInfoRequest{
-		ChanId: chanID,
+		ChanId:    chanID,
+		ChanPoint: chanPoint,
 	}
 
 	chanInfo, err := client.GetChanInfo(ctxc, req)
@@ -2215,7 +2253,7 @@ var updateChannelPolicyCommand = cli.Command{
 				"forwarded HTLC and the outbound fee. Fee " +
 				"rate is expressed in parts per million and " +
 				"must be zero or negative - it is a discount " +
-				"for using a particular incoming channel." +
+				"for using a particular incoming channel. " +
 				"Note that forwards will be rejected if the " +
 				"discount exceeds the outbound fee " +
 				"(forward at a loss), and lead to " +
@@ -2789,7 +2827,7 @@ var restoreChanBackupCommand = cli.Command{
 }
 
 // errMissingChanBackup is an error returned when we attempt to parse a channel
-// backup from a CLI command and it is missing.
+// backup from a CLI command, and it is missing.
 var errMissingChanBackup = errors.New("missing channel backup")
 
 func parseChanBackups(ctx *cli.Context) (*lnrpc.RestoreChanBackupRequest, error) {

@@ -7,6 +7,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/stretchr/testify/require"
@@ -128,7 +129,9 @@ func TestBlindedPaymentToHints(t *testing.T) {
 		HtlcMaximum:         htlcMax,
 		Features:            features,
 	}
-	require.Nil(t, blindedPayment.toRouteHints())
+	hints, err := blindedPayment.toRouteHints(fn.None[*btcec.PublicKey]())
+	require.NoError(t, err)
+	require.Nil(t, hints)
 
 	// Populate the blinded payment with hops.
 	blindedPayment.BlindedPath.BlindedHops = []*sphinx.BlindedHopInfo{
@@ -146,41 +149,43 @@ func TestBlindedPaymentToHints(t *testing.T) {
 		},
 	}
 
+	policy1 := &models.CachedEdgePolicy{
+		TimeLockDelta: cltvDelta,
+		MinHTLC:       lnwire.MilliSatoshi(htlcMin),
+		MaxHTLC:       lnwire.MilliSatoshi(htlcMax),
+		FeeBaseMSat:   lnwire.MilliSatoshi(baseFee),
+		FeeProportionalMillionths: lnwire.MilliSatoshi(
+			ppmFee,
+		),
+		ToNodePubKey: func() route.Vertex {
+			return vb2
+		},
+		ToNodeFeatures: features,
+	}
+	policy2 := &models.CachedEdgePolicy{
+		ToNodePubKey: func() route.Vertex {
+			return vb3
+		},
+		ToNodeFeatures: features,
+	}
+
+	blindedEdge1, err := NewBlindedEdge(policy1, blindedPayment, 0)
+	require.NoError(t, err)
+
+	blindedEdge2, err := NewBlindedEdge(policy2, blindedPayment, 1)
+	require.NoError(t, err)
+
 	expected := RouteHints{
 		v1: {
-			//nolint:lll
-			&BlindedEdge{
-				policy: &models.CachedEdgePolicy{
-					TimeLockDelta: cltvDelta,
-					MinHTLC:       lnwire.MilliSatoshi(htlcMin),
-					MaxHTLC:       lnwire.MilliSatoshi(htlcMax),
-					FeeBaseMSat:   lnwire.MilliSatoshi(baseFee),
-					FeeProportionalMillionths: lnwire.MilliSatoshi(
-						ppmFee,
-					),
-					ToNodePubKey: func() route.Vertex {
-						return vb2
-					},
-					ToNodeFeatures: features,
-				},
-				blindingPoint: blindedPoint,
-				cipherText:    cipherText,
-			},
+			blindedEdge1,
 		},
 		vb2: {
-			&BlindedEdge{
-				policy: &models.CachedEdgePolicy{
-					ToNodePubKey: func() route.Vertex {
-						return vb3
-					},
-					ToNodeFeatures: features,
-				},
-				cipherText: cipherText,
-			},
+			blindedEdge2,
 		},
 	}
 
-	actual := blindedPayment.toRouteHints()
+	actual, err := blindedPayment.toRouteHints(fn.None[*btcec.PublicKey]())
+	require.NoError(t, err)
 
 	require.Equal(t, len(expected), len(actual))
 	for vertex, expectedHint := range expected {
@@ -202,10 +207,10 @@ func TestBlindedPaymentToHints(t *testing.T) {
 		// The arguments we use for the payload do not matter as long as
 		// both functions return the same payload.
 		expectedPayloadSize := expectedHint[0].IntermediatePayloadSize(
-			0, 0, false, 0,
+			0, 0, 0,
 		)
 		actualPayloadSize := actualHint[0].IntermediatePayloadSize(
-			0, 0, false, 0,
+			0, 0, 0,
 		)
 
 		require.Equal(t, expectedPayloadSize, actualPayloadSize)

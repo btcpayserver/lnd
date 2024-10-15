@@ -37,7 +37,7 @@ func TestBlindedDataEncoding(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		baseFee     uint32
+		baseFee     lnwire.MilliSatoshi
 		htlcMin     lnwire.MilliSatoshi
 		features    *lnwire.FeatureVector
 		constraints bool
@@ -101,7 +101,7 @@ func TestBlindedDataEncoding(t *testing.T) {
 				}
 			}
 
-			encodedData := NewBlindedRouteData(
+			encodedData := NewNonFinalBlindedRouteData(
 				channelID, pubkey(t), info, constraints,
 				testCase.features,
 			)
@@ -114,6 +114,163 @@ func TestBlindedDataEncoding(t *testing.T) {
 			require.NoError(t, err)
 
 			require.Equal(t, encodedData, decodedData)
+		})
+	}
+}
+
+// TestBlindedDataFinalHopEncoding tests the encoding and decoding of a blinded
+// data blob intended for the final hop of a blinded path where only the pathID
+// will potentially be set.
+func TestBlindedDataFinalHopEncoding(t *testing.T) {
+	tests := []struct {
+		name        string
+		pathID      []byte
+		constraints bool
+	}{
+		{
+			name:   "with path ID",
+			pathID: []byte{1, 2, 3, 4, 5, 6},
+		},
+		{
+			name:   "with no path ID",
+			pathID: nil,
+		},
+		{
+			name:        "with path ID and constraints",
+			pathID:      []byte{1, 2, 3, 4, 5, 6},
+			constraints: true,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var constraints *PaymentConstraints
+			if test.constraints {
+				constraints = &PaymentConstraints{
+					MaxCltvExpiry:   4,
+					HtlcMinimumMsat: 5,
+				}
+			}
+
+			encodedData := NewFinalHopBlindedRouteData(
+				constraints, test.pathID,
+			)
+
+			encoded, err := EncodeBlindedRouteData(encodedData)
+			require.NoError(t, err)
+
+			b := bytes.NewBuffer(encoded)
+			decodedData, err := DecodeBlindedRouteData(b)
+			require.NoError(t, err)
+
+			require.Equal(t, encodedData, decodedData)
+		})
+	}
+}
+
+// TestDummyHopBlindedDataEncoding tests the encoding and decoding of a blinded
+// data blob intended for hops preceding a dummy hop in a blinded path. These
+// hops provide the reader with a signal that the next hop may be a dummy hop.
+func TestDummyHopBlindedDataEncoding(t *testing.T) {
+	t.Parallel()
+
+	priv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	info := PaymentRelayInfo{
+		FeeRate:         2,
+		CltvExpiryDelta: 3,
+		BaseFee:         30,
+	}
+
+	constraints := PaymentConstraints{
+		MaxCltvExpiry:   4,
+		HtlcMinimumMsat: 100,
+	}
+
+	routeData := NewDummyHopRouteData(priv.PubKey(), info, constraints)
+
+	encoded, err := EncodeBlindedRouteData(routeData)
+	require.NoError(t, err)
+
+	// Assert the size of an average dummy hop payload in case we need to
+	// update this constant in future.
+	require.Len(t, encoded, AverageDummyHopPayloadSize)
+
+	b := bytes.NewBuffer(encoded)
+	decodedData, err := DecodeBlindedRouteData(b)
+	require.NoError(t, err)
+
+	require.Equal(t, routeData, decodedData)
+}
+
+// TestBlindedRouteDataPadding tests the PadBy method of BlindedRouteData.
+func TestBlindedRouteDataPadding(t *testing.T) {
+	newBlindedRouteData := func() *BlindedRouteData {
+		channelID := lnwire.NewShortChanIDFromInt(1)
+		info := PaymentRelayInfo{
+			FeeRate:         2,
+			CltvExpiryDelta: 3,
+			BaseFee:         30,
+		}
+
+		constraints := &PaymentConstraints{
+			MaxCltvExpiry:   4,
+			HtlcMinimumMsat: 100,
+		}
+
+		return NewNonFinalBlindedRouteData(
+			channelID, pubkey(t), info, constraints, nil,
+		)
+	}
+
+	tests := []struct {
+		name                 string
+		paddingSize          int
+		expectedSizeIncrease uint64
+	}{
+		{
+			// Calling PadBy with an n value of 0 in the case where
+			// there is not yet a padding field will result in a
+			// zero length TLV entry being added. This will add 2
+			// bytes for the type and length fields.
+			name:                 "no extra padding",
+			expectedSizeIncrease: 2,
+		},
+		{
+			name: "small padding (length " +
+				"field of 1 byte)",
+			paddingSize:          200,
+			expectedSizeIncrease: 202,
+		},
+		{
+			name: "medium padding (length field " +
+				"of 3 bytes)",
+			paddingSize:          256,
+			expectedSizeIncrease: 260,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := newBlindedRouteData()
+
+			prePaddingEncoding, err := EncodeBlindedRouteData(data)
+			require.NoError(t, err)
+
+			data.PadBy(test.paddingSize)
+
+			postPaddingEncoding, err := EncodeBlindedRouteData(data)
+			require.NoError(t, err)
+
+			require.EqualValues(
+				t, test.expectedSizeIncrease,
+				len(postPaddingEncoding)-
+					len(prePaddingEncoding),
+			)
 		})
 	}
 }
@@ -131,10 +288,11 @@ func TestBlindingSpecTestVectors(t *testing.T) {
 	tests := []struct {
 		encoded             string
 		expectedPaymentData *BlindedRouteData
+		expectedPadding     int
 	}{
 		{
 			encoded: "011a0000000000000000000000000000000000000000000000000000020800000000000006c10a0800240000009627100c06000b69e505dc0e00fd023103123456",
-			expectedPaymentData: NewBlindedRouteData(
+			expectedPaymentData: NewNonFinalBlindedRouteData(
 				lnwire.ShortChannelID{
 					BlockHeight: 0,
 					TxIndex:     0,
@@ -155,10 +313,11 @@ func TestBlindingSpecTestVectors(t *testing.T) {
 					lnwire.Features,
 				),
 			),
+			expectedPadding: 26,
 		},
 		{
 			encoded: "020800000000000004510821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0a0800300000006401f40c06000b69c105dc0e00",
-			expectedPaymentData: NewBlindedRouteData(
+			expectedPaymentData: NewNonFinalBlindedRouteData(
 				lnwire.ShortChannelID{
 					TxPosition: 1105,
 				},
@@ -175,7 +334,8 @@ func TestBlindingSpecTestVectors(t *testing.T) {
 				lnwire.NewFeatureVector(
 					lnwire.NewRawFeatureVector(),
 					lnwire.Features,
-				)),
+				),
+			),
 		},
 	}
 
@@ -188,6 +348,12 @@ func TestBlindingSpecTestVectors(t *testing.T) {
 
 			decodedRoute, err := DecodeBlindedRouteData(buff)
 			require.NoError(t, err)
+
+			if test.expectedPadding != 0 {
+				test.expectedPaymentData.PadBy(
+					test.expectedPadding,
+				)
+			}
 
 			require.Equal(
 				t, test.expectedPaymentData, decodedRoute,

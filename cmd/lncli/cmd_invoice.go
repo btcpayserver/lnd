@@ -60,6 +60,14 @@ var addInvoiceCommand = cli.Command{
 				"specified, an expiry of " +
 				"86400 seconds (24 hours) is implied.",
 		},
+		cli.Uint64Flag{
+			Name: "cltv_expiry_delta",
+			Usage: "The minimum CLTV delta to use for the final " +
+				"hop. If this is set to 0, the default value " +
+				"is used. The default value for " +
+				"cltv_expiry_delta is configured by the " +
+				"'bitcoin.timelockdelta' option.",
+		},
 		cli.BoolFlag{
 			Name: "private",
 			Usage: "encode routing hints in the invoice with " +
@@ -73,6 +81,40 @@ var addInvoiceCommand = cli.Command{
 			Name: "amp",
 			Usage: "creates an AMP invoice. If true, preimage " +
 				"should not be set.",
+		},
+		cli.BoolFlag{
+			Name: "blind",
+			Usage: "creates an invoice that contains blinded " +
+				"paths. Note that invoices with blinded " +
+				"paths will be signed using a random " +
+				"ephemeral key so as not to reveal the real " +
+				"node ID of this node.",
+		},
+		cli.UintFlag{
+			Name: "min_real_blinded_hops",
+			Usage: "The minimum number of real hops to use in a " +
+				"blinded path. This option will only be used " +
+				"if `--blind` has also been set.",
+		},
+		cli.UintFlag{
+			Name: "num_blinded_hops",
+			Usage: "The number of hops to use for each " +
+				"blinded path included in the invoice. This " +
+				"option will only be used if `--blind` has " +
+				"also been set. Dummy hops will be used to " +
+				"pad paths shorter than this.",
+		},
+		cli.UintFlag{
+			Name: "max_blinded_paths",
+			Usage: "The maximum number of blinded paths to add " +
+				"to an invoice. This option will only be " +
+				"used if `--blind` has also been set.",
+		},
+		cli.StringSliceFlag{
+			Name: "blinded_path_omit_node",
+			Usage: "The pub key (in hex) of a node not to " +
+				"use on a blinded path. The flag may be " +
+				"specified multiple times.",
 		},
 	},
 	Action: actionDecorator(addInvoice),
@@ -119,16 +161,30 @@ func addInvoice(ctx *cli.Context) error {
 		return fmt.Errorf("unable to parse description_hash: %w", err)
 	}
 
+	if ctx.IsSet("private") && ctx.IsSet("blind") {
+		return fmt.Errorf("cannot include both route hints and " +
+			"blinded paths in the same invoice")
+	}
+
+	blindedPathCfg, err := parseBlindedPathCfg(ctx)
+	if err != nil {
+		return fmt.Errorf("could not parse blinded path config: %w",
+			err)
+	}
+
 	invoice := &lnrpc.Invoice{
-		Memo:            ctx.String("memo"),
-		RPreimage:       preimage,
-		Value:           amt,
-		ValueMsat:       amtMsat,
-		DescriptionHash: descHash,
-		FallbackAddr:    ctx.String("fallback_addr"),
-		Expiry:          ctx.Int64("expiry"),
-		Private:         ctx.Bool("private"),
-		IsAmp:           ctx.Bool("amp"),
+		Memo:              ctx.String("memo"),
+		RPreimage:         preimage,
+		Value:             amt,
+		ValueMsat:         amtMsat,
+		DescriptionHash:   descHash,
+		FallbackAddr:      ctx.String("fallback_addr"),
+		Expiry:            ctx.Int64("expiry"),
+		CltvExpiry:        ctx.Uint64("cltv_expiry_delta"),
+		Private:           ctx.Bool("private"),
+		IsAmp:             ctx.Bool("amp"),
+		IsBlinded:         ctx.Bool("blind"),
+		BlindedPathConfig: blindedPathCfg,
 	}
 
 	resp, err := client.AddInvoice(ctxc, invoice)
@@ -139,6 +195,51 @@ func addInvoice(ctx *cli.Context) error {
 	printRespJSON(resp)
 
 	return nil
+}
+
+func parseBlindedPathCfg(ctx *cli.Context) (*lnrpc.BlindedPathConfig, error) {
+	if !ctx.Bool("blind") {
+		if ctx.IsSet("min_real_blinded_hops") ||
+			ctx.IsSet("num_blinded_hops") ||
+			ctx.IsSet("max_blinded_paths") ||
+			ctx.IsSet("blinded_path_omit_node") {
+
+			return nil, fmt.Errorf("blinded path options are " +
+				"only used if the `--blind` options is set")
+		}
+
+		return nil, nil
+	}
+
+	var blindCfg lnrpc.BlindedPathConfig
+
+	if ctx.IsSet("min_real_blinded_hops") {
+		minNumRealHops := uint32(ctx.Uint("min_real_blinded_hops"))
+		blindCfg.MinNumRealHops = &minNumRealHops
+	}
+
+	if ctx.IsSet("num_blinded_hops") {
+		numHops := uint32(ctx.Uint("num_blinded_hops"))
+		blindCfg.NumHops = &numHops
+	}
+
+	if ctx.IsSet("max_blinded_paths") {
+		maxPaths := uint32(ctx.Uint("max_blinded_paths"))
+		blindCfg.MaxNumPaths = &maxPaths
+	}
+
+	for _, pubKey := range ctx.StringSlice("blinded_path_omit_node") {
+		pubKeyBytes, err := hex.DecodeString(pubKey)
+		if err != nil {
+			return nil, err
+		}
+
+		blindCfg.NodeOmissionList = append(
+			blindCfg.NodeOmissionList, pubKeyBytes,
+		)
+	}
+
+	return &blindCfg, nil
 }
 
 var lookupInvoiceCommand = cli.Command{

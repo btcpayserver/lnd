@@ -23,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
+	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -655,7 +656,7 @@ func (h *HarnessTest) AssertStreamChannelCoopClosed(hn *node.HarnessNode,
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.Miner.AssertTxInBlock(block, closingTxid)
+	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels now.
 	h.AssertNumWaitingClose(hn, 0)
@@ -699,7 +700,7 @@ func (h *HarnessTest) AssertStreamChannelForceClosed(hn *node.HarnessNode,
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.Miner.AssertTxInBlock(block, closingTxid)
+	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels and 1 pending force close
 	// channels now.
@@ -784,8 +785,13 @@ func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 			return nil
 		}
 
+		desc := "has UTXOs:\n"
+		for _, utxo := range resp.Utxos {
+			desc += fmt.Sprintf("%v\n", utxo)
+		}
+
 		return errNumNotMatched(hn.Name(), "num of UTXOs",
-			expectedUtxos, total-old, total, old)
+			expectedUtxos, total-old, total, old, desc)
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout waiting for UTXOs")
 
@@ -937,7 +943,7 @@ func (h *HarnessTest) RandomPreimage() lntypes.Preimage {
 
 // DecodeAddress decodes a given address and asserts there's no error.
 func (h *HarnessTest) DecodeAddress(addr string) btcutil.Address {
-	resp, err := btcutil.DecodeAddress(addr, harnessNetParams)
+	resp, err := btcutil.DecodeAddress(addr, miner.HarnessNetParams)
 	require.NoError(h, err, "DecodeAddress failed")
 
 	return resp
@@ -1633,6 +1639,24 @@ func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
 	return target
 }
 
+// AssertPaymentFailureReason asserts that the given node lists a payment with
+// the given preimage which has the expected failure reason.
+func (h *HarnessTest) AssertPaymentFailureReason(hn *node.HarnessNode,
+	preimage lntypes.Preimage, reason lnrpc.PaymentFailureReason) {
+
+	payHash := preimage.Hash()
+	err := wait.NoError(func() error {
+		p := h.findPayment(hn, payHash.String())
+		if reason == p.FailureReason {
+			return nil
+		}
+
+		return fmt.Errorf("payment: %v failure reason not match, "+
+			"want %s got %s", payHash, reason, p.Status)
+	}, DefaultTimeout)
+	require.NoError(h, err, "timeout checking payment failure reason")
+}
+
 // AssertActiveNodesSynced asserts all active nodes have synced to the chain.
 func (h *HarnessTest) AssertActiveNodesSynced() {
 	for _, node := range h.manager.activeNodes {
@@ -1820,6 +1844,37 @@ func (h *HarnessTest) AssertZombieChannel(hn *node.HarnessNode, chanID uint64) {
 	require.NoError(h, err, "timeout while checking zombie channel")
 }
 
+// AssertNotInGraph asserts that a given channel is either not found at all in
+// the graph or that it has been marked as a zombie.
+func (h *HarnessTest) AssertNotInGraph(hn *node.HarnessNode, chanID uint64) {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	err := wait.NoError(func() error {
+		_, err := hn.RPC.LN.GetChanInfo(
+			ctxt, &lnrpc.ChanInfoRequest{ChanId: chanID},
+		)
+		if err == nil {
+			return fmt.Errorf("expected error but got nil")
+		}
+
+		switch {
+		case strings.Contains(err.Error(), "marked as zombie"):
+			return nil
+
+		case strings.Contains(err.Error(), "edge not found"):
+			return nil
+
+		default:
+			return fmt.Errorf("expected error to contain either "+
+				"'%s' or '%s' but was: '%v'", "marked as i"+
+				"zombie", "edge not found", err)
+		}
+	}, DefaultTimeout)
+	require.NoError(h, err, "timeout while checking that channel is not "+
+		"found in graph")
+}
+
 // AssertTxAtHeight gets all of the transactions that a node's wallet has a
 // record of at the target height, and finds and returns the tx with the target
 // txid, failing if it is not found.
@@ -1984,6 +2039,7 @@ func (h *HarnessTest) CreateBurnAddr(addrType lnrpc.AddressType) ([]byte,
 	require.NoError(h, err)
 
 	randomKeyBytes := randomPrivKey.PubKey().SerializeCompressed()
+	harnessNetParams := miner.HarnessNetParams
 
 	var addr btcutil.Address
 	switch addrType {
@@ -2180,12 +2236,12 @@ func (h *HarnessTest) AssertFeeReport(hn *node.HarnessNode,
 //
 // TODO(yy): needs refactor to reduce its complexity.
 func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
-	fwdCount, fwdFailCount, settleCount int,
+	fwdCount, fwdFailCount, settleCount, linkFailCount int,
 	userType routerrpc.HtlcEvent_EventType) []*routerrpc.HtlcEvent {
 
-	var forwards, forwardFails, settles int
+	var forwards, forwardFails, settles, linkFails int
 
-	numEvents := fwdCount + fwdFailCount + settleCount
+	numEvents := fwdCount + fwdFailCount + settleCount + linkFailCount
 	events := make([]*routerrpc.HtlcEvent, 0)
 
 	// It's either the userType or the unknown type.
@@ -2218,6 +2274,9 @@ func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
 				settles++
 			}
 
+		case *routerrpc.HtlcEvent_LinkFailEvent:
+			linkFails++
+
 		default:
 			require.Fail(h, "assert event fail",
 				"unexpected event: %T", event.Event)
@@ -2228,6 +2287,7 @@ func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
 	require.Equal(h, fwdFailCount, forwardFails,
 		"num of forward fails mismatch")
 	require.Equal(h, settleCount, settles, "num of settles mismatch")
+	require.Equal(h, linkFailCount, linkFails, "num of link fails mismatch")
 
 	return events
 }
@@ -2531,11 +2591,11 @@ func (h *HarnessTest) AssertClosingTxInMempool(cp *lnrpc.ChannelPoint,
 	}
 
 	// Wait for the expected txes to be found in the mempool.
-	h.Miner.AssertNumTxsInMempool(expectedTxes)
+	h.AssertNumTxsInMempool(expectedTxes)
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	return closeTx
 }
@@ -2545,11 +2605,11 @@ func (h *HarnessTest) AssertClosingTxInMempool(cp *lnrpc.ChannelPoint,
 // will assert the anchor sweep tx is also in the mempool.
 func (h *HarnessTest) MineClosingTx(cp *lnrpc.ChannelPoint) *wire.MsgTx {
 	// Wait for the expected txes to be found in the mempool.
-	h.Miner.AssertNumTxsInMempool(1)
+	h.AssertNumTxsInMempool(1)
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	// Mine a block to confirm the closing transaction and potential anchor
 	// sweep.

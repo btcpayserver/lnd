@@ -150,13 +150,15 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 	}
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        aliceDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(channelCapacity),
 			ChanReserve:      channelCapacity / 100,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         uint16(csvTimeoutAlice),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: aliceDustLimit,
+			CsvDelay:  uint16(csvTimeoutAlice),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeys[0].PubKey(),
@@ -175,13 +177,15 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        bobDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(channelCapacity),
 			ChanReserve:      channelCapacity / 100,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         uint16(csvTimeoutBob),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: bobDustLimit,
+			CsvDelay:  uint16(csvTimeoutBob),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeys[0].PubKey(),
@@ -415,6 +419,28 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 	return channelAlice, channelBob, nil
 }
 
+// initMusigNonce is used to manually setup musig2 nonces for a new channel,
+// outside the normal chan-reest flow.
+func initMusigNonce(chanA, chanB *LightningChannel) error {
+	chanANonces, err := chanA.GenMusigNonces()
+	if err != nil {
+		return err
+	}
+	chanBNonces, err := chanB.GenMusigNonces()
+	if err != nil {
+		return err
+	}
+
+	if err := chanA.InitRemoteMusigNonces(chanBNonces); err != nil {
+		return err
+	}
+	if err := chanB.InitRemoteMusigNonces(chanANonces); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // initRevocationWindows simulates a new channel being opened within the p2p
 // network by populating the initial revocation windows of the passed
 // commitment state machines.
@@ -423,19 +449,7 @@ func initRevocationWindows(chanA, chanB *LightningChannel) error {
 	// either FundingLocked or ChannelReestablish by calling
 	// InitRemoteMusigNonces for both sides.
 	if chanA.channelState.ChanType.IsTaproot() {
-		chanANonces, err := chanA.GenMusigNonces()
-		if err != nil {
-			return err
-		}
-		chanBNonces, err := chanB.GenMusigNonces()
-		if err != nil {
-			return err
-		}
-
-		if err := chanA.InitRemoteMusigNonces(chanBNonces); err != nil {
-			return err
-		}
-		if err := chanB.InitRemoteMusigNonces(chanANonces); err != nil {
+		if err := initMusigNonce(chanA, chanB); err != nil {
 			return err
 		}
 	}

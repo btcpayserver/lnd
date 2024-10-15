@@ -25,6 +25,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -394,19 +395,11 @@ func (c ChannelType) IsTaproot() bool {
 	return c&SimpleTaprootFeatureBit == SimpleTaprootFeatureBit
 }
 
-// ChannelConstraints represents a set of constraints meant to allow a node to
-// limit their exposure, enact flow control and ensure that all HTLCs are
-// economically relevant. This struct will be mirrored for both sides of the
-// channel, as each side will enforce various constraints that MUST be adhered
-// to for the life time of the channel. The parameters for each of these
-// constraints are static for the duration of the channel, meaning the channel
-// must be torn down for them to change.
-type ChannelConstraints struct {
-	// DustLimit is the threshold (in satoshis) below which any outputs
-	// should be trimmed. When an output is trimmed, it isn't materialized
-	// as an actual output, but is instead burned to miner's fees.
-	DustLimit btcutil.Amount
-
+// ChannelStateBounds are the parameters from OpenChannel and AcceptChannel
+// that are responsible for providing bounds on the state space of the abstract
+// channel state. These values must be remembered for normal channel operation
+// but they do not impact how we compute the commitment transactions themselves.
+type ChannelStateBounds struct {
 	// ChanReserve is an absolute reservation on the channel for the
 	// owner of this set of constraints. This means that the current
 	// settled balance for this node CANNOT dip below the reservation
@@ -432,6 +425,19 @@ type ChannelConstraints struct {
 	// acted upon in the case of a unilateral channel closure or a contract
 	// breach.
 	MaxAcceptedHtlcs uint16
+}
+
+// CommitmentParams are the parameters from OpenChannel and
+// AcceptChannel that are required to render an abstract channel state to a
+// concrete commitment transaction. These values are necessary to (re)compute
+// the commitment transaction. We treat these differently than the state space
+// bounds because their history needs to be stored in order to properly handle
+// chain resolution.
+type CommitmentParams struct {
+	// DustLimit is the threshold (in satoshis) below which any outputs
+	// should be trimmed. When an output is trimmed, it isn't materialized
+	// as an actual output, but is instead burned to miner's fees.
+	DustLimit btcutil.Amount
 
 	// CsvDelay is the relative time lock delay expressed in blocks. Any
 	// settled outputs that pay to the owner of this channel configuration
@@ -447,12 +453,17 @@ type ChannelConstraints struct {
 // nature of HTLC's allotted, the keys to be used for delivery, and relative
 // time lock parameters.
 type ChannelConfig struct {
-	// ChannelConstraints is the set of constraints that must be upheld for
-	// the duration of the channel for the owner of this channel
+	// ChannelStateBounds is the set of constraints that must be
+	// upheld for the duration of the channel for the owner of this channel
 	// configuration. Constraints govern a number of flow control related
 	// parameters, also including the smallest HTLC that will be accepted
 	// by a participant.
-	ChannelConstraints
+	ChannelStateBounds
+
+	// CommitmentParams is an embedding of the parameters
+	// required to render an abstract channel state into a concrete
+	// commitment transaction.
+	CommitmentParams
 
 	// MultiSigKey is the key to be used within the 2-of-2 output script
 	// for the owner of this channel config.
@@ -886,6 +897,18 @@ func (c *OpenChannel) String() string {
 		c.ShortChannelID, c.chanStatus, c.IsInitiator, c.IsPending,
 		local, remote,
 	)
+}
+
+// Initiator returns the ChannelParty that originally opened this channel.
+func (c *OpenChannel) Initiator() lntypes.ChannelParty {
+	c.RLock()
+	defer c.RUnlock()
+
+	if c.IsInitiator {
+		return lntypes.Local
+	}
+
+	return lntypes.Remote
 }
 
 // ShortChanID returns the current ShortChannelID of this channel.
@@ -1690,11 +1713,11 @@ func (c *OpenChannel) isBorked(chanBucket kvdb.RBucket) (bool, error) {
 // republish this tx at startup to ensure propagation, and we should still
 // handle the case where a different tx actually hits the chain.
 func (c *OpenChannel) MarkCommitmentBroadcasted(closeTx *wire.MsgTx,
-	locallyInitiated bool) error {
+	closer lntypes.ChannelParty) error {
 
 	return c.markBroadcasted(
 		ChanStatusCommitBroadcasted, forceCloseTxKey, closeTx,
-		locallyInitiated,
+		closer,
 	)
 }
 
@@ -1706,11 +1729,11 @@ func (c *OpenChannel) MarkCommitmentBroadcasted(closeTx *wire.MsgTx,
 // ensure propagation, and we should still handle the case where a different tx
 // actually hits the chain.
 func (c *OpenChannel) MarkCoopBroadcasted(closeTx *wire.MsgTx,
-	locallyInitiated bool) error {
+	closer lntypes.ChannelParty) error {
 
 	return c.markBroadcasted(
 		ChanStatusCoopBroadcasted, coopCloseTxKey, closeTx,
-		locallyInitiated,
+		closer,
 	)
 }
 
@@ -1719,7 +1742,7 @@ func (c *OpenChannel) MarkCoopBroadcasted(closeTx *wire.MsgTx,
 // which should specify either a coop or force close. It adds a status which
 // indicates the party that initiated the channel close.
 func (c *OpenChannel) markBroadcasted(status ChannelStatus, key []byte,
-	closeTx *wire.MsgTx, locallyInitiated bool) error {
+	closeTx *wire.MsgTx, closer lntypes.ChannelParty) error {
 
 	c.Lock()
 	defer c.Unlock()
@@ -1741,7 +1764,7 @@ func (c *OpenChannel) markBroadcasted(status ChannelStatus, key []byte,
 	// Add the initiator status to the status provided. These statuses are
 	// set in addition to the broadcast status so that we do not need to
 	// migrate the original logic which does not store initiator.
-	if locallyInitiated {
+	if closer.IsLocal() {
 		status |= ChanStatusLocalCloseInitiator
 	} else {
 		status |= ChanStatusRemoteCloseInitiator
@@ -3488,7 +3511,7 @@ type ChannelCloseSummary struct {
 	// per-commitment-point.
 	RemoteNextRevocation *btcec.PublicKey
 
-	// LocalChanCfg is the channel configuration for the local node.
+	// LocalChanConfig is the channel configuration for the local node.
 	LocalChanConfig ChannelConfig
 
 	// LastChanSyncMsg is the ChannelReestablish message for this channel
@@ -4484,6 +4507,15 @@ func NewShutdownInfo(deliveryScript lnwire.DeliveryAddress,
 			locallyInitiated,
 		),
 	}
+}
+
+// Closer identifies the ChannelParty that initiated the coop-closure process.
+func (s ShutdownInfo) Closer() lntypes.ChannelParty {
+	if s.LocalInitiator.Val {
+		return lntypes.Local
+	}
+
+	return lntypes.Remote
 }
 
 // encode serialises the ShutdownInfo to the given io.Writer.

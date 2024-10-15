@@ -20,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -28,7 +29,6 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/multimutex"
 	"github.com/lightningnetwork/lnd/netann"
-	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/ticker"
 	"golang.org/x/time/rate"
@@ -165,11 +165,11 @@ type Config struct {
 	//   * also need to do same for Notifier
 	ChainHash chainhash.Hash
 
-	// Router is the subsystem which is responsible for managing the
+	// Graph is the subsystem which is responsible for managing the
 	// topology of lightning network. After incoming channel, node, channel
 	// updates announcements are validated they are sent to the router in
 	// order to be included in the LN graph.
-	Router routing.ChannelGraphSource
+	Graph graph.ChannelGraphSource
 
 	// ChanSeries is an interfaces that provides access to a time series
 	// view of the current known channel graph. Each GossipSyncer enabled
@@ -255,6 +255,11 @@ type Config struct {
 	// TODO(roasbeef): extract ann crafting + sign from fundingMgr into
 	// here?
 	AnnSigner lnwallet.MessageSigner
+
+	// ScidCloser is an instance of ClosedChannelTracker that helps the
+	// gossiper cut down on spam channel announcements for already closed
+	// channels.
+	ScidCloser ClosedChannelTracker
 
 	// NumActiveSyncers is the number of peers for which we should have
 	// active syncers with. After reaching NumActiveSyncers, any future
@@ -434,6 +439,9 @@ type AuthenticatedGossiper struct {
 	// ChannelAnnouncement for the channel is received.
 	prematureChannelUpdates *lru.Cache[uint64, *cachedNetworkMsg]
 
+	// banman tracks our peer's ban status.
+	banman *banman
+
 	// networkMsgs is a channel that carries new network broadcasted
 	// message from outside the gossiper service to be processed by the
 	// networkHandler.
@@ -512,6 +520,7 @@ func New(cfg Config, selfKeyDesc *keychain.KeyDescriptor) *AuthenticatedGossiper
 			maxRejectedUpdates,
 		),
 		chanUpdateRateLimiter: make(map[uint64][2]*rate.Limiter),
+		banman:                newBanman(),
 	}
 
 	gossiper.syncMgr = newSyncManager(&SyncManagerCfg{
@@ -591,7 +600,7 @@ func (d *AuthenticatedGossiper) start() error {
 	}
 	d.blockEpochs = blockEpochs
 
-	height, err := d.cfg.Router.CurrentBlockHeight()
+	height, err := d.cfg.Graph.CurrentBlockHeight()
 	if err != nil {
 		return err
 	}
@@ -605,6 +614,8 @@ func (d *AuthenticatedGossiper) start() error {
 	}
 
 	d.syncMgr.Start()
+
+	d.banman.start()
 
 	// Start receiving blocks in its dedicated goroutine.
 	d.wg.Add(2)
@@ -750,12 +761,19 @@ func (d *AuthenticatedGossiper) Stop() error {
 }
 
 func (d *AuthenticatedGossiper) stop() {
-	log.Info("Authenticated Gossiper is stopping")
-	defer log.Info("Authenticated Gossiper stopped")
+	log.Debug("Authenticated Gossiper is stopping")
+	defer log.Debug("Authenticated Gossiper stopped")
 
-	d.blockEpochs.Cancel()
+	// `blockEpochs` is only initialized in the start routine so we make
+	// sure we don't panic here in the case where the `Stop` method is
+	// called when the `Start` method does not complete.
+	if d.blockEpochs != nil {
+		d.blockEpochs.Cancel()
+	}
 
 	d.syncMgr.Stop()
+
+	d.banman.stop()
 
 	close(d.quit)
 	d.wg.Wait()
@@ -1360,7 +1378,7 @@ func (d *AuthenticatedGossiper) networkHandler() {
 
 	// We'll use this validation to ensure that we process jobs in their
 	// dependency order during parallel validation.
-	validationBarrier := routing.NewValidationBarrier(1000, d.quit)
+	validationBarrier := graph.NewValidationBarrier(1000, d.quit)
 
 	for {
 		select {
@@ -1485,7 +1503,7 @@ func (d *AuthenticatedGossiper) networkHandler() {
 //
 // NOTE: must be run as a goroutine.
 func (d *AuthenticatedGossiper) handleNetworkMessages(nMsg *networkMsg,
-	deDuped *deDupedAnnouncements, vb *routing.ValidationBarrier) {
+	deDuped *deDupedAnnouncements, vb *graph.ValidationBarrier) {
 
 	defer d.wg.Done()
 	defer vb.CompleteJob()
@@ -1501,10 +1519,10 @@ func (d *AuthenticatedGossiper) handleNetworkMessages(nMsg *networkMsg,
 		log.Debugf("Validating network message %s got err: %v",
 			nMsg.msg.MsgType(), err)
 
-		if !routing.IsError(
+		if !graph.IsError(
 			err,
-			routing.ErrVBarrierShuttingDown,
-			routing.ErrParentValidationFailed,
+			graph.ErrVBarrierShuttingDown,
+			graph.ErrParentValidationFailed,
 		) {
 
 			log.Warnf("unexpected error during validation "+
@@ -1595,7 +1613,7 @@ func (d *AuthenticatedGossiper) retransmitStaleAnns(now time.Time) error {
 		havePublicChannels bool
 		edgesToUpdate      []updateTuple
 	)
-	err := d.cfg.Router.ForAllOutgoingChannels(func(
+	err := d.cfg.Graph.ForAllOutgoingChannels(func(
 		_ kvdb.RTx,
 		info *models.ChannelEdgeInfo,
 		edge *models.ChannelEdgePolicy) error {
@@ -1831,7 +1849,7 @@ func (d *AuthenticatedGossiper) processRejectedEdge(
 
 	// First, we'll fetch the state of the channel as we know if from the
 	// database.
-	chanInfo, e1, e2, err := d.cfg.Router.GetChannelByID(
+	chanInfo, e1, e2, err := d.cfg.Graph.GetChannelByID(
 		chanAnnMsg.ShortChannelID,
 	)
 	if err != nil {
@@ -1860,7 +1878,7 @@ func (d *AuthenticatedGossiper) processRejectedEdge(
 	if err != nil {
 		return nil, err
 	}
-	err = routing.ValidateChannelAnn(chanAnn)
+	err = graph.ValidateChannelAnn(chanAnn)
 	if err != nil {
 		err := fmt.Errorf("assembled channel announcement proof "+
 			"for shortChanID=%v isn't valid: %v",
@@ -1871,7 +1889,7 @@ func (d *AuthenticatedGossiper) processRejectedEdge(
 
 	// If everything checks out, then we'll add the fully assembled proof
 	// to the database.
-	err = d.cfg.Router.AddProof(chanAnnMsg.ShortChannelID, proof)
+	err = d.cfg.Graph.AddProof(chanAnnMsg.ShortChannelID, proof)
 	if err != nil {
 		err := fmt.Errorf("unable add proof to shortChanID=%v: %w",
 			chanAnnMsg.ShortChannelID, err)
@@ -1909,7 +1927,7 @@ func (d *AuthenticatedGossiper) processRejectedEdge(
 func (d *AuthenticatedGossiper) addNode(msg *lnwire.NodeAnnouncement,
 	op ...batch.SchedulerOption) error {
 
-	if err := routing.ValidateNodeAnn(msg); err != nil {
+	if err := graph.ValidateNodeAnn(msg); err != nil {
 		return fmt.Errorf("unable to validate node announcement: %w",
 			err)
 	}
@@ -1928,7 +1946,7 @@ func (d *AuthenticatedGossiper) addNode(msg *lnwire.NodeAnnouncement,
 		ExtraOpaqueData:      msg.ExtraOpaqueData,
 	}
 
-	return d.cfg.Router.AddNode(node, op...)
+	return d.cfg.Graph.AddNode(node, op...)
 }
 
 // isPremature decides whether a given network message has a block height+delta
@@ -2063,7 +2081,7 @@ func (d *AuthenticatedGossiper) processZombieUpdate(
 			"with chan_id=%v", msg.ShortChannelID)
 	}
 
-	err := routing.VerifyChannelUpdateSignature(msg, pubKey)
+	err := graph.VerifyChannelUpdateSignature(msg, pubKey)
 	if err != nil {
 		return fmt.Errorf("unable to verify channel "+
 			"update signature: %v", err)
@@ -2072,7 +2090,7 @@ func (d *AuthenticatedGossiper) processZombieUpdate(
 	// With the signature valid, we'll proceed to mark the
 	// edge as live and wait for the channel announcement to
 	// come through again.
-	err = d.cfg.Router.MarkEdgeLive(scid)
+	err = d.cfg.Graph.MarkEdgeLive(scid)
 	switch {
 	case errors.Is(err, channeldb.ErrZombieEdgeNotFound):
 		log.Errorf("edge with chan_id=%v was not found in the "+
@@ -2099,7 +2117,7 @@ func (d *AuthenticatedGossiper) processZombieUpdate(
 func (d *AuthenticatedGossiper) fetchNodeAnn(
 	pubKey [33]byte) (*lnwire.NodeAnnouncement, error) {
 
-	node, err := d.cfg.Router.FetchLightningNode(pubKey)
+	node, err := d.cfg.Graph.FetchLightningNode(pubKey)
 	if err != nil {
 		return nil, err
 	}
@@ -2112,14 +2130,14 @@ func (d *AuthenticatedGossiper) fetchNodeAnn(
 func (d *AuthenticatedGossiper) isMsgStale(msg lnwire.Message) bool {
 	switch msg := msg.(type) {
 	case *lnwire.AnnounceSignatures:
-		chanInfo, _, _, err := d.cfg.Router.GetChannelByID(
+		chanInfo, _, _, err := d.cfg.Graph.GetChannelByID(
 			msg.ShortChannelID,
 		)
 
 		// If the channel cannot be found, it is most likely a leftover
 		// message for a channel that was closed, so we can consider it
 		// stale.
-		if err == channeldb.ErrEdgeNotFound {
+		if errors.Is(err, channeldb.ErrEdgeNotFound) {
 			return true
 		}
 		if err != nil {
@@ -2134,12 +2152,12 @@ func (d *AuthenticatedGossiper) isMsgStale(msg lnwire.Message) bool {
 		return chanInfo.AuthProof != nil
 
 	case *lnwire.ChannelUpdate:
-		_, p1, p2, err := d.cfg.Router.GetChannelByID(msg.ShortChannelID)
+		_, p1, p2, err := d.cfg.Graph.GetChannelByID(msg.ShortChannelID)
 
 		// If the channel cannot be found, it is most likely a leftover
 		// message for a channel that was closed, so we can consider it
 		// stale.
-		if err == channeldb.ErrEdgeNotFound {
+		if errors.Is(err, channeldb.ErrEdgeNotFound) {
 			return true
 		}
 		if err != nil {
@@ -2200,14 +2218,16 @@ func (d *AuthenticatedGossiper) updateChannel(info *models.ChannelEdgeInfo,
 
 	// To ensure that our signature is valid, we'll verify it ourself
 	// before committing it to the slice returned.
-	err = routing.ValidateChannelUpdateAnn(d.selfKey, info.Capacity, chanUpdate)
+	err = graph.ValidateChannelUpdateAnn(
+		d.selfKey, info.Capacity, chanUpdate,
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generated invalid channel "+
 			"update sig: %v", err)
 	}
 
 	// Finally, we'll write the new edge policy to disk.
-	if err := d.cfg.Router.UpdateEdge(edge); err != nil {
+	if err := d.cfg.Graph.UpdateEdge(edge); err != nil {
 		return nil, nil, err
 	}
 
@@ -2225,7 +2245,7 @@ func (d *AuthenticatedGossiper) updateChannel(info *models.ChannelEdgeInfo,
 			BitcoinKey1:     info.BitcoinKey1Bytes,
 			Features:        lnwire.NewRawFeatureVector(),
 			BitcoinKey2:     info.BitcoinKey2Bytes,
-			ExtraOpaqueData: edge.ExtraOpaqueData,
+			ExtraOpaqueData: info.ExtraOpaqueData,
 		}
 		chanAnn.NodeSig1, err = lnwire.NewSigFromECDSARawSignature(
 			info.AuthProof.NodeSig1Bytes,
@@ -2327,7 +2347,7 @@ func (d *AuthenticatedGossiper) handleNodeAnnouncement(nMsg *networkMsg,
 
 	// We'll quickly ask the router if it already has a newer update for
 	// this node so we can skip validating signatures if not required.
-	if d.cfg.Router.IsStaleNode(nodeAnn.NodeID, timestamp) {
+	if d.cfg.Graph.IsStaleNode(nodeAnn.NodeID, timestamp) {
 		log.Debugf("Skipped processing stale node: %x", nodeAnn.NodeID)
 		nMsg.err <- nil
 		return nil, true
@@ -2337,11 +2357,11 @@ func (d *AuthenticatedGossiper) handleNodeAnnouncement(nMsg *networkMsg,
 		log.Debugf("Adding node: %x got error: %v", nodeAnn.NodeID,
 			err)
 
-		if !routing.IsError(
+		if !graph.IsError(
 			err,
-			routing.ErrOutdated,
-			routing.ErrIgnored,
-			routing.ErrVBarrierShuttingDown,
+			graph.ErrOutdated,
+			graph.ErrIgnored,
+			graph.ErrVBarrierShuttingDown,
 		) {
 
 			log.Error(err)
@@ -2354,7 +2374,7 @@ func (d *AuthenticatedGossiper) handleNodeAnnouncement(nMsg *networkMsg,
 	// In order to ensure we don't leak unadvertised nodes, we'll make a
 	// quick check to ensure this node intends to publicly advertise itself
 	// to the network.
-	isPublic, err := d.cfg.Router.IsPublicNode(nodeAnn.NodeID)
+	isPublic, err := d.cfg.Graph.IsPublicNode(nodeAnn.NodeID)
 	if err != nil {
 		log.Errorf("Unable to determine if node %x is advertised: %v",
 			nodeAnn.NodeID, err)
@@ -2392,8 +2412,10 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	ann *lnwire.ChannelAnnouncement,
 	ops []batch.SchedulerOption) ([]networkMsg, bool) {
 
+	scid := ann.ShortChannelID
+
 	log.Debugf("Processing ChannelAnnouncement: peer=%v, short_chan_id=%v",
-		nMsg.peer, ann.ShortChannelID.ToUint64())
+		nMsg.peer, scid.ToUint64())
 
 	// We'll ignore any channel announcements that target any chain other
 	// than the set of chains we know of.
@@ -2404,7 +2426,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 		log.Errorf(err.Error())
 
 		key := newRejectCacheKey(
-			ann.ShortChannelID.ToUint64(),
+			scid.ToUint64(),
 			sourceToPub(nMsg.source),
 		)
 		_, _ = d.recentRejects.Put(key, &cachedReject{})
@@ -2416,13 +2438,12 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	// If this is a remote ChannelAnnouncement with an alias SCID, we'll
 	// reject the announcement. Since the router accepts alias SCIDs,
 	// not erroring out would be a DoS vector.
-	if nMsg.isRemote && d.cfg.IsAlias(ann.ShortChannelID) {
-		err := fmt.Errorf("ignoring remote alias channel=%v",
-			ann.ShortChannelID)
+	if nMsg.isRemote && d.cfg.IsAlias(scid) {
+		err := fmt.Errorf("ignoring remote alias channel=%v", scid)
 		log.Errorf(err.Error())
 
 		key := newRejectCacheKey(
-			ann.ShortChannelID.ToUint64(),
+			scid.ToUint64(),
 			sourceToPub(nMsg.source),
 		)
 		_, _ = d.recentRejects.Put(key, &cachedReject{})
@@ -2434,11 +2455,10 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	// If the advertised inclusionary block is beyond our knowledge of the
 	// chain tip, then we'll ignore it for now.
 	d.Lock()
-	if nMsg.isRemote && d.isPremature(ann.ShortChannelID, 0, nMsg) {
+	if nMsg.isRemote && d.isPremature(scid, 0, nMsg) {
 		log.Warnf("Announcement for chan_id=(%v), is premature: "+
 			"advertises height %v, only height %v is known",
-			ann.ShortChannelID.ToUint64(),
-			ann.ShortChannelID.BlockHeight, d.bestHeight)
+			scid.ToUint64(), scid.BlockHeight, d.bestHeight)
 		d.Unlock()
 		nMsg.err <- nil
 		return nil, false
@@ -2447,21 +2467,66 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 
 	// At this point, we'll now ask the router if this is a zombie/known
 	// edge. If so we can skip all the processing below.
-	if d.cfg.Router.IsKnownEdge(ann.ShortChannelID) {
+	if d.cfg.Graph.IsKnownEdge(scid) {
 		nMsg.err <- nil
 		return nil, true
+	}
+
+	// Check if the channel is already closed in which case we can ignore
+	// it.
+	closed, err := d.cfg.ScidCloser.IsClosedScid(scid)
+	if err != nil {
+		log.Errorf("failed to check if scid %v is closed: %v", scid,
+			err)
+		nMsg.err <- err
+
+		return nil, false
+	}
+
+	if closed {
+		err = fmt.Errorf("ignoring closed channel %v", scid)
+		log.Error(err)
+
+		// If this is an announcement from us, we'll just ignore it.
+		if !nMsg.isRemote {
+			nMsg.err <- err
+			return nil, false
+		}
+
+		// Increment the peer's ban score if they are sending closed
+		// channel announcements.
+		d.banman.incrementBanScore(nMsg.peer.PubKey())
+
+		// If the peer is banned and not a channel peer, we'll
+		// disconnect them.
+		shouldDc, dcErr := d.ShouldDisconnect(nMsg.peer.IdentityKey())
+		if dcErr != nil {
+			log.Errorf("failed to check if we should disconnect "+
+				"peer: %v", dcErr)
+			nMsg.err <- dcErr
+
+			return nil, false
+		}
+
+		if shouldDc {
+			nMsg.peer.Disconnect(ErrPeerBanned)
+		}
+
+		nMsg.err <- err
+
+		return nil, false
 	}
 
 	// If this is a remote channel announcement, then we'll validate all
 	// the signatures within the proof as it should be well formed.
 	var proof *models.ChannelAuthProof
 	if nMsg.isRemote {
-		if err := routing.ValidateChannelAnn(ann); err != nil {
+		if err := graph.ValidateChannelAnn(ann); err != nil {
 			err := fmt.Errorf("unable to validate announcement: "+
 				"%v", err)
 
 			key := newRejectCacheKey(
-				ann.ShortChannelID.ToUint64(),
+				scid.ToUint64(),
 				sourceToPub(nMsg.source),
 			)
 			_, _ = d.recentRejects.Put(key, &cachedReject{})
@@ -2492,7 +2557,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	}
 
 	edge := &models.ChannelEdgeInfo{
-		ChannelID:        ann.ShortChannelID.ToUint64(),
+		ChannelID:        scid.ToUint64(),
 		ChainHash:        ann.ChainHash,
 		NodeKey1Bytes:    ann.NodeID1,
 		NodeKey2Bytes:    ann.NodeID2,
@@ -2515,8 +2580,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 		}
 	}
 
-	log.Debugf("Adding edge for short_chan_id: %v",
-		ann.ShortChannelID.ToUint64())
+	log.Debugf("Adding edge for short_chan_id: %v", scid.ToUint64())
 
 	// We will add the edge to the channel router. If the nodes present in
 	// this channel are not present in the database, a partial node will be
@@ -2526,24 +2590,25 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	// channel ID. We do this to ensure no other goroutine has read the
 	// database and is now making decisions based on this DB state, before
 	// it writes to the DB.
-	d.channelMtx.Lock(ann.ShortChannelID.ToUint64())
-	err := d.cfg.Router.AddEdge(edge, ops...)
+	d.channelMtx.Lock(scid.ToUint64())
+	err = d.cfg.Graph.AddEdge(edge, ops...)
 	if err != nil {
-		log.Debugf("Router rejected edge for short_chan_id(%v): %v",
-			ann.ShortChannelID.ToUint64(), err)
+		log.Debugf("Graph rejected edge for short_chan_id(%v): %v",
+			scid.ToUint64(), err)
 
-		defer d.channelMtx.Unlock(ann.ShortChannelID.ToUint64())
+		defer d.channelMtx.Unlock(scid.ToUint64())
 
 		// If the edge was rejected due to already being known, then it
 		// may be the case that this new message has a fresh channel
 		// proof, so we'll check.
-		if routing.IsError(err, routing.ErrIgnored) {
+		switch {
+		case graph.IsError(err, graph.ErrIgnored):
 			// Attempt to process the rejected message to see if we
 			// get any new announcements.
 			anns, rErr := d.processRejectedEdge(ann, proof)
 			if rErr != nil {
 				key := newRejectCacheKey(
-					ann.ShortChannelID.ToUint64(),
+					scid.ToUint64(),
 					sourceToPub(nMsg.source),
 				)
 				cr := &cachedReject{}
@@ -2565,31 +2630,99 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 			nMsg.err <- nil
 
 			return anns, true
-		} else {
+
+		case graph.IsError(
+			err, graph.ErrNoFundingTransaction,
+			graph.ErrInvalidFundingOutput,
+		):
+			key := newRejectCacheKey(
+				scid.ToUint64(),
+				sourceToPub(nMsg.source),
+			)
+			_, _ = d.recentRejects.Put(key, &cachedReject{})
+
+			// Increment the peer's ban score. We check isRemote
+			// so we don't actually ban the peer in case of a local
+			// bug.
+			if nMsg.isRemote {
+				d.banman.incrementBanScore(nMsg.peer.PubKey())
+			}
+
+		case graph.IsError(err, graph.ErrChannelSpent):
+			key := newRejectCacheKey(
+				scid.ToUint64(),
+				sourceToPub(nMsg.source),
+			)
+			_, _ = d.recentRejects.Put(key, &cachedReject{})
+
+			// Since this channel has already been closed, we'll
+			// add it to the graph's closed channel index such that
+			// we won't attempt to do expensive validation checks
+			// on it again.
+			// TODO: Populate the ScidCloser by using closed
+			// channel notifications.
+			dbErr := d.cfg.ScidCloser.PutClosedScid(scid)
+			if dbErr != nil {
+				log.Errorf("failed to mark scid(%v) as "+
+					"closed: %v", scid, dbErr)
+
+				nMsg.err <- dbErr
+
+				return nil, false
+			}
+
+			// Increment the peer's ban score. We check isRemote
+			// so we don't accidentally ban ourselves in case of a
+			// bug.
+			if nMsg.isRemote {
+				d.banman.incrementBanScore(nMsg.peer.PubKey())
+			}
+
+		default:
 			// Otherwise, this is just a regular rejected edge.
 			key := newRejectCacheKey(
-				ann.ShortChannelID.ToUint64(),
+				scid.ToUint64(),
 				sourceToPub(nMsg.source),
 			)
 			_, _ = d.recentRejects.Put(key, &cachedReject{})
 		}
 
+		if !nMsg.isRemote {
+			log.Errorf("failed to add edge for local channel: %v",
+				err)
+			nMsg.err <- err
+
+			return nil, false
+		}
+
+		shouldDc, dcErr := d.ShouldDisconnect(nMsg.peer.IdentityKey())
+		if dcErr != nil {
+			log.Errorf("failed to check if we should disconnect "+
+				"peer: %v", dcErr)
+			nMsg.err <- dcErr
+
+			return nil, false
+		}
+
+		if shouldDc {
+			nMsg.peer.Disconnect(ErrPeerBanned)
+		}
+
 		nMsg.err <- err
+
 		return nil, false
 	}
 
 	// If err is nil, release the lock immediately.
-	d.channelMtx.Unlock(ann.ShortChannelID.ToUint64())
+	d.channelMtx.Unlock(scid.ToUint64())
 
-	log.Debugf("Finish adding edge for short_chan_id: %v",
-		ann.ShortChannelID.ToUint64())
+	log.Debugf("Finish adding edge for short_chan_id: %v", scid.ToUint64())
 
 	// If we earlier received any ChannelUpdates for this channel, we can
 	// now process them, as the channel is added to the graph.
-	shortChanID := ann.ShortChannelID.ToUint64()
 	var channelUpdates []*processedNetworkMsg
 
-	earlyChanUpdates, err := d.prematureChannelUpdates.Get(shortChanID)
+	earlyChanUpdates, err := d.prematureChannelUpdates.Get(scid.ToUint64())
 	if err == nil {
 		// There was actually an entry in the map, so we'll accumulate
 		// it. We don't worry about deletion, since it'll eventually
@@ -2622,8 +2755,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 			// shuts down.
 			case *lnwire.ChannelUpdate:
 				log.Debugf("Reprocessing ChannelUpdate for "+
-					"shortChanID=%v",
-					msg.ShortChannelID.ToUint64())
+					"shortChanID=%v", scid.ToUint64())
 
 				select {
 				case d.networkMsgs <- updMsg:
@@ -2657,7 +2789,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	nMsg.err <- nil
 
 	log.Debugf("Processed ChannelAnnouncement: peer=%v, short_chan_id=%v",
-		nMsg.peer, ann.ShortChannelID.ToUint64())
+		nMsg.peer, scid.ToUint64())
 
 	return announcements, true
 }
@@ -2725,7 +2857,7 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 		graphScid = upd.ShortChannelID
 	}
 
-	if d.cfg.Router.IsStaleEdgePolicy(
+	if d.cfg.Graph.IsStaleEdgePolicy(
 		graphScid, timestamp, upd.ChannelFlags,
 	) {
 
@@ -2736,6 +2868,22 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 
 		nMsg.err <- nil
 		return nil, true
+	}
+
+	// Check that the ChanUpdate is not too far into the future, this could
+	// reveal some faulty implementation therefore we log an error.
+	if time.Until(timestamp) > graph.DefaultChannelPruneExpiry {
+		log.Errorf("Skewed timestamp (%v) for edge policy of "+
+			"short_chan_id(%v), timestamp too far in the future: "+
+			"peer=%v, msg=%s, is_remote=%v", timestamp.Unix(),
+			shortChanID, nMsg.peer, nMsg.msg.MsgType(),
+			nMsg.isRemote,
+		)
+
+		nMsg.err <- fmt.Errorf("skewed timestamp of edge policy, "+
+			"timestamp too far in the future: %v", timestamp.Unix())
+
+		return nil, false
 	}
 
 	// Get the node pub key as far since we don't have it in the channel
@@ -2749,13 +2897,13 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 	d.channelMtx.Lock(graphScid.ToUint64())
 	defer d.channelMtx.Unlock(graphScid.ToUint64())
 
-	chanInfo, e1, e2, err := d.cfg.Router.GetChannelByID(graphScid)
-	switch err {
+	chanInfo, e1, e2, err := d.cfg.Graph.GetChannelByID(graphScid)
+	switch {
 	// No error, break.
-	case nil:
+	case err == nil:
 		break
 
-	case channeldb.ErrZombieEdge:
+	case errors.Is(err, channeldb.ErrZombieEdge):
 		err = d.processZombieUpdate(chanInfo, graphScid, upd)
 		if err != nil {
 			log.Debug(err)
@@ -2768,11 +2916,11 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 		// needed to ensure the edge exists in the graph before
 		// applying the update.
 		fallthrough
-	case channeldb.ErrGraphNotFound:
+	case errors.Is(err, channeldb.ErrGraphNotFound):
 		fallthrough
-	case channeldb.ErrGraphNoEdgesFound:
+	case errors.Is(err, channeldb.ErrGraphNoEdgesFound):
 		fallthrough
-	case channeldb.ErrEdgeNotFound:
+	case errors.Is(err, channeldb.ErrEdgeNotFound):
 		// If the edge corresponding to this ChannelUpdate was not
 		// found in the graph, this might be a channel in the process
 		// of being opened, and we haven't processed our own
@@ -2861,7 +3009,7 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 	// Validate the channel announcement with the expected public key and
 	// channel capacity. In the case of an invalid channel update, we'll
 	// return an error to the caller and exit early.
-	err = routing.ValidateChannelUpdateAnn(pubKey, chanInfo.Capacity, upd)
+	err = graph.ValidateChannelUpdateAnn(pubKey, chanInfo.Capacity, upd)
 	if err != nil {
 		rErr := fmt.Errorf("unable to validate channel update "+
 			"announcement for short_chan_id=%v: %v",
@@ -2945,11 +3093,11 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 		ExtraOpaqueData:           upd.ExtraOpaqueData,
 	}
 
-	if err := d.cfg.Router.UpdateEdge(update, ops...); err != nil {
-		if routing.IsError(
-			err, routing.ErrOutdated,
-			routing.ErrIgnored,
-			routing.ErrVBarrierShuttingDown,
+	if err := d.cfg.Graph.UpdateEdge(update, ops...); err != nil {
+		if graph.IsError(
+			err, graph.ErrOutdated,
+			graph.ErrIgnored,
+			graph.ErrVBarrierShuttingDown,
 		) {
 
 			log.Debugf("Update edge for short_chan_id(%v) got: %v",
@@ -3092,7 +3240,7 @@ func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 	d.channelMtx.Lock(ann.ShortChannelID.ToUint64())
 	defer d.channelMtx.Unlock(ann.ShortChannelID.ToUint64())
 
-	chanInfo, e1, e2, err := d.cfg.Router.GetChannelByID(
+	chanInfo, e1, e2, err := d.cfg.Graph.GetChannelByID(
 		ann.ShortChannelID,
 	)
 	if err != nil {
@@ -3267,7 +3415,7 @@ func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 
 	// With all the necessary components assembled validate the full
 	// channel announcement proof.
-	if err := routing.ValidateChannelAnn(chanAnn); err != nil {
+	if err := graph.ValidateChannelAnn(chanAnn); err != nil {
 		err := fmt.Errorf("channel announcement proof for "+
 			"short_chan_id=%v isn't valid: %v", shortChanID, err)
 
@@ -3282,7 +3430,7 @@ func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 	// attest to the bitcoin keys by validating the signatures of
 	// announcement. If proof is valid then we'll populate the channel edge
 	// with it, so we can announce it on peer connect.
-	err = d.cfg.Router.AddProof(ann.ShortChannelID, &dbProof)
+	err = d.cfg.Graph.AddProof(ann.ShortChannelID, &dbProof)
 	if err != nil {
 		err := fmt.Errorf("unable add proof to the channel chanID=%v:"+
 			" %v", ann.ChannelID, err)
@@ -3365,4 +3513,37 @@ func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 
 	nMsg.err <- nil
 	return announcements, true
+}
+
+// isBanned returns true if the peer identified by pubkey is banned for sending
+// invalid channel announcements.
+func (d *AuthenticatedGossiper) isBanned(pubkey [33]byte) bool {
+	return d.banman.isBanned(pubkey)
+}
+
+// ShouldDisconnect returns true if we should disconnect the peer identified by
+// pubkey.
+func (d *AuthenticatedGossiper) ShouldDisconnect(pubkey *btcec.PublicKey) (
+	bool, error) {
+
+	pubkeySer := pubkey.SerializeCompressed()
+
+	var pubkeyBytes [33]byte
+	copy(pubkeyBytes[:], pubkeySer)
+
+	// If the public key is banned, check whether or not this is a channel
+	// peer.
+	if d.isBanned(pubkeyBytes) {
+		isChanPeer, err := d.cfg.ScidCloser.IsChannelPeer(pubkey)
+		if err != nil {
+			return false, err
+		}
+
+		// We should only disconnect non-channel peers.
+		if !isChanPeer {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

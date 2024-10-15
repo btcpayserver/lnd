@@ -1,4 +1,4 @@
-FROM golang:1.22.3-bullseye as builder
+FROM golang:1.22.5-bullseye as builder
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
@@ -20,7 +20,7 @@ RUN make \
 &&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc"
 
 # Build loop binary
-RUN git clone --depth 1 --branch v0.28.5-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
+RUN git clone --depth 1 --branch v0.28.7-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
 WORKDIR /go/src/github.com/lightninglabs/loop/cmd
 
 RUN go install ./...

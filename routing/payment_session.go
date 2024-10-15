@@ -5,10 +5,11 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btclog"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -163,9 +164,11 @@ type PaymentSession interface {
 // loop if payment attempts take long enough. An additional set of edges can
 // also be provided to assist in reaching the payment's destination.
 type paymentSession struct {
+	selfNode route.Vertex
+
 	additionalEdges map[route.Vertex][]AdditionalEdge
 
-	getBandwidthHints func(routingGraph) (bandwidthHints, error)
+	getBandwidthHints func(Graph) (bandwidthHints, error)
 
 	payment *LightningPayment
 
@@ -173,7 +176,7 @@ type paymentSession struct {
 
 	pathFinder pathFinder
 
-	getRoutingGraph func() (routingGraph, func(), error)
+	graphSessFactory GraphSessionFactory
 
 	// pathFindingConfig defines global parameters that control the
 	// trade-off in path finding between fees and probability.
@@ -192,25 +195,37 @@ type paymentSession struct {
 }
 
 // newPaymentSession instantiates a new payment session.
-func newPaymentSession(p *LightningPayment,
-	getBandwidthHints func(routingGraph) (bandwidthHints, error),
-	getRoutingGraph func() (routingGraph, func(), error),
-	missionControl MissionController, pathFindingConfig PathFindingConfig) (
-	*paymentSession, error) {
+func newPaymentSession(p *LightningPayment, selfNode route.Vertex,
+	getBandwidthHints func(Graph) (bandwidthHints, error),
+	graphSessFactory GraphSessionFactory, missionControl MissionController,
+	pathFindingConfig PathFindingConfig) (*paymentSession, error) {
 
 	edges, err := RouteHintsToEdges(p.RouteHints, p.Target)
 	if err != nil {
 		return nil, err
 	}
 
+	if p.BlindedPathSet != nil {
+		if len(edges) != 0 {
+			return nil, fmt.Errorf("cannot have both route hints " +
+				"and blinded path")
+		}
+
+		edges, err = p.BlindedPathSet.ToRouteHints()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	logPrefix := fmt.Sprintf("PaymentSession(%x):", p.Identifier())
 
 	return &paymentSession{
+		selfNode:          selfNode,
 		additionalEdges:   edges,
 		getBandwidthHints: getBandwidthHints,
 		payment:           p,
 		pathFinder:        findPath,
-		getRoutingGraph:   getRoutingGraph,
+		graphSessFactory:  graphSessFactory,
 		pathFindingConfig: pathFindingConfig,
 		missionControl:    missionControl,
 		minShardAmt:       DefaultShardMinAmt,
@@ -277,8 +292,8 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 	}
 
 	for {
-		// Get a routing graph.
-		routingGraph, cleanup, err := p.getRoutingGraph()
+		// Get a routing graph session.
+		graph, closeGraph, err := p.graphSessFactory.NewGraphSession()
 		if err != nil {
 			return nil, err
 		}
@@ -289,35 +304,45 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		// don't have enough bandwidth to carry the payment. New
 		// bandwidth hints are queried for every new path finding
 		// attempt, because concurrent payments may change balances.
-		bandwidthHints, err := p.getBandwidthHints(routingGraph)
+		bandwidthHints, err := p.getBandwidthHints(graph)
 		if err != nil {
+			// Close routing graph session.
+			if graphErr := closeGraph(); graphErr != nil {
+				log.Errorf("could not close graph session: %v",
+					graphErr)
+			}
+
 			return nil, err
 		}
 
 		p.log.Debugf("pathfinding for amt=%v", maxAmt)
-
-		sourceVertex := routingGraph.sourceNode()
 
 		// Find a route for the current amount.
 		path, _, err := p.pathFinder(
 			&graphParams{
 				additionalEdges: p.additionalEdges,
 				bandwidthHints:  bandwidthHints,
-				graph:           routingGraph,
+				graph:           graph,
 			},
 			restrictions, &p.pathFindingConfig,
-			sourceVertex, p.payment.Target,
+			p.selfNode, p.selfNode, p.payment.Target,
 			maxAmt, p.payment.TimePref, finalHtlcExpiry,
 		)
 
-		// Close routing graph.
-		cleanup()
+		// Close routing graph session.
+		if err := closeGraph(); err != nil {
+			log.Errorf("could not close graph session: %v", err)
+		}
 
 		switch {
 		case err == errNoPathFound:
 			// Don't split if this is a legacy payment without mpp
-			// record.
-			if p.payment.PaymentAddr == nil {
+			// record. If it has a blinded path though, then we
+			// can split. Split payments to blinded paths won't have
+			// MPP records.
+			if p.payment.PaymentAddr == nil &&
+				p.payment.BlindedPathSet == nil {
+
 				p.log.Debugf("not splitting because payment " +
 					"address is unspecified")
 
@@ -335,7 +360,8 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 				!destFeatures.HasFeature(lnwire.AMPOptional) {
 
 				p.log.Debug("not splitting because " +
-					"destination doesn't declare MPP or AMP")
+					"destination doesn't declare MPP or " +
+					"AMP")
 
 				return nil, errNoPathFound
 			}
@@ -384,7 +410,7 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		// this into a route by applying the time-lock and fee
 		// requirements.
 		route, err := newRoute(
-			sourceVertex, path, height,
+			p.selfNode, path, height,
 			finalHopParams{
 				amt:         maxAmt,
 				totalAmt:    p.payment.Amount,
@@ -392,7 +418,7 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 				records:     p.payment.DestCustomRecords,
 				paymentAddr: p.payment.PaymentAddr,
 				metadata:    p.payment.Metadata,
-			}, nil,
+			}, p.payment.BlindedPathSet,
 		)
 		if err != nil {
 			return nil, err
@@ -410,7 +436,7 @@ func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
 	pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool {
 
 	// Validate the message signature.
-	if err := VerifyChannelUpdateSignature(msg, pubKey); err != nil {
+	if err := graph.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
 		log.Errorf(
 			"Unable to validate channel update signature: %v", err,
 		)
@@ -423,7 +449,7 @@ func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
 	policy.FeeProportionalMillionths = lnwire.MilliSatoshi(msg.FeeRate)
 
 	log.Debugf("New private channel update applied: %v",
-		newLogClosure(func() string { return spew.Sdump(msg) }))
+		lnutils.SpewLogClosure(msg))
 
 	return true
 }

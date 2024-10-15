@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
@@ -26,6 +27,7 @@ import (
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/blockcache"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -977,8 +979,9 @@ func (b *BtcWallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 // NOTE: This method requires the global coin selection lock to be held.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
-	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+func (b *BtcWallet) SendOutputs(inputs fn.Set[wire.OutPoint],
+	outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
+	minConfs int32, label string,
 	strategy base.CoinSelectionStrategy) (*wire.MsgTx, error) {
 
 	// Convert our fee rate from sat/kw to sat/kb since it's required by
@@ -993,6 +996,14 @@ func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
 	// Sanity check minConfs.
 	if minConfs < 0 {
 		return nil, lnwallet.ErrInvalidMinconf
+	}
+
+	// Use selected UTXOs if specified, otherwise default selection.
+	if len(inputs) != 0 {
+		return b.wallet.SendOutputsWithInput(
+			outputs, nil, defaultAccount, minConfs, feeSatPerKB,
+			strategy, label, inputs.ToSlice(),
+		)
 	}
 
 	return b.wallet.SendOutputs(
@@ -1014,10 +1025,10 @@ func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
 // NOTE: This method requires the global coin selection lock to be held.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) CreateSimpleTx(outputs []*wire.TxOut,
-	feeRate chainfee.SatPerKWeight, minConfs int32,
-	strategy base.CoinSelectionStrategy,
-	dryRun bool) (*txauthor.AuthoredTx, error) {
+func (b *BtcWallet) CreateSimpleTx(inputs fn.Set[wire.OutPoint],
+	outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight, minConfs int32,
+	strategy base.CoinSelectionStrategy, dryRun bool) (
+	*txauthor.AuthoredTx, error) {
 
 	// The fee rate is passed in using units of sat/kw, so we'll convert
 	// this to sat/KB as the CreateSimpleTx method requires this unit.
@@ -1047,9 +1058,12 @@ func (b *BtcWallet) CreateSimpleTx(outputs []*wire.TxOut,
 		}
 	}
 
+	// Add the optional inputs to the transaction.
+	optFunc := wallet.WithCustomSelectUtxos(inputs.ToSlice())
+
 	return b.wallet.CreateSimpleTx(
 		nil, defaultAccount, outputs, minConfs, feeSatPerKB,
-		strategy, dryRun,
+		strategy, dryRun, []wallet.TxCreateOption{optFunc}...,
 	)
 }
 
@@ -1191,8 +1205,8 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	return witnessOutputs, nil
 }
 
-// mapRpcclientError maps an error from the rpcclient package to defined error
-// in this package.
+// mapRpcclientError maps an error from the `btcwallet/chain` package to
+// defined error in this package.
 //
 // NOTE: we are mapping the errors returned from `sendrawtransaction` RPC or
 // the reject reason from `testmempoolaccept` RPC.
@@ -1202,15 +1216,17 @@ func mapRpcclientError(err error) error {
 	switch {
 	// If the wallet reports a double spend, convert it to our internal
 	// ErrDoubleSpend and return.
-	case errors.Is(err, rpcclient.ErrMempoolConflict),
-		errors.Is(err, rpcclient.ErrMissingInputs):
+	case errors.Is(err, chain.ErrMempoolConflict),
+		errors.Is(err, chain.ErrMissingInputs),
+		errors.Is(err, chain.ErrTxAlreadyKnown),
+		errors.Is(err, chain.ErrTxAlreadyConfirmed):
 
 		return lnwallet.ErrDoubleSpend
 
 	// If the wallet reports that fee requirements for accepting the tx
 	// into mempool are not met, convert it to our internal ErrMempoolFee
 	// and return.
-	case errors.Is(err, rpcclient.ErrMempoolMinFeeNotMet):
+	case errors.Is(err, chain.ErrMempoolMinFeeNotMet):
 		return fmt.Errorf("%w: %v", lnwallet.ErrMempoolFee, err.Error())
 	}
 
@@ -1277,7 +1293,7 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 
 	// We need to use the string to create an error type and map it to a
 	// btcwallet error.
-	err = rpcclient.MapRPCErr(errors.New(result.RejectReason))
+	err = b.chain.MapRPCErr(errors.New(result.RejectReason))
 
 	//nolint:lll
 	// These two errors are ignored inside `PublishTransaction`:
@@ -1295,9 +1311,9 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 	// `PublishTransaction` again because we need to mark the label in the
 	// wallet. We can remove this exception once we have the above TODO
 	// fixed.
-	case errors.Is(err, rpcclient.ErrTxAlreadyInMempool),
-		errors.Is(err, rpcclient.ErrTxAlreadyKnown),
-		errors.Is(err, rpcclient.ErrTxAlreadyConfirmed):
+	case errors.Is(err, chain.ErrTxAlreadyInMempool),
+		errors.Is(err, chain.ErrTxAlreadyKnown),
+		errors.Is(err, chain.ErrTxAlreadyConfirmed):
 
 		err := b.wallet.PublishTransaction(tx, label)
 		return mapRpcclientError(err)
@@ -1922,7 +1938,7 @@ func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	// Mempool check failed, we now map the reject reason to a proper RPC
 	// error and return it.
 	if !result.Allowed {
-		err := rpcclient.MapRPCErr(errors.New(result.RejectReason))
+		err := b.chain.MapRPCErr(errors.New(result.RejectReason))
 
 		return fmt.Errorf("mempool rejection: %w", err)
 	}

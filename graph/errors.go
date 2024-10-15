@@ -1,15 +1,15 @@
-package routing
+package graph
 
 import "github.com/go-errors/errors"
 
-// errorCode is used to represent the various errors that can occur within this
+// ErrorCode is used to represent the various errors that can occur within this
 // package.
-type errorCode uint8
+type ErrorCode uint8
 
 const (
 	// ErrOutdated is returned when the routing update already have
 	// been applied, or a newer update is already known.
-	ErrOutdated errorCode = iota
+	ErrOutdated ErrorCode = iota
 
 	// ErrIgnored is returned when the update have been ignored because
 	// this update can't bring us something new, or because a node
@@ -39,27 +39,27 @@ const (
 	ErrParentValidationFailed
 )
 
-// routerError is a structure that represent the error inside the routing package,
+// Error is a structure that represent the error inside the graph package,
 // this structure carries additional information about error code in order to
 // be able distinguish errors outside of the current package.
-type routerError struct {
+type Error struct {
 	err  *errors.Error
-	code errorCode
+	code ErrorCode
 }
 
 // Error represents errors as the string
 // NOTE: Part of the error interface.
-func (e *routerError) Error() string {
+func (e *Error) Error() string {
 	return e.err.Error()
 }
 
-// A compile time check to ensure routerError implements the error interface.
-var _ error = (*routerError)(nil)
+// A compile time check to ensure Error implements the error interface.
+var _ error = (*Error)(nil)
 
-// newErrf creates a routerError by the given error formatted description and
+// NewErrf creates a Error by the given error formatted description and
 // its corresponding error code.
-func newErrf(code errorCode, format string, a ...interface{}) *routerError {
-	return &routerError{
+func NewErrf(code ErrorCode, format string, a ...interface{}) *Error {
+	return &Error{
 		code: code,
 		err:  errors.Errorf(format, a...),
 	}
@@ -67,8 +67,8 @@ func newErrf(code errorCode, format string, a ...interface{}) *routerError {
 
 // IsError is a helper function which is needed to have ability to check that
 // returned error has specific error code.
-func IsError(e interface{}, codes ...errorCode) bool {
-	err, ok := e.(*routerError)
+func IsError(e interface{}, codes ...ErrorCode) bool {
+	err, ok := e.(*Error)
 	if !ok {
 		return false
 	}

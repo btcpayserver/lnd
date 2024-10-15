@@ -57,7 +57,7 @@ jobs:
   multiarch:
     machine:
       enabled: true
-      image: ubuntu-2204:2022.04.1
+      image: default
     steps:
       - run:
           command: |

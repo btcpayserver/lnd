@@ -28,23 +28,11 @@ func TestIntermediatePayloadSize(t *testing.T) {
 		edge    AdditionalEdge
 	}{
 		{
-			name: "Legacy payload private edge",
-			hop: route.Hop{
-				AmtToForward:     1000,
-				OutgoingTimeLock: 600000,
-				ChannelID:        3432483437438,
-				LegacyPayload:    true,
-			},
-			nextHop: 1,
-			edge:    &PrivateEdge{},
-		},
-		{
 			name: "Tlv payload private edge",
 			hop: route.Hop{
 				AmtToForward:     1000,
 				OutgoingTimeLock: 600000,
 				ChannelID:        3432483437438,
-				LegacyPayload:    false,
 			},
 			nextHop: 1,
 			edge:    &PrivateEdge{},
@@ -54,9 +42,13 @@ func TestIntermediatePayloadSize(t *testing.T) {
 			hop: route.Hop{
 				EncryptedData: []byte{12, 13},
 			},
-			edge: &BlindedEdge{
-				cipherText: []byte{12, 13},
-			},
+			edge: &BlindedEdge{blindedPayment: &BlindedPayment{
+				BlindedPath: &sphinx.BlindedPath{
+					BlindedHops: []*sphinx.BlindedHopInfo{
+						{CipherText: []byte{12, 13}},
+					},
+				},
+			}},
 		},
 		{
 			name: "Blinded edge - introduction point",
@@ -64,10 +56,14 @@ func TestIntermediatePayloadSize(t *testing.T) {
 				EncryptedData: []byte{12, 13},
 				BlindingPoint: blindedPoint,
 			},
-			edge: &BlindedEdge{
-				cipherText:    []byte{12, 13},
-				blindingPoint: blindedPoint,
-			},
+			edge: &BlindedEdge{blindedPayment: &BlindedPayment{
+				BlindedPath: &sphinx.BlindedPath{
+					BlindingPoint: blindedPoint,
+					BlindedHops: []*sphinx.BlindedHopInfo{
+						{CipherText: []byte{12, 13}},
+					},
+				},
+			}},
 		},
 	}
 
@@ -86,7 +82,6 @@ func TestIntermediatePayloadSize(t *testing.T) {
 				IntermediatePayloadSize(
 					testCase.hop.AmtToForward,
 					testCase.hop.OutgoingTimeLock,
-					testCase.hop.LegacyPayload,
 					testCase.nextHop,
 				)
 

@@ -14,7 +14,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/fn"
@@ -24,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -40,6 +40,12 @@ const (
 	// arbitratorBlockBufferSize is the size of the buffer we give to each
 	// channel arbitrator.
 	arbitratorBlockBufferSize = 20
+
+	// AnchorOutputValue is the output value for the anchor output of an
+	// anchor channel.
+	// See BOLT 03 for more details:
+	// https://github.com/lightning/bolts/blob/master/03-transactions.md
+	AnchorOutputValue = btcutil.Amount(330)
 )
 
 // WitnessSubscription represents an intent to be notified once new witnesses
@@ -123,7 +129,7 @@ type ChannelArbitratorConfig struct {
 
 	// MarkCommitmentBroadcasted should mark the channel as the commitment
 	// being broadcast, and we are waiting for the commitment to confirm.
-	MarkCommitmentBroadcasted func(*wire.MsgTx, bool) error
+	MarkCommitmentBroadcasted func(*wire.MsgTx, lntypes.ChannelParty) error
 
 	// MarkChannelClosed marks the channel closed in the database, with the
 	// passed close summary. After this method successfully returns we can
@@ -465,10 +471,8 @@ func (c *ChannelArbitrator) Start(state *chanArbStartState) error {
 	}
 
 	log.Debugf("Starting ChannelArbitrator(%v), htlc_set=%v, state=%v",
-		c.cfg.ChanPoint, newLogClosure(func() string {
-			return spew.Sdump(c.activeHTLCs)
-		}), state.currentState,
-	)
+		c.cfg.ChanPoint, lnutils.SpewLogClosure(c.activeHTLCs),
+		state.currentState)
 
 	// Set our state from our starting state.
 	c.state = state.currentState
@@ -958,10 +962,7 @@ func (c *ChannelArbitrator) stateStep(
 		// Otherwise, we'll log that we checked the HTLC actions as the
 		// commitment transaction has already been broadcast.
 		log.Tracef("ChannelArbitrator(%v): logging chain_actions=%v",
-			c.cfg.ChanPoint,
-			newLogClosure(func() string {
-				return spew.Sdump(chainActions)
-			}))
+			c.cfg.ChanPoint, lnutils.SpewLogClosure(chainActions))
 
 		// Depending on the type of trigger, we'll either "tunnel"
 		// through to a farther state, or just proceed linearly to the
@@ -1083,7 +1084,7 @@ func (c *ChannelArbitrator) stateStep(
 		// database, such that we can re-publish later in case it
 		// didn't propagate. We initiated the force close, so we
 		// mark broadcast with local initiator set to true.
-		err = c.cfg.MarkCommitmentBroadcasted(closeTx, true)
+		err = c.cfg.MarkCommitmentBroadcasted(closeTx, lntypes.Local)
 		if err != nil {
 			log.Errorf("ChannelArbitrator(%v): unable to "+
 				"mark commitment broadcasted: %v",
@@ -1096,10 +1097,7 @@ func (c *ChannelArbitrator) stateStep(
 		// channel resolution state.
 		log.Infof("Broadcasting force close transaction %v, "+
 			"ChannelPoint(%v): %v", closeTx.TxHash(),
-			c.cfg.ChanPoint,
-			newLogClosure(func() string {
-				return spew.Sdump(closeTx)
-			}))
+			c.cfg.ChanPoint, lnutils.SpewLogClosure(closeTx))
 
 		// At this point, we'll now broadcast the commitment
 		// transaction itself.
@@ -1224,9 +1222,7 @@ func (c *ChannelArbitrator) stateStep(
 		if len(pktsToSend) != 0 {
 			log.Debugf("ChannelArbitrator(%v): sending "+
 				"resolution message=%v", c.cfg.ChanPoint,
-				newLogClosure(func() string {
-					return spew.Sdump(pktsToSend)
-				}))
+				lnutils.SpewLogClosure(pktsToSend))
 
 			err := c.cfg.DeliverResolutionMsg(pktsToSend...)
 			if err != nil {
@@ -1323,13 +1319,14 @@ func (c *ChannelArbitrator) sweepAnchors(anchors *lnwallet.AnchorResolutions,
 		}
 
 		// If we cannot find a deadline, it means there's no HTLCs at
-		// stake, which means we can relax our anchor sweeping as we
-		// don't have any time sensitive outputs to sweep.
+		// stake, which means we can relax our anchor sweeping
+		// conditions as we don't have any time sensitive outputs to
+		// sweep. However we need to register the anchor output with the
+		// sweeper so we are later able to bump the close fee.
 		if deadline.IsNone() {
 			log.Infof("ChannelArbitrator(%v): no HTLCs at stake, "+
-				"skipped anchor CPFP", c.cfg.ChanPoint)
-
-			return nil
+				"sweeping anchor with default deadline",
+				c.cfg.ChanPoint)
 		}
 
 		witnessType := input.CommitmentAnchor
@@ -1367,10 +1364,13 @@ func (c *ChannelArbitrator) sweepAnchors(anchors *lnwallet.AnchorResolutions,
 		// Calculate the budget based on the value under protection,
 		// which is the sum of all HTLCs on this commitment subtracted
 		// by their budgets.
+		// The anchor output in itself has a small output value of 330
+		// sats so we also include it in the budget to pay for the
+		// cpfp transaction.
 		budget := calculateBudget(
 			value, c.cfg.Budget.AnchorCPFPRatio,
 			c.cfg.Budget.AnchorCPFP,
-		)
+		) + AnchorOutputValue
 
 		log.Infof("ChannelArbitrator(%v): offering anchor from %s "+
 			"commitment %v to sweeper with deadline=%v, budget=%v",
@@ -2741,11 +2741,7 @@ func (c *ChannelArbitrator) notifyContractUpdate(upd *ContractUpdate) {
 	c.unmergedSet[upd.HtlcKey] = newHtlcSet(upd.Htlcs)
 
 	log.Tracef("ChannelArbitrator(%v): fresh set of htlcs=%v",
-		c.cfg.ChanPoint,
-		newLogClosure(func() string {
-			return spew.Sdump(upd)
-		}),
-	)
+		c.cfg.ChanPoint, lnutils.SpewLogClosure(upd))
 }
 
 // updateActiveHTLCs merges the unmerged set of HTLCs from the link with

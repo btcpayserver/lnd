@@ -811,8 +811,8 @@ func (w *WalletKit) SendOutputs(ctx context.Context,
 	// requirement, we can request that the wallet attempts to create this
 	// transaction.
 	tx, err := w.cfg.Wallet.SendOutputs(
-		outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw), minConfs,
-		label, coinSelectionStrategy,
+		nil, outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw),
+		minConfs, label, coinSelectionStrategy,
 	)
 	if err != nil {
 		return nil, err
@@ -849,8 +849,11 @@ func (w *WalletKit) EstimateFee(ctx context.Context,
 		return nil, err
 	}
 
+	relayFeePerKw := w.cfg.FeeEstimator.RelayFeePerKW()
+
 	return &EstimateFeeResponse{
-		SatPerKw: int64(satPerKw),
+		SatPerKw:            int64(satPerKw),
+		MinRelayFeeSatPerKw: int64(relayFeePerKw),
 	}, nil
 }
 
