@@ -5,8 +5,9 @@ This repository is used to build LND Docker container images that are distribute
 Docker images are published to https://hub.docker.com/r/btcpayserver/lnd/
 
 Versions:
- - [0.18.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-e7449187b058440e4746f948bd095584d67bb82133c93737204e86c3aeff664a?context=repo)
+ - [0.18.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-513ddd55a5af44a14e27110ee14cb28f1c7a69205bcaa2fba4e66275c1f725e5?context=repo)
     - Includes 0.28.7-beta Loop
+    - [Fix for lnd unlock password \n problem](https://github.com/btcpayserver/lnd/pull/7)
  - [0.18.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.1-beta/images/sha256-5fbfa76a218ab59bf9206485f4c0c071a525f9f0906255a5672054741d043b79?context=repo)
     - Includes 0.28.5-beta Loop
  - [0.18.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.0-beta/images/sha256-e6043dddf0bdbd5c740e882447c441b37f87f2c736ebb08747a4aff5e100d9bf?context=repo)
@@ -47,7 +48,7 @@ Each version is marked with appropriate `basedon-vX.X.X-beta` tags. We are using
    c) Cherry-pick the `Adding BtcPayServer related files and resources` commit. [Example commit](https://github.com/btcpayserver/lnd/commit/ae4bb33c6a3db8b7cc01d18fdf46e600ead9bed4).  
    d) Tag it with the `basedon-v*` prefix name and push it. For v0.18.1, the tag name was `basedon-v0.18.3-beta`.  
    e) The build process will start (it [matches on tag format](.circleci/config.yml#L11)). Here is [an example CircleCI build](https://app.circleci.com/pipelines/github/btcpayserver/lnd/202/workflows/b90b5888-c0b8-4207-860e-a63ce21077af).  
-   f) The resulting image will be published to Docker Hub. Example [Docker Hub image for v0.18.3](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-e7449187b058440e4746f948bd095584d67bb82133c93737204e86c3aeff664a?context=repo).
+   f) The resulting image will be published to Docker Hub. Example [Docker Hub image for v0.18.3](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-513ddd55a5af44a14e27110ee14cb28f1c7a69205bcaa2fba4e66275c1f725e5?context=repo).
 
    Occasionally, there are problems with:
    - Versioning of base Docker images used for building Go binaries. You may need to bump that base image - [example commit](https://github.com/btcpayserver/lnd/commit/c841954c515a9d067c24987291316b093b91c2f2).
