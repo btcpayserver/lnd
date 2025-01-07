@@ -52,7 +52,7 @@ Each version is marked with appropriate `basedon-vX.X.X-beta` tags. We are using
 
    Occasionally, there are problems with:
    - Versioning of base Docker images used for building Go binaries. You may need to bump that base image - [example commit](https://github.com/btcpayserver/lnd/commit/c841954c515a9d067c24987291316b093b91c2f2).
-   - Updating Loop as part of the package, which needs to happen occasionally. [Example bump of Loop version](https://github.com/btcpayserver/lnd/commit/b3aecc7ac58280ef662e39ba99461573a30fe79a].
+   - [Updating Loop](https://github.com/lightninglabs/loop) as part of the package, which needs to happen occasionally. [Example bump of Loop version](https://github.com/btcpayserver/lnd/commit/b3aecc7ac58280ef662e39ba99461573a30fe79a).
 
 2. **Update https://github.com/btcpayserver/BTCPayServer.Lightning**
 
