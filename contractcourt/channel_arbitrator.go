@@ -98,7 +98,7 @@ type ArbChannel interface {
 	// corresponding link, such that we won't accept any new updates. The
 	// returned summary contains all items needed to eventually resolve all
 	// outputs on chain.
-	ForceCloseChan() (*lnwallet.LocalForceCloseSummary, error)
+	ForceCloseChan() (*wire.MsgTx, error)
 
 	// NewAnchorResolutions returns the anchor resolutions for currently
 	// valid commitment transactions.
@@ -482,6 +482,20 @@ func (c *ChannelArbitrator) Start(state *chanArbStartState) error {
 		return err
 	}
 
+	c.wg.Add(1)
+	go c.channelAttendant(bestHeight, state.commitSet)
+
+	return nil
+}
+
+// progressStateMachineAfterRestart attempts to progress the state machine
+// after a restart. This makes sure that if the state transition failed, we
+// will try to progress the state machine again. Moreover it will relaunch
+// resolvers if the channel is still in the pending close state and has not
+// been fully resolved yet.
+func (c *ChannelArbitrator) progressStateMachineAfterRestart(bestHeight int32,
+	commitSet *CommitSet) error {
+
 	// If the channel has been marked pending close in the database, and we
 	// haven't transitioned the state machine to StateContractClosed (or a
 	// succeeding state), then a state transition most likely failed. We'll
@@ -527,7 +541,7 @@ func (c *ChannelArbitrator) Start(state *chanArbStartState) error {
 	// on-chain state, and our set of active contracts.
 	startingState := c.state
 	nextState, _, err := c.advanceState(
-		triggerHeight, trigger, state.commitSet,
+		triggerHeight, trigger, commitSet,
 	)
 	if err != nil {
 		switch err {
@@ -564,14 +578,12 @@ func (c *ChannelArbitrator) Start(state *chanArbStartState) error {
 		// receive a chain event from the chain watcher that the
 		// commitment has been confirmed on chain, and before we
 		// advance our state step, we call InsertConfirmedCommitSet.
-		err := c.relaunchResolvers(state.commitSet, triggerHeight)
+		err := c.relaunchResolvers(commitSet, triggerHeight)
 		if err != nil {
 			return err
 		}
 	}
 
-	c.wg.Add(1)
-	go c.channelAttendant(bestHeight)
 	return nil
 }
 
@@ -1058,7 +1070,7 @@ func (c *ChannelArbitrator) stateStep(
 		// We'll tell the switch that it should remove the link for
 		// this channel, in addition to fetching the force close
 		// summary needed to close this channel on chain.
-		closeSummary, err := c.cfg.Channel.ForceCloseChan()
+		forceCloseTx, err := c.cfg.Channel.ForceCloseChan()
 		if err != nil {
 			log.Errorf("ChannelArbitrator(%v): unable to "+
 				"force close: %v", c.cfg.ChanPoint, err)
@@ -1078,7 +1090,7 @@ func (c *ChannelArbitrator) stateStep(
 
 			return StateError, closeTx, err
 		}
-		closeTx = closeSummary.CloseTx
+		closeTx = forceCloseTx
 
 		// Before publishing the transaction, we store it to the
 		// database, such that we can re-publish later in case it
@@ -1982,9 +1994,11 @@ func (c *ChannelArbitrator) isPreimageAvailable(hash lntypes.Hash) (bool,
 	// have the incoming contest resolver decide that we don't want to
 	// settle this invoice.
 	invoice, err := c.cfg.Registry.LookupInvoice(context.Background(), hash)
-	switch err {
-	case nil:
-	case invoices.ErrInvoiceNotFound, invoices.ErrNoInvoicesCreated:
+	switch {
+	case err == nil:
+	case errors.Is(err, invoices.ErrInvoiceNotFound) ||
+		errors.Is(err, invoices.ErrNoInvoicesCreated):
+
 		return false, nil
 	default:
 		return false, err
@@ -2773,12 +2787,27 @@ func (c *ChannelArbitrator) updateActiveHTLCs() {
 // Nursery for incubation, and ultimate sweeping.
 //
 // NOTE: This MUST be run as a goroutine.
-func (c *ChannelArbitrator) channelAttendant(bestHeight int32) {
+//
+//nolint:funlen
+func (c *ChannelArbitrator) channelAttendant(bestHeight int32,
+	commitSet *CommitSet) {
 
 	// TODO(roasbeef): tell top chain arb we're done
 	defer func() {
 		c.wg.Done()
 	}()
+
+	err := c.progressStateMachineAfterRestart(bestHeight, commitSet)
+	if err != nil {
+		// In case of an error, we return early but we do not shutdown
+		// LND, because there might be other channels that still can be
+		// resolved and we don't want to interfere with that.
+		// We continue to run the channel attendant in case the channel
+		// closes via other means for example the remote pary force
+		// closes the channel. So we log the error and continue.
+		log.Errorf("Unable to progress state machine after "+
+			"restart: %v", err)
+	}
 
 	for {
 		select {
@@ -2869,11 +2898,36 @@ func (c *ChannelArbitrator) channelAttendant(bestHeight int32) {
 			}
 			closeTx := closeInfo.CloseTx
 
+			resolutions, err := closeInfo.ContractResolutions.
+				UnwrapOrErr(
+					fmt.Errorf("resolutions not found"),
+				)
+			if err != nil {
+				log.Errorf("ChannelArbitrator(%v): unable to "+
+					"get resolutions: %v", c.cfg.ChanPoint,
+					err)
+
+				return
+			}
+
+			// We make sure that the htlc resolutions are present
+			// otherwise we would panic dereferencing the pointer.
+			//
+			// TODO(ziggie): Refactor ContractResolutions to use
+			// options.
+			if resolutions.HtlcResolutions == nil {
+				log.Errorf("ChannelArbitrator(%v): htlc "+
+					"resolutions not found",
+					c.cfg.ChanPoint)
+
+				return
+			}
+
 			contractRes := &ContractResolutions{
 				CommitHash:       closeTx.TxHash(),
-				CommitResolution: closeInfo.CommitResolution,
-				HtlcResolutions:  *closeInfo.HtlcResolutions,
-				AnchorResolution: closeInfo.AnchorResolution,
+				CommitResolution: resolutions.CommitResolution,
+				HtlcResolutions:  *resolutions.HtlcResolutions,
+				AnchorResolution: resolutions.AnchorResolution,
 			}
 
 			// When processing a unilateral close event, we'll
@@ -2882,7 +2936,7 @@ func (c *ChannelArbitrator) channelAttendant(bestHeight int32) {
 			// available to fetch in that state, we'll also write
 			// the commit set so we can reconstruct our chain
 			// actions on restart.
-			err := c.log.LogContractResolutions(contractRes)
+			err = c.log.LogContractResolutions(contractRes)
 			if err != nil {
 				log.Errorf("Unable to write resolutions: %v",
 					err)

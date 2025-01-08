@@ -769,6 +769,9 @@ func TestPathFinding(t *testing.T) {
 		name: "path finding with additional edges",
 		fn:   runPathFindingWithAdditionalEdges,
 	}, {
+		name: "path finding with duplicate blinded hop",
+		fn:   runPathFindingWithBlindedPathDuplicateHop,
+	}, {
 		name: "path finding with redundant additional edges",
 		fn:   runPathFindingWithRedundantAdditionalEdges,
 	}, {
@@ -1268,6 +1271,107 @@ func runPathFindingWithAdditionalEdges(t *testing.T, useCache bool) {
 	assertExpectedPath(t, graph.aliasMap, path, "songoku", "doge")
 }
 
+// runPathFindingWithBlindedPathDuplicateHop tests that in case a blinded path
+// has duplicate hops that the path finding algorithm does not fail or behave
+// incorrectly. This can happen because the creator of the blinded path can
+// specify the same hop multiple times and this will only be detected at the
+// forwarding nodes, so it is important that we can handle this case.
+func runPathFindingWithBlindedPathDuplicateHop(t *testing.T, useCache bool) {
+	graph, err := parseTestGraph(t, useCache, basicGraphFilePath)
+	require.NoError(t, err, "unable to create graph")
+
+	sourceNode, err := graph.graph.SourceNode()
+	require.NoError(t, err, "unable to fetch source node")
+
+	paymentAmt := lnwire.NewMSatFromSatoshis(100)
+
+	songokuPubKeyBytes := graph.aliasMap["songoku"]
+	songokuPubKey, err := btcec.ParsePubKey(songokuPubKeyBytes[:])
+	require.NoError(t, err, "unable to parse public key from bytes")
+
+	_, pkb1 := btcec.PrivKeyFromBytes([]byte{2})
+	_, pkb2 := btcec.PrivKeyFromBytes([]byte{3})
+	_, blindedPoint := btcec.PrivKeyFromBytes([]byte{5})
+
+	sizeEncryptedData := 100
+	cipherText := bytes.Repeat(
+		[]byte{1}, sizeEncryptedData,
+	)
+
+	vb1 := route.NewVertex(pkb1)
+	vb2 := route.NewVertex(pkb2)
+
+	// Payments to blinded paths always pay to the NUMS target key.
+	dummyTarget := route.NewVertex(&BlindedPathNUMSKey)
+
+	graph.aliasMap["pkb1"] = vb1
+	graph.aliasMap["pkb2"] = vb2
+	graph.aliasMap["dummyTarget"] = dummyTarget
+
+	// Create a blinded payment with duplicate hops and make sure the
+	// path finding algorithm can cope with that. We add blinded hop 2
+	// 3 times. The path finding algorithm should create a path with a
+	// single hop to pkb2 (the first entry).
+	blindedPayment := &BlindedPayment{
+		BlindedPath: &sphinx.BlindedPath{
+			IntroductionPoint: songokuPubKey,
+			BlindingPoint:     blindedPoint,
+			BlindedHops: []*sphinx.BlindedHopInfo{
+				{
+					CipherText: cipherText,
+				},
+				{
+					BlindedNodePub: pkb2,
+					CipherText:     cipherText,
+				},
+				{
+					BlindedNodePub: pkb1,
+					CipherText:     cipherText,
+				},
+				{
+					BlindedNodePub: pkb2,
+					CipherText:     cipherText,
+				},
+				{
+					BlindedNodePub: &BlindedPathNUMSKey,
+					CipherText:     cipherText,
+				},
+				{
+					BlindedNodePub: pkb2,
+					CipherText:     cipherText,
+				},
+			},
+		},
+		HtlcMinimum:     1,
+		HtlcMaximum:     100_000_000,
+		CltvExpiryDelta: 140,
+	}
+
+	blindedPath, err := blindedPayment.toRouteHints()
+	require.NoError(t, err)
+
+	find := func(r *RestrictParams) (
+		[]*unifiedEdge, error) {
+
+		return dbFindPath(
+			graph.graph, blindedPath, &mockBandwidthHints{},
+			r, testPathFindingConfig,
+			sourceNode.PubKeyBytes, dummyTarget, paymentAmt,
+			0, 0,
+		)
+	}
+
+	// We should now be able to find a path however not the chained path
+	// of the blinded hops.
+	path, err := find(noRestrictions)
+	require.NoError(t, err, "unable to create route to blinded path")
+
+	// The path should represent the following hops:
+	//	source node -> songoku -> pkb2 -> dummyTarget
+	assertExpectedPath(t, graph.aliasMap, path, "songoku", "pkb2",
+		"dummyTarget")
+}
+
 // runPathFindingWithRedundantAdditionalEdges asserts that we are able to find
 // paths to nodes ignoring additional edges that are already known by self node.
 func runPathFindingWithRedundantAdditionalEdges(t *testing.T, useCache bool) {
@@ -1367,7 +1471,7 @@ func TestNewRoute(t *testing.T) {
 		// overwrite the final hop's feature vector in the graph.
 		destFeatures *lnwire.FeatureVector
 
-		paymentAddr *[32]byte
+		paymentAddr fn.Option[[32]byte]
 
 		// metadata is the payment metadata to attach to the route.
 		metadata []byte
@@ -1446,7 +1550,7 @@ func TestNewRoute(t *testing.T) {
 			// a fee to receive the payment.
 			name:          "two hop single shot mpp",
 			destFeatures:  tlvPayAddrFeatures,
-			paymentAddr:   &testPaymentAddr,
+			paymentAddr:   fn.Some(testPaymentAddr),
 			paymentAmount: 100000,
 			hops: []*models.CachedEdgePolicy{
 				createHop(0, 1000, 1000000, 10),
@@ -1911,7 +2015,7 @@ func runDestPaymentAddr(t *testing.T, useCache bool) {
 	luoji := ctx.keyFromAlias("luoji")
 
 	// Add payment address w/o any invoice features.
-	ctx.restrictParams.PaymentAddr = &[32]byte{1}
+	ctx.restrictParams.PaymentAddr = fn.Some([32]byte{1})
 
 	// Add empty destination features. This should cause us to fail, since
 	// this overrides anything in the graph.
@@ -2955,7 +3059,7 @@ func runInboundFees(t *testing.T, useCache bool) {
 	ctx := newPathFindingTestContext(t, useCache, testChannels, "a")
 
 	payAddr := [32]byte{1}
-	ctx.restrictParams.PaymentAddr = &payAddr
+	ctx.restrictParams.PaymentAddr = fn.Some(payAddr)
 	ctx.restrictParams.DestFeatures = tlvPayAddrFeatures
 
 	const (
@@ -2974,7 +3078,7 @@ func runInboundFees(t *testing.T, useCache bool) {
 			amt:         paymentAmt,
 			cltvDelta:   finalHopCLTV,
 			records:     nil,
-			paymentAddr: &payAddr,
+			paymentAddr: fn.Some(payAddr),
 			totalAmt:    paymentAmt,
 		},
 		nil,
@@ -3287,9 +3391,7 @@ func TestBlindedRouteConstruction(t *testing.T) {
 	// that make up the graph we'll give to route construction. The hints
 	// map is keyed by source node, so we can retrieve our blinded edges
 	// accordingly.
-	blindedEdges, err := blindedPayment.toRouteHints(
-		fn.None[*btcec.PublicKey](),
-	)
+	blindedEdges, err := blindedPayment.toRouteHints()
 	require.NoError(t, err)
 
 	carolDaveEdge := blindedEdges[carolVertex][0]
@@ -3418,32 +3520,48 @@ func TestLastHopPayloadSize(t *testing.T) {
 		customRecords = map[uint64][]byte{
 			record.CustomTypeStart: {1, 2, 3},
 		}
-		sizeEncryptedData = 100
-		encrypedData      = bytes.Repeat(
-			[]byte{1}, sizeEncryptedData,
+
+		encrypedDataSmall = bytes.Repeat(
+			[]byte{1}, 5,
 		)
-		_, blindedPoint       = btcec.PrivKeyFromBytes([]byte{5})
-		paymentAddr           = &[32]byte{1}
-		ampOptions            = &AMPOptions{}
-		amtToForward          = lnwire.MilliSatoshi(10000)
-		finalHopExpiry  int32 = 144
+		encrypedDataLarge = bytes.Repeat(
+			[]byte{1}, 100,
+		)
+		_, blindedPoint          = btcec.PrivKeyFromBytes([]byte{5})
+		paymentAddr              = &[32]byte{1}
+		ampOptions               = &AMPOptions{}
+		amtToForward             = lnwire.MilliSatoshi(10000)
+		emptyEncryptedData       = []byte{}
+		finalHopExpiry     int32 = 144
 
 		oneHopPath = &sphinx.BlindedPath{
 			BlindedHops: []*sphinx.BlindedHopInfo{
 				{
-					CipherText: encrypedData,
+					CipherText: emptyEncryptedData,
 				},
 			},
 			BlindingPoint: blindedPoint,
 		}
 
-		twoHopPath = &sphinx.BlindedPath{
+		twoHopPathSmallHopSize = &sphinx.BlindedPath{
 			BlindedHops: []*sphinx.BlindedHopInfo{
 				{
-					CipherText: encrypedData,
+					CipherText: encrypedDataLarge,
 				},
 				{
-					CipherText: encrypedData,
+					CipherText: encrypedDataLarge,
+				},
+			},
+			BlindingPoint: blindedPoint,
+		}
+
+		twoHopPathLargeHopSize = &sphinx.BlindedPath{
+			BlindedHops: []*sphinx.BlindedHopInfo{
+				{
+					CipherText: encrypedDataSmall,
+				},
+				{
+					CipherText: encrypedDataSmall,
 				},
 			},
 			BlindingPoint: blindedPoint,
@@ -3456,20 +3574,24 @@ func TestLastHopPayloadSize(t *testing.T) {
 	require.NoError(t, err)
 
 	twoHopBlindedPayment, err := NewBlindedPaymentPathSet(
-		[]*BlindedPayment{{BlindedPath: twoHopPath}},
+		[]*BlindedPayment{
+			{BlindedPath: twoHopPathLargeHopSize},
+			{BlindedPath: twoHopPathSmallHopSize},
+		},
 	)
 	require.NoError(t, err)
 
 	testCases := []struct {
-		name           string
-		restrictions   *RestrictParams
-		finalHopExpiry int32
-		amount         lnwire.MilliSatoshi
+		name                  string
+		restrictions          *RestrictParams
+		finalHopExpiry        int32
+		amount                lnwire.MilliSatoshi
+		expectedEncryptedData []byte
 	}{
 		{
 			name: "Non blinded final hop",
 			restrictions: &RestrictParams{
-				PaymentAddr:       paymentAddr,
+				PaymentAddr:       fn.Some(*paymentAddr),
 				DestCustomRecords: customRecords,
 				Metadata:          metadata,
 				Amp:               ampOptions,
@@ -3482,16 +3604,18 @@ func TestLastHopPayloadSize(t *testing.T) {
 			restrictions: &RestrictParams{
 				BlindedPaymentPathSet: oneHopBlindedPayment,
 			},
-			amount:         amtToForward,
-			finalHopExpiry: finalHopExpiry,
+			amount:                amtToForward,
+			finalHopExpiry:        finalHopExpiry,
+			expectedEncryptedData: emptyEncryptedData,
 		},
 		{
 			name: "Blinded final hop of a two hop payment",
 			restrictions: &RestrictParams{
 				BlindedPaymentPathSet: twoHopBlindedPayment,
 			},
-			amount:         amtToForward,
-			finalHopExpiry: finalHopExpiry,
+			amount:                amtToForward,
+			finalHopExpiry:        finalHopExpiry,
+			expectedEncryptedData: encrypedDataLarge,
 		},
 	}
 
@@ -3501,12 +3625,10 @@ func TestLastHopPayloadSize(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var mpp *record.MPP
-			if tc.restrictions.PaymentAddr != nil {
-				mpp = record.NewMPP(
-					tc.amount, *tc.restrictions.PaymentAddr,
-				)
-			}
+			mpp := fn.MapOptionZ(tc.restrictions.PaymentAddr,
+				func(addr [32]byte) *record.MPP {
+					return record.NewMPP(tc.amount, addr)
+				})
 
 			// In case it's an AMP payment we use the max AMP record
 			// size to estimate the final hop size.
@@ -3517,16 +3639,23 @@ func TestLastHopPayloadSize(t *testing.T) {
 
 			var finalHop route.Hop
 			if tc.restrictions.BlindedPaymentPathSet != nil {
-				path := tc.restrictions.BlindedPaymentPathSet.
-					LargestLastHopPayloadPath()
+				bPSet := tc.restrictions.BlindedPaymentPathSet
+				path, err := bPSet.LargestLastHopPayloadPath()
+				require.NotNil(t, path)
+
+				require.NoError(t, err)
+
 				blindedPath := path.BlindedPath.BlindedHops
 				blindedPoint := path.BlindedPath.BlindingPoint
+				lastHop := blindedPath[len(blindedPath)-1]
+				require.Equal(t, lastHop.CipherText,
+					tc.expectedEncryptedData)
 
 				//nolint:lll
 				finalHop = route.Hop{
 					AmtToForward:     tc.amount,
 					OutgoingTimeLock: uint32(tc.finalHopExpiry),
-					EncryptedData:    blindedPath[len(blindedPath)-1].CipherText,
+					EncryptedData:    lastHop.CipherText,
 				}
 				if len(blindedPath) == 1 {
 					finalHop.BlindingPoint = blindedPoint
@@ -3546,11 +3675,11 @@ func TestLastHopPayloadSize(t *testing.T) {
 			payLoad, err := createHopPayload(finalHop, 0, true)
 			require.NoErrorf(t, err, "failed to create hop payload")
 
-			expectedPayloadSize := lastHopPayloadSize(
+			expectedPayloadSize, err := lastHopPayloadSize(
 				tc.restrictions, tc.finalHopExpiry,
 				tc.amount,
 			)
-
+			require.NoError(t, err)
 			require.Equal(
 				t, expectedPayloadSize,
 				uint64(payLoad.NumBytes()),

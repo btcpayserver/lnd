@@ -35,6 +35,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 func isAlias(scid lnwire.ShortChannelID) bool {
@@ -844,14 +845,14 @@ func (f *mockChannelLink) UpdateForwardingPolicy(_ models.ForwardingPolicy) {
 }
 func (f *mockChannelLink) CheckHtlcForward([32]byte, lnwire.MilliSatoshi,
 	lnwire.MilliSatoshi, uint32, uint32, models.InboundFee, uint32,
-	lnwire.ShortChannelID) *LinkError {
+	lnwire.ShortChannelID, lnwire.CustomRecords) *LinkError {
 
 	return f.checkHtlcForwardResult
 }
 
 func (f *mockChannelLink) CheckHtlcTransit(payHash [32]byte,
 	amt lnwire.MilliSatoshi, timeout uint32,
-	heightNow uint32) *LinkError {
+	heightNow uint32, _ lnwire.CustomRecords) *LinkError {
 
 	return f.checkHtlcTransitResult
 }
@@ -950,6 +951,25 @@ func (f *mockChannelLink) OnCommitOnce(LinkDirection, func()) {
 	// TODO(proofofkeags): Implement
 }
 
+func (f *mockChannelLink) FundingCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (f *mockChannelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+// AuxBandwidth returns the bandwidth that can be used for a channel,
+// expressed in milli-satoshi. This might be different from the regular
+// BTC bandwidth for custom channels. This will always return fn.None()
+// for a regular (non-custom) channel.
+func (f *mockChannelLink) AuxBandwidth(lnwire.MilliSatoshi,
+	lnwire.ShortChannelID,
+	fn.Option[tlv.Blob], AuxTrafficShaper) fn.Result[OptionalBandwidth] {
+
+	return fn.Ok(fn.None[lnwire.MilliSatoshi]())
+}
+
 var _ ChannelLink = (*mockChannelLink)(nil)
 
 func newDB() (*channeldb.DB, func(), error) {
@@ -1005,6 +1025,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		panic(err)
 	}
 
+	modifierMock := &invoices.MockHtlcModifier{}
 	registry := invoices.NewRegistry(
 		cdb,
 		invoices.NewInvoiceExpiryWatcher(
@@ -1013,6 +1034,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		),
 		&invoices.RegistryConfig{
 			FinalCltvRejectDelta: 5,
+			HtlcInterceptor:      modifierMock,
 		},
 	)
 	registry.Start()
@@ -1038,11 +1060,12 @@ func (i *mockInvoiceRegistry) SettleHodlInvoice(
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
 	circuitKey models.CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
 	event, err := i.registry.NotifyExitHopHtlc(
-		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
-		payload,
+		rhash, amt, expiry, currentHeight, circuitKey,
+		hodlChan, wireCustomRecords, payload,
 	)
 	if err != nil {
 		return nil, err
@@ -1152,22 +1175,27 @@ type mockHTLCNotifier struct {
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
 	eventType HtlcEventType, linkErr *LinkError,
-	incoming bool) { //nolint:whitespace
+	incoming bool) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey,
-	preimage lntypes.Preimage, eventType HtlcEventType) { //nolint:whitespace,lll
+	preimage lntypes.Preimage, eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyFinalHtlcEvent(key models.CircuitKey,
-	info channeldb.FinalHtlcInfo) { //nolint:whitespace
+	info channeldb.FinalHtlcInfo) {
+
 }

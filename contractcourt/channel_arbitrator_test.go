@@ -21,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -693,11 +694,15 @@ func TestChannelArbitratorLocalForceClose(t *testing.T) {
 	chanArbCtx.AssertState(StateCommitmentBroadcasted)
 
 	// Now notify about the local force close getting confirmed.
+	//
+	//nolint:lll
 	chanArb.cfg.ChainEvents.LocalUnilateralClosure <- &LocalUnilateralCloseInfo{
 		SpendDetail: &chainntnfs.SpendDetail{},
 		LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
-			CloseTx:         &wire.MsgTx{},
-			HtlcResolutions: &lnwallet.HtlcResolutions{},
+			CloseTx: &wire.MsgTx{},
+			ContractResolutions: fn.Some(lnwallet.ContractResolutions{
+				HtlcResolutions: &lnwallet.HtlcResolutions{},
+			}),
 		},
 		ChannelCloseSummary: &channeldb.ChannelCloseSummary{},
 	}
@@ -969,15 +974,18 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		},
 	}
 
+	//nolint:lll
 	chanArb.cfg.ChainEvents.LocalUnilateralClosure <- &LocalUnilateralCloseInfo{
 		SpendDetail: &chainntnfs.SpendDetail{},
 		LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
 			CloseTx: closeTx,
-			HtlcResolutions: &lnwallet.HtlcResolutions{
-				OutgoingHTLCs: []lnwallet.OutgoingHtlcResolution{
-					outgoingRes,
+			ContractResolutions: fn.Some(lnwallet.ContractResolutions{
+				HtlcResolutions: &lnwallet.HtlcResolutions{
+					OutgoingHTLCs: []lnwallet.OutgoingHtlcResolution{
+						outgoingRes,
+					},
 				},
-			},
+			}),
 		},
 		ChannelCloseSummary: &channeldb.ChannelCloseSummary{},
 		CommitSet: CommitSet{
@@ -1036,10 +1044,19 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 
 	// Post restart, it should be the case that our resolver was properly
 	// supplemented, and we only have a single resolver in the final set.
-	if len(chanArb.activeResolvers) != 1 {
-		t.Fatalf("expected single resolver, instead got: %v",
-			len(chanArb.activeResolvers))
-	}
+	// The resolvers are added concurrently so we need to wait here.
+	err = wait.NoError(func() error {
+		chanArb.activeResolversLock.Lock()
+		defer chanArb.activeResolversLock.Unlock()
+
+		if len(chanArb.activeResolvers) != 1 {
+			return fmt.Errorf("expected single resolver, instead "+
+				"got: %v", len(chanArb.activeResolvers))
+		}
+
+		return nil
+	}, defaultTimeout)
+	require.NoError(t, err)
 
 	// We'll now examine the in-memory state of the active resolvers to
 	// ensure t hey were populated properly.
@@ -1611,12 +1628,15 @@ func TestChannelArbitratorCommitFailure(t *testing.T) {
 		},
 		{
 			closeType: channeldb.LocalForceClose,
+			//nolint:lll
 			sendEvent: func(chanArb *ChannelArbitrator) {
 				chanArb.cfg.ChainEvents.LocalUnilateralClosure <- &LocalUnilateralCloseInfo{
 					SpendDetail: &chainntnfs.SpendDetail{},
 					LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
-						CloseTx:         &wire.MsgTx{},
-						HtlcResolutions: &lnwallet.HtlcResolutions{},
+						CloseTx: &wire.MsgTx{},
+						ContractResolutions: fn.Some(lnwallet.ContractResolutions{
+							HtlcResolutions: &lnwallet.HtlcResolutions{},
+						}),
 					},
 					ChannelCloseSummary: &channeldb.ChannelCloseSummary{},
 				}
@@ -1944,11 +1964,15 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 			// being canalled back. Also note that there're no HTLC
 			// resolutions sent since we have none on our
 			// commitment transaction.
+			//
+			//nolint:lll
 			uniCloseInfo := &LocalUnilateralCloseInfo{
 				SpendDetail: &chainntnfs.SpendDetail{},
 				LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
-					CloseTx:         closeTx,
-					HtlcResolutions: &lnwallet.HtlcResolutions{},
+					CloseTx: closeTx,
+					ContractResolutions: fn.Some(lnwallet.ContractResolutions{
+						HtlcResolutions: &lnwallet.HtlcResolutions{},
+					}),
 				},
 				ChannelCloseSummary: &channeldb.ChannelCloseSummary{},
 				CommitSet: CommitSet{
@@ -2754,12 +2778,15 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 		},
 	}
 
+	//nolint:lll
 	chanArb.cfg.ChainEvents.LocalUnilateralClosure <- &LocalUnilateralCloseInfo{
 		SpendDetail: &chainntnfs.SpendDetail{},
 		LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
-			CloseTx:          closeTx,
-			HtlcResolutions:  &lnwallet.HtlcResolutions{},
-			AnchorResolution: anchorResolution,
+			CloseTx: closeTx,
+			ContractResolutions: fn.Some(lnwallet.ContractResolutions{
+				HtlcResolutions:  &lnwallet.HtlcResolutions{},
+				AnchorResolution: anchorResolution,
+			}),
 		},
 		ChannelCloseSummary: &channeldb.ChannelCloseSummary{},
 		CommitSet: CommitSet{
@@ -2867,9 +2894,12 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 		{
 			name: "Commitment is rejected with an " +
 				"unmatched error",
-			broadcastErr:    fmt.Errorf("Reject Commitment Tx"),
-			expectedState:   StateBroadcastCommit,
-			expectedStartup: false,
+			broadcastErr:  fmt.Errorf("Reject Commitment Tx"),
+			expectedState: StateBroadcastCommit,
+			// We should still be able to start up since we other
+			// channels might be closing as well and we should
+			// resolve the contracts.
+			expectedStartup: true,
 		},
 
 		// We started after the DLP was triggered, and try to force
@@ -2993,14 +3023,10 @@ func (m *mockChannel) NewAnchorResolutions() (*lnwallet.AnchorResolutions,
 	return &lnwallet.AnchorResolutions{}, nil
 }
 
-func (m *mockChannel) ForceCloseChan() (*lnwallet.LocalForceCloseSummary, error) {
+func (m *mockChannel) ForceCloseChan() (*wire.MsgTx, error) {
 	if m.forceCloseErr != nil {
 		return nil, m.forceCloseErr
 	}
 
-	summary := &lnwallet.LocalForceCloseSummary{
-		CloseTx:         &wire.MsgTx{},
-		HtlcResolutions: &lnwallet.HtlcResolutions{},
-	}
-	return summary, nil
+	return &wire.MsgTx{}, nil
 }
