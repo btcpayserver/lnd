@@ -28,7 +28,7 @@ RUN go install ./...
 
 
 # Force the builder machine to take make an arm runtime image. This is fine as long as the builder does not run any program
-FROM arm32v7/debian:bullseye-slim as final
+FROM --platform=linux/arm/v7 arm32v7/debian:bullseye-slim as final
 
 COPY --from=builder /opt/tini /usr/bin/tini
 COPY --from=builder /usr/bin/qemu-arm-static /usr/bin/qemu-arm-static
