@@ -70,7 +70,7 @@ Each version is marked with appropriate `basedon-vX.X.X-beta` tags. We are using
 
    This will give access to LND to the whole dev team and allow for further testing on their dev machines if everything works as expected.
 
-   a) Modify 2 `docker-compose.yml` files in `BTCPayServer.Tests`. [Example pull request to emulate](https://github.com/btcpayserver/btcpayserver/pull/6094).  
+   a) Modify 4 `docker-compose.yml` files in `BTCPayServer.Tests`. [Example pull request to emulate](https://github.com/btcpayserver/btcpayserver/pull/6795).  
    b) When you open the PR, include the version and link to the BTCPayServer.Lightning PR.  
    c) Once tests pass, you can merge it.
 
