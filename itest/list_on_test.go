@@ -364,6 +364,10 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testSingleHopInvoice,
 	},
 	{
+		Name:     "send payment overpay",
+		TestFunc: testSendPaymentOverpay,
+	},
+	{
 		Name:     "wipe forwarding packages",
 		TestFunc: testWipeForwardingPackages,
 	},
