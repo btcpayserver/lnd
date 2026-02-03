@@ -985,27 +985,24 @@ func (r *RouterBackend) extractIntentFromSendRequest(
 			return nil, err
 		}
 
-		// If the amount was not included in the invoice, then we let
-		// the payer specify the amount of satoshis they wish to send.
-		// We override the amount to pay with the amount provided from
-		// the payment request.
-		if payReq.MilliSat == nil {
-			if reqAmt == 0 {
-				return nil, errors.New("amount must be " +
-					"specified when paying a zero amount " +
-					"invoice")
-			}
+		// An invoice must include either a payment address or
+		// blinded paths.
+		if payReq.PaymentAddr.IsNone() &&
+			len(payReq.BlindedPaymentPaths) == 0 {
 
-			payIntent.Amount = reqAmt
-		} else {
-			if reqAmt != 0 {
-				return nil, errors.New("amount must not be " +
-					"specified when paying a non-zero " +
-					" amount invoice")
-			}
-
-			payIntent.Amount = *payReq.MilliSat
+			return nil, errors.New("payment request must contain " +
+				"either a payment address or blinded paths")
 		}
+
+		// Validate and resolve the payment amount against the
+		// invoice. Overpayment is allowed, underpayment is not.
+		payAmt, err := lnrpc.ValidatePayReqAmt(
+			payReq.MilliSat, rpcPayReq.Amt, rpcPayReq.AmtMsat,
+		)
+		if err != nil {
+			return nil, err
+		}
+		payIntent.Amount = payAmt
 
 		if !payReq.Features.HasFeature(lnwire.MPPOptional) &&
 			!payReq.Features.HasFeature(lnwire.AMPOptional) {
