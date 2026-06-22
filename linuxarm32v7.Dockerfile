@@ -6,7 +6,7 @@ ENV GODEBUG netdns=cgo
 
 # Install dependencies and build the binaries.
 RUN apt-get -y update && apt-get -y install git make wget \
-    && apt-get install -qq --no-install-recommends qemu qemu-user-static qemu-user binfmt-support
+    && apt-get install -qq --no-install-recommends qemu-user-static qemu-user binfmt-support
 
 RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-armhf" \
     && echo "01b54b934d5f5deb32aa4eb4b0f71d0e76324f4f0237cc262d59376bf2bdc269 /opt/tini" | sha256sum -c - \

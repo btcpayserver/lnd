@@ -6,7 +6,7 @@ ENV GODEBUG netdns=cgo
 
 # Install dependencies and build the binaries.
 RUN apt-get -y update && apt-get -y install git make wget \
-    && apt-get install -qq --no-install-recommends qemu qemu-user-static qemu-user binfmt-support
+    && apt-get install -qq --no-install-recommends qemu-user-static qemu-user binfmt-support
 
 RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-arm64" \
     && echo "7c5463f55393985ee22357d976758aaaecd08defb3c5294d353732018169b019 /opt/tini" | sha256sum -c - \
