@@ -2,23 +2,17 @@
 1. [Overview](#overview)
 2. [Minimum Recommended Skillset](#minimum-recommended-skillset)
 3. [Required Reading](#required-reading)
-4. [Development Practices](#development-practices)
+4. [Substantial contributions only](#substantial-contributions-only)
+5. [Development Practices](#development-practices)
    1. [Share Early, Share Often](#share-early-share-often)
-   1. [Testing](#testing)
-   1. [Code Documentation and Commenting](#code-documentation-and-commenting)
-   1. [Model Git Commit Messages](#model-git-commit-messages)
-   1. [Ideal Git Commit Structure](#ideal-git-commit-structure)
-   1. [Sign Your Git Commits](#sign-your-git-commits)
-   1. [Code Spacing and formatting](#code-spacing-and-formatting)
-   1. [Pointing to Remote Dependent Branches in Go Modules](#pointing-to-remote-dependent-branches-in-go-modules)
-   1. [Use of Log Levels](#use-of-log-levels)
-   1. [Use of Golang submodules](#use-of-golang-submodules)
+   1. [Development Guidelines](#development-guidelines)
 5. [Code Approval Process](#code-approval-process)
    1. [Code Review](#code-review)
    1. [Rework Code (if needed)](#rework-code-if-needed)
    1. [Acceptance](#acceptance)
+   1. [Backporting Changes](#backporting-changes)
    1. [Review Bot](#review-bot)
-6. [Contribution Standards](#contribution-standards)
+7. [Contribution Standards](#contribution-standards)
    1. [Contribution Checklist](#contribution-checklist)
    1. [Licensing of Contributions](#licensing-of-contributions)
 
@@ -77,7 +71,7 @@ security and performance implications.
 
 # Required Reading
 
-- [Effective Go](http://golang.org/doc/effective_go.html) - The entire `lnd` 
+- [Effective Go](https://golang.org/doc/effective_go.html) - The entire `lnd` 
   project follows the guidelines in this document.  For your code to be accepted,
   it must follow the guidelines therein.
 - [Original Satoshi Whitepaper](https://bitcoin.org/bitcoin.pdf) - This is the white paper that started it all.  Having a solid
@@ -85,7 +79,7 @@ security and performance implications.
 - [Lightning Network Whitepaper](https://lightning.network/lightning-network-paper.pdf) - This is the white paper that kicked off the Layer 2 revolution. Having a good grasp of the concepts of Lightning will make the core logic within the daemon much more comprehensible: Bitcoin Script, off-chain blockchain protocols, payment channels, bidirectional payment channels, relative and absolute time-locks, commitment state revocations, and Segregated Witness. 
     - The original LN was written for a rather narrow audience, the paper may be a bit unapproachable to many. Thanks to the Bitcoin community, there exist many easily accessible supplemental resources which can help one see how all the pieces fit together from double-spend protection all the way up to commitment state transitions and Hash Time Locked Contracts (HTLCs): 
         - [Lightning Network Summary](https://lightning.network/lightning-network-summary.pdf)
-        - [Understanding the Lightning Network 3-Part series](https://bitcoinmagazine.com/articles/understanding-the-lightning-network-part-building-a-bidirectional-payment-channel-1464710791) 
+        - [Understanding the Lightning Network 3-Part series](https://bitcoinmagazine.com/technical/understanding-the-lightning-network-part-building-a-bidirectional-payment-channel-1464710791) 
         - [Deployable Lightning](https://github.com/ElementsProject/lightning/blob/master/doc/miscellaneous/deployable-lightning.pdf)
 
 
@@ -97,6 +91,28 @@ initial [Lightning Network Specifications](https://github.com/lightningnetwork/l
 Once the specification is finalized, it will be the most up-to-date
 comprehensive document explaining the Lightning Network. As a result, it will
 be recommended for newcomers to read first in order to get up to speed. 
+
+# Substantial contributions only
+
+Due to the prevalence of automated analysis and pull request authoring tools
+and online competitions that incentivize creating commits in popular
+repositories, the maintainers of this project are flooded with trivial pull
+requests that only change some typos or other insubstantial content (e.g. the
+year in the license file).
+If you are an honest user that wants to contribute to this project, please
+consider that every pull request takes precious time from the maintainers to
+review and consider the impact of changes. Time that could be spent writing
+features or fixing bugs.
+If you really want to contribute, [consider reviewing and testing other users'
+pull requests instead](review.md).
+First-time reviewer friendly [pull requests can be found
+here](https://github.com/lightningnetwork/lnd/pulls?q=is%3Aopen+is%3Apr+label%3A%22good+first+review%22).
+Once you are familiar with the project's code style, testing and review
+procedure, your own pull requests will likely require less guidance and fewer
+maintainer review cycles, resulting in potentially faster merges.
+Also, consider increasing the test coverage of the code by writing more unit
+tests first, which is also a very valuable way to contribute and learn more
+about the code base.
 
 # Development Practices
 
@@ -123,337 +139,22 @@ This approach has several benefits:
 - The quicker your changes are merged to master, the less time you will need to
   spend rebasing and otherwise trying to keep up with the main code base
 
-## Testing
+## Development Guidelines
 
-One of the major design goals of all of `lnd`'s packages and the daemon itself is
-to aim for a high degree of test coverage.  This is financial software so bugs
-and regressions in the core logic can cost people real money.  For this reason
-every effort must be taken to ensure the code is as accurate and bug-free as
-possible.  Thorough testing is a good way to help achieve that goal.
+The `lnd` project emphasizes code readability and maintainability through
+specific development guidelines. Key aspects include: thorough code
+documentation with clear function comments and meaningful inline comments;
+consistent code spacing to separate logical blocks; adherence to an 80-character
+line limit with specific rules for wrapping function calls, definitions, and log
+messages (including structured logging); comprehensive unit and integration
+testing for all changes; well-structured Git commit messages with package
+prefixes and atomic commits; signing Git commits; proper handling of Go module
+dependencies and submodules; and appropriate use of log levels. Developers are
+encouraged to configure their editors to align with these standards.
 
-Unless a new feature you submit is completely trivial, it will probably be
-rejected unless it is also accompanied by adequate test coverage for both
-positive and negative conditions.  That is to say, the tests must ensure your
-code works correctly when it is fed correct data as well as incorrect data
-(error paths).
+For the complete set of rules and examples, please refer to the detailed
+[Development Guidelines](development_guidelines.md).
 
-
-Go provides an excellent test framework that makes writing test code and
-checking coverage statistics straightforward.  For more information about the
-test coverage tools, see the [golang cover blog post](http://blog.golang.org/cover).
-
-A quick summary of test practices follows:
-- All new code should be accompanied by tests that ensure the code behaves
-  correctly when given expected values, and, perhaps even more importantly, that
-  it handles errors gracefully
-- When you fix a bug, it should be accompanied by tests which exercise the bug
-  to both prove it has been resolved and to prevent future regressions
-- Changes to publicly exported packages such as
-  [brontide](https://github.com/lightningnetwork/lnd/tree/master/brontide) should
-  be accompanied by unit tests exercising the new or changed behavior.
-- Changes to behavior within the daemon's interaction with the P2P protocol,
-  or RPC's will need to be accompanied by integration tests which use the
-  [`networkHarness`framework](https://github.com/lightningnetwork/lnd/blob/master/lntest/harness.go)
-  contained within `lnd`. For example integration tests, see
-  [`lnd_test.go`](https://github.com/lightningnetwork/lnd/blob/master/itest/lnd_test.go).
-- The itest log files are automatically scanned for `[ERR]` lines. There
-  shouldn't be any of those in the logs, see [Use of Log Levels](#use-of-log-levels).
-
-Throughout the process of contributing to `lnd`, you'll likely also be
-extensively using the commands within our `Makefile`. As a result, we recommend
-[perusing the make file documentation](https://github.com/lightningnetwork/lnd/blob/master/docs/MAKEFILE.md).
-
-## Code Documentation and Commenting
-
-- At a minimum every function must be commented with its intended purpose and
-  any assumptions that it makes
-  - Function comments must always begin with the name of the function per
-    [Effective Go](http://golang.org/doc/effective_go.html)
-  - Function comments should be complete sentences since they allow a wide
-    variety of automated presentations such as [godoc.org](https://godoc.org)
-  - The general rule of thumb is to look at it as if you were completely
-    unfamiliar with the code and ask yourself, would this give me enough
-	information to understand what this function does and how I'd probably want
-	to use it?
-- Exported functions should also include detailed information the caller of the
-  function will likely need to know and/or understand:<br /><br />
-
-**WRONG**
-```go
-// generates a revocation key
-func DeriveRevocationPubkey(commitPubKey *btcec.PublicKey,
-	revokePreimage []byte) *btcec.PublicKey {
-```
-**RIGHT**
-```go
-// DeriveRevocationPubkey derives the revocation public key given the
-// counterparty's commitment key, and revocation preimage derived via a
-// pseudo-random-function. In the event that we (for some reason) broadcast a
-// revoked commitment transaction, then if the other party knows the revocation
-// preimage, then they'll be able to derive the corresponding private key to
-// this private key by exploiting the homomorphism in the elliptic curve group:
-//    * https://en.wikipedia.org/wiki/Group_homomorphism#Homomorphisms_of_abelian_groups
-//
-// The derivation is performed as follows:
-//
-//   revokeKey := commitKey + revokePoint
-//             := G*k + G*h
-//             := G * (k+h)
-//
-// Therefore, once we divulge the revocation preimage, the remote peer is able to
-// compute the proper private key for the revokeKey by computing:
-//   revokePriv := commitPriv + revokePreimge mod N
-//
-// Where N is the order of the sub-group.
-func DeriveRevocationPubkey(commitPubKey *btcec.PublicKey,
-	revokePreimage []byte) *btcec.PublicKey {
-```
-- Comments in the body of the code are highly encouraged, but they should
-  explain the intention of the code as opposed to just calling out the
-  obvious<br /><br />
-
-**WRONG**
-```go
-// return err if amt is less than 546
-if amt < 546 {
-	return err
-}
-```
-**RIGHT**
-```go
-// Treat transactions with amounts less than the amount which is considered dust
-// as non-standard.
-if amt < 546 {
-	return err
-}
-```
-**NOTE:** The above should really use a constant as opposed to a magic number,
-but it was left as a magic number to show how much of a difference a good
-comment can make.
-
-## Code Spacing and formatting
-
-Code in general (and Open Source code specifically) is _read_ by developers many
-more times during its lifecycle than it is modified. With this fact in mind, the
-Golang language was designed for readability (among other goals).
-While the enforced formatting of `go fmt` and some best practices already
-eliminate many discussions, the resulting code can still look and feel very
-differently among different developers.
-
-We aim to enforce a few additional rules to unify the look and feel of all code
-in `lnd` to help improve the overall readability.
-
-**Please refer to the [code formatting rules
-document](./code_formatting_rules.md)** to see the list of additional style
-rules we enforce.
-
-## Model Git Commit Messages
-
-This project prefers to keep a clean commit history with well-formed commit
-messages.  This section illustrates a model commit message and provides a bit
-of background for it.  This content was originally created by Tim Pope and made
-available on his website, however that website is no longer active, so it is
-being provided here.
-
-Here’s a model Git commit message:
-
-```text
-Short (50 chars or less) summary of changes
-
-More detailed explanatory text, if necessary.  Wrap it to about 72
-characters or so.  In some contexts, the first line is treated as the
-subject of an email and the rest of the text as the body.  The blank
-line separating the summary from the body is critical (unless you omit
-the body entirely); tools like rebase can get confused if you run the
-two together.
-
-Write your commit message in the present tense: "Fix bug" and not "Fixed
-bug."  This convention matches up with commit messages generated by
-commands like git merge and git revert.
-
-Further paragraphs come after blank lines.
-
-- Bullet points are okay, too
-- Typically a hyphen or asterisk is used for the bullet, preceded by a
-  single space, with blank lines in between, but conventions vary here
-- Use a hanging indent
-```
-
-Here are some of the reasons why wrapping your commit messages to 72 columns is
-a good thing.
-
-- git log doesn't do any special wrapping of the commit messages. With
-  the default pager of less -S, this means your paragraphs flow far off the edge
-  of the screen, making them difficult to read. On an 80 column terminal, if we
-  subtract 4 columns for the indent on the left and 4 more for symmetry on the
-  right, we’re left with 72 columns.
-- git format-patch --stdout converts a series of commits to a series of emails,
-  using the messages for the message body.  Good email netiquette dictates we
-  wrap our plain text emails such that there’s room for a few levels of nested
-  reply indicators without overflow in an 80 column terminal.
-  
-In addition to the Git commit message structure adhered to within the daemon
-all short-[commit messages are to be prefixed according to the convention
-outlined in the Go project](https://golang.org/doc/contribute.html#change). All
-commits should begin with the subsystem or package primarily affected by the
-change. In the case of a widespread change, the packages are to be delimited by
-either a '+' or a ','. This prefix seems minor but can be extremely helpful in
-determining the scope of a commit at a glance, or when bug hunting to find a
-commit which introduced a bug or regression. 
-
-## Ideal Git Commit Structure
-
-Within the project we prefer small, contained commits for a pull request over a
-single giant commit that touches several files/packages. Ideal commits build on
-their own, in order to facilitate easy usage of tools like `git bisect` to `git
-cherry-pick`. It's preferred that commits contain an isolated change in a
-single package. In this case, the commit header message should begin with the
-prefix of the modified package. For example, if a commit was made to modify the
-`lnwallet` package, it should start with `lnwallet: `. 
-
-In the case of changes that only build in tandem with changes made in other
-packages, it is permitted for a single commit to be made which contains several
-prefixes such as: `lnwallet+htlcswitch`. This prefix structure along with the
-requirement for atomic contained commits (when possible) make things like
-scanning the set of commits and debugging easier. In the case of changes that
-touch several packages, and can only compile with the change across several
-packages, a `multi: ` prefix should be used.
-
-Examples of common patterns w.r.t commit structures within the project:
-
-  * It is common that during the work on a PR, existing bugs are found and
-    fixed. If they can be fixed in isolation, they should have their own
-    commit. 
-  * File restructuring like moving a function to another file or changing order
-    of functions: with a separate commit because it is much easier to review
-    the real changes that go on top of the restructuring.
-  * Preparatory refactorings that are functionally equivalent: own commit.
-  * Project or package wide file renamings should be in their own commit.
-  * Ideally if a new package/struct/sub-system is added in a PR, there should
-    be a single commit which adds the new functionality, with follow up
-    individual commits that begin to integrate the functionality within the
-    codebase.
-  * If a PR only fixes a trivial issue, such as updating documentation on a
-    small scale, fix typos, or any changes that do not modify the code, the
-    commit message should end with `[skip ci]` to skip the CI checks.
-    
-## Sign your git commits
-
-When contributing to `lnd` it is recommended to sign your git commits. This is
-easy to do and will help in assuring the integrity of the tree. See [mailing
-list entry](https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2014-May/005877.html)
-for more information.
-
-### How to sign your commits?
-
-Provide the `-S` flag (or `--gpg-sign`) to git commit when you commit
-your changes, for example
-
-```shell
-$  git commit -m "Commit message" -S
-```
-
-Optionally you can provide a key id after the `-S` option to sign with a
-specific key.
-
-To instruct `git` to auto-sign every commit, add the following lines to your
-`~/.gitconfig` file:
-
-```text
-[commit]
-        gpgsign = true
-```
-
-### What if I forgot?
-
-You can retroactively sign your previous commit using `--amend`, for example
-
-```shell
-$  git commit -S --amend
-```
-
-If you need to go further back, you can use the interactive rebase
-command with 'edit'. Replace `HEAD~3` with the base commit from which
-you want to start.
-
-```shell
-$  git rebase -i HEAD~3
-```
-
-Replace 'pick' by 'edit' for the commit that you want to sign and the
-rebasing will stop after that commit. Then you can amend the commit as
-above. Afterwards, do
-
-```shell
-$  git rebase --continue
-```
-
-As this will rewrite history, you cannot do this when your commit is
-already merged. In that case, too bad, better luck next time.
-
-If you rewrite history for another reason - for example when squashing
-commits - make sure that you re-sign as the signatures will be lost.
-
-Multiple commits can also be re-signed with `git rebase`. For example, signing
-the last three commits can be done with:
-
-```shell
-$  git rebase --exec 'git commit --amend --no-edit -n -S' -i HEAD~3
-```
-
-### How to check if commits are signed?
-
-Use `git log` with `--show-signature`,
-
-```shell
-$  git log --show-signature
-```
-
-You can also pass the `--show-signature` option to `git show` to check a single
-commit.
-
-## Pointing to Remote Dependent Branches in Go Modules
-
-It's common that a developer may need to make a change in a dependent project
-of `lnd` such as `btcd`, `neutrino`, `btcwallet`, etc. In order to test changes
-without testing infrastructure, or simply make a PR into `lnd` that will build
-without any further work, the `go.mod` and `go.sum` files will need to be
-updated. Luckily, the `go mod` command has a handy tool to do this
-automatically so developers don't need to manually edit the `go.mod` file:
-```shell
-$  go mod edit -replace=IMPORT-PATH-IN-LND@LND-VERSION=DEV-FORK-IMPORT-PATH@DEV-FORK-VERSION
-```
-
-Here's an example replacing the `lightning-onion` version checked into `lnd` with a version in roasbeef's fork:
-```shell
-$  go mod edit -replace=github.com/lightningnetwork/lightning-onion@v0.0.0-20180605012408-ac4d9da8f1d6=github.com/roasbeef/lightning-onion@2e5ae87696046298365ab43bcd1cf3a7a1d69695
-```
-
-## Use of Log Levels
-
-There are six log levels available: `trace`, `debug`, `info`, `warn`, `error` and `critical`.
-
-Only use `error` for internal errors that are never expected to happen during
-normal operation. No event triggered by external sources (rpc, chain backend,
-etc) should lead to an `error` log.
-
-## Use of Golang submodules
-
-Changes to packages that are their own submodules (e.g. they contain a `go.mod`
-and `go.sum` file, for example `tor/go.mod`) require a specific process.
-We want to avoid the use of local replace directives in the root `go.mod`,
-therefore changes to a submodule are a bit involved.
-
-The main process for updating and then using code in a submodule is as follows:
- - Create a PR for the changes to the submodule itself (e.g. edit something in
-   the `tor` package)
- - Wait for the PR to be merged and a new tag (for example `tor/v1.0.x`) to be
-   pushed.
- - Create a second PR that bumps the updated submodule in the root `go.mod` and
-   uses the new functionality in the main module.
-
-Of course the two PRs can be opened at the same time and be built on top of each
-other. But the merge and tag push order should always be maintained.
 
 # Code Approval Process
 
@@ -531,6 +232,23 @@ these signatures intact, we prefer using merge commits. PR proposers can use
 `git rebase --signoff` to sign and rebase at the same time as a final step.
 
 Rejoice as you will now be listed as a [contributor](https://github.com/lightningnetwork/lnd/graphs/contributors)!
+
+## Backporting Changes
+
+After a PR is merged to master, it may need to be backported to release branches
+(e.g., `v0.20.x-branch`) to include the fix or feature in upcoming patch releases.
+
+The project uses an **automated backport workflow** to simplify this process. Simply
+add a label like `backport-v0.20.x-branch` to your merged PR, and a GitHub Action
+will automatically create a backport PR for you.
+
+For complete documentation on the automated backport workflow, including:
+- How to use backport labels
+- Handling merge conflicts
+- Multiple backports
+- Troubleshooting
+
+See [backport-workflow.md](backport-workflow.md)
 
 ## Review Bot
 

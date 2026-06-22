@@ -15,7 +15,9 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 	// multi-hop payment.
 	const chanAmt = funding.MaxBtcFundingAmount
 
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Since we'd like to test some multi-hop failure scenarios, we'll
 	// introduce another node into our test network: Carol.
@@ -49,7 +51,7 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 	)
 
 	// Ensure that Alice has Carol in her routing table before proceeding.
-	ht.AssertTopologyChannelOpen(alice, chanPointBob)
+	ht.AssertChannelInGraph(alice, chanPointBob)
 
 	cType := ht.GetChannelCommitType(alice, chanPointAlice)
 	commitFee := lntest.CalcStaticFee(cType, 0)
@@ -132,13 +134,12 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 		Dest:           carol.PubKey[:],
 		Amt:            payAmt,
 		FinalCltvDelta: int32(carolPayReq.CltvExpiry),
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 		MaxParts:       1,
 	}
 	ht.SendPaymentAssertFail(
 		alice, sendReq,
-		lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS, //nolint:lll
+		lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS, //nolint:ll
 	)
 	ht.AssertLastHTLCError(
 		alice, lnrpc.Failure_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
@@ -201,13 +202,12 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 		// 10k satoshis are expected.
 		Amt:            int64(htlcAmt.ToSatoshis()),
 		FinalCltvDelta: int32(carolPayReq.CltvExpiry),
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 		MaxParts:       1,
 	}
 	ht.SendPaymentAssertFail(
 		alice, sendReq,
-		lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS, //nolint:lll
+		lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS, //nolint:ll
 	)
 	ht.AssertLastHTLCError(
 		alice, lnrpc.Failure_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
@@ -249,7 +249,6 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 
 	req := &routerrpc.SendPaymentRequest{
 		PaymentRequest: carolInvoice2.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 		MaxParts:       1,
 	}
@@ -285,7 +284,6 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 
 	sendReq = &routerrpc.SendPaymentRequest{
 		PaymentRequest: carolInvoice3.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 		MaxParts:       1,
 	}
@@ -334,7 +332,6 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 
 	req = &routerrpc.SendPaymentRequest{
 		PaymentRequest: carolInvoice.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 		MaxParts:       1,
 	}
@@ -363,12 +360,4 @@ func testHtlcErrorPropagation(ht *lntest.HarnessTest) {
 	ht.AssertHtlcEventTypes(
 		bobEvents, routerrpc.HtlcEvent_UNKNOWN, lntest.HtlcEventFinal,
 	)
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.CloseChannel(alice, chanPointAlice)
-
-	// Force close Bob's final channel.
-	ht.ForceCloseChannel(bob, chanPointBob)
 }

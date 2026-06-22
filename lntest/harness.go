@@ -1,23 +1,27 @@
 package lntest
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
 	"fmt"
+	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
@@ -26,6 +30,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +54,19 @@ const (
 	// maxBlocksAllowed specifies the max allowed value to be used when
 	// mining blocks.
 	maxBlocksAllowed = 100
+
+	// finalCltvDelta is the min CLTV delta used by the router.
+	finalCltvDelta = routing.MinCLTVDelta
+
+	// thawHeightDelta defines how far in the future we pick thaw heights.
+	thawHeightDelta = finalCltvDelta * 2
+)
+
+var (
+	// MaxBlocksMinedPerTest is the maximum number of blocks that we allow
+	// a test to mine. This is an exported global variable so it can be
+	// overwritten by other projects that don't have the same constraints.
+	MaxBlocksMinedPerTest = 70
 )
 
 // TestCase defines a test case that's been used in the integration test.
@@ -60,23 +78,11 @@ type TestCase struct {
 	TestFunc func(t *HarnessTest)
 }
 
-// standbyNodes are a list of nodes which are created during the initialization
-// of the test and used across all test cases.
-type standbyNodes struct {
-	// Alice and Bob are the initial seeder nodes that are automatically
-	// created to be the initial participants of the test network.
-	Alice *node.HarnessNode
-	Bob   *node.HarnessNode
-}
-
 // HarnessTest builds on top of a testing.T with enhanced error detection. It
 // is responsible for managing the interactions among different nodes, and
 // providing easy-to-use assertions.
 type HarnessTest struct {
 	*testing.T
-
-	// Embed the standbyNodes so we can easily access them via `ht.Alice`.
-	standbyNodes
 
 	// miner is a reference to a running full node that can be used to
 	// create new blocks on the network.
@@ -96,7 +102,8 @@ type HarnessTest struct {
 	// runCtx is a context with cancel method. It's used to signal when the
 	// node needs to quit, and used as the parent context when spawning
 	// children contexts for RPC requests.
-	runCtx context.Context //nolint:containedctx
+	//nolint:containedctx
+	runCtx context.Context
 	cancel context.CancelFunc
 
 	// stopChainBackend points to the cleanup function returned by the
@@ -145,7 +152,7 @@ func NewHarnessTest(t *testing.T, lndBinary string, feeService WebFeeService,
 	t.Helper()
 
 	// Create the run context.
-	ctxt, cancel := context.WithCancel(context.Background())
+	ctxt, cancel := context.WithCancel(t.Context())
 
 	manager := newNodeManager(lndBinary, dbBackend, nativeSQL)
 
@@ -193,6 +200,9 @@ func (h *HarnessTest) Start(chain node.BackendConfig,
 
 	// Assemble the miner.
 	h.miner = miner
+
+	// Update block height.
+	h.updateCurrentHeight()
 }
 
 // ChainBackendName returns the chain backend name used in the test.
@@ -261,98 +271,6 @@ func (h *HarnessTest) createAndSendOutput(target *node.HarnessNode,
 	h.miner.SendOutput(output, defaultMinerFeeRate)
 }
 
-// SetupRemoteSigningStandbyNodes starts the initial seeder nodes within the
-// test harness in a remote signing configuration. The initial node's wallets
-// will be funded wallets with 100x1 BTC outputs each.
-func (h *HarnessTest) SetupRemoteSigningStandbyNodes() {
-	h.Log("Setting up standby nodes Alice and Bob with remote " +
-		"signing configurations...")
-	defer h.Log("Finished the setup, now running tests...")
-
-	password := []byte("itestpassword")
-
-	// Setup remote signing nodes for Alice and Bob.
-	signerAlice := h.NewNode("SignerAlice", nil)
-	signerBob := h.NewNode("SignerBob", nil)
-
-	// Setup watch-only nodes for Alice and Bob, each configured with their
-	// own remote signing instance.
-	h.Alice = h.setupWatchOnlyNode("Alice", signerAlice, password)
-	h.Bob = h.setupWatchOnlyNode("Bob", signerBob, password)
-
-	// Fund each node with 100 BTC (using 100 separate transactions).
-	const fundAmount = 1 * btcutil.SatoshiPerBitcoin
-	const numOutputs = 100
-	const totalAmount = fundAmount * numOutputs
-	for _, node := range []*node.HarnessNode{h.Alice, h.Bob} {
-		h.manager.standbyNodes[node.Cfg.NodeID] = node
-		for i := 0; i < numOutputs; i++ {
-			h.createAndSendOutput(
-				node, fundAmount,
-				lnrpc.AddressType_WITNESS_PUBKEY_HASH,
-			)
-		}
-	}
-
-	// We generate several blocks in order to give the outputs created
-	// above a good number of confirmations.
-	const totalTxes = 200
-	h.MineBlocksAndAssertNumTxes(numBlocksSendOutput, totalTxes)
-
-	// Now we want to wait for the nodes to catch up.
-	h.WaitForBlockchainSync(h.Alice)
-	h.WaitForBlockchainSync(h.Bob)
-
-	// Now block until both wallets have fully synced up.
-	h.WaitForBalanceConfirmed(h.Alice, totalAmount)
-	h.WaitForBalanceConfirmed(h.Bob, totalAmount)
-}
-
-// SetUp starts the initial seeder nodes within the test harness. The initial
-// node's wallets will be funded wallets with 10x10 BTC outputs each.
-func (h *HarnessTest) SetupStandbyNodes() {
-	h.Log("Setting up standby nodes Alice and Bob...")
-	defer h.Log("Finished the setup, now running tests...")
-
-	lndArgs := []string{
-		"--default-remote-max-htlcs=483",
-		"--dust-threshold=5000000",
-	}
-
-	// Start the initial seeder nodes within the test network.
-	h.Alice = h.NewNode("Alice", lndArgs)
-	h.Bob = h.NewNode("Bob", lndArgs)
-
-	// Load up the wallets of the seeder nodes with 100 outputs of 1 BTC
-	// each.
-	const fundAmount = 1 * btcutil.SatoshiPerBitcoin
-	const numOutputs = 100
-	const totalAmount = fundAmount * numOutputs
-	for _, node := range []*node.HarnessNode{h.Alice, h.Bob} {
-		h.manager.standbyNodes[node.Cfg.NodeID] = node
-		for i := 0; i < numOutputs; i++ {
-			h.createAndSendOutput(
-				node, fundAmount,
-				lnrpc.AddressType_WITNESS_PUBKEY_HASH,
-			)
-		}
-	}
-
-	// We generate several blocks in order to give the outputs created
-	// above a good number of confirmations.
-	const totalTxes = 200
-	h.MineBlocksAndAssertNumTxes(numBlocksSendOutput, totalTxes)
-	h.MineBlocks(numBlocksSendOutput)
-
-	// Now we want to wait for the nodes to catch up.
-	h.WaitForBlockchainSync(h.Alice)
-	h.WaitForBlockchainSync(h.Bob)
-
-	// Now block until both wallets have fully synced up.
-	h.WaitForBalanceConfirmed(h.Alice, totalAmount)
-	h.WaitForBalanceConfirmed(h.Bob, totalAmount)
-}
-
 // Stop stops the test harness.
 func (h *HarnessTest) Stop() {
 	// Do nothing if it's not started.
@@ -360,6 +278,8 @@ func (h *HarnessTest) Stop() {
 		h.Log("HarnessTest is not started")
 		return
 	}
+
+	h.shutdownAllNodes()
 
 	close(h.lndErrorChan)
 
@@ -378,32 +298,26 @@ func (h *HarnessTest) Stop() {
 // represented as fatal.
 func (h *HarnessTest) RunTestCase(testCase *TestCase) {
 	defer func() {
-		if err := recover(); err != nil {
-			description := errors.Wrap(err, 2).ErrorStack()
-			h.Fatalf("Failed: (%v) panic with: \n%v",
-				testCase.Name, description)
+		if r := recover(); r != nil {
+			// Wrap the recovered panic in an error.
+			var err error
+			switch v := r.(type) {
+			case error:
+				err = v
+			default:
+				err = fmt.Errorf("%v", v)
+			}
+
+			// Capture and print the stack trace.
+			stack := debug.Stack()
+
+			// Fail the test with panic info and stack.
+			h.Fatalf("Failed: (%v) panic with: %v\n%s",
+				testCase.Name, err, stack)
 		}
 	}()
 
 	testCase.TestFunc(h)
-}
-
-// resetStandbyNodes resets all standby nodes by attaching the new testing.T
-// and restarting them with the original config.
-func (h *HarnessTest) resetStandbyNodes(t *testing.T) {
-	t.Helper()
-
-	for _, hn := range h.manager.standbyNodes {
-		// Inherit the testing.T.
-		h.T = t
-
-		// Reset the config so the node will be using the default
-		// config for the coming test. This will also inherit the
-		// test's running context.
-		h.RestartNodeWithExtraArgs(hn, hn.Cfg.OriginalExtraArgs)
-
-		hn.AddToLogf("Finished test case %v", h.manager.currentTestCase)
-	}
 }
 
 // Subtest creates a child HarnessTest, which inherits the harness net and
@@ -417,7 +331,6 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 		T:            t,
 		manager:      h.manager,
 		miner:        h.miner,
-		standbyNodes: h.standbyNodes,
 		feeService:   h.feeService,
 		lndErrorChan: make(chan error, lndErrorChanSize),
 	}
@@ -428,9 +341,6 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 	// Inherit the subtest for the miner.
 	st.miner.T = st.T
 
-	// Reset the standby nodes.
-	st.resetStandbyNodes(t)
-
 	// Reset fee estimator.
 	st.feeService.Reset()
 
@@ -439,16 +349,13 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 	startHeight := int32(h.CurrentHeight())
 
 	st.Cleanup(func() {
-		_, endHeight := h.GetBestBlock()
-
-		st.Logf("finished test: %s, start height=%d, end height=%d, "+
-			"mined blocks=%d", st.manager.currentTestCase,
-			startHeight, endHeight, endHeight-startHeight)
+		// Make sure the test is not consuming too many blocks.
+		st.checkAndLimitBlocksMined(startHeight)
 
 		// Don't bother run the cleanups if the test is failed.
 		if st.Failed() {
 			st.Log("test failed, skipped cleanup")
-			st.shutdownAllNodes()
+			st.shutdownNodesNoAssert()
 			return
 		}
 
@@ -460,14 +367,8 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 			return
 		}
 
-		// When we finish the test, reset the nodes' configs and take a
-		// snapshot of each of the nodes' internal states.
-		for _, node := range st.manager.standbyNodes {
-			st.cleanupStandbyNode(node)
-		}
-
 		// If found running nodes, shut them down.
-		st.shutdownNonStandbyNodes()
+		st.shutdownAllNodes()
 
 		// We require the mempool to be cleaned from the test.
 		require.Empty(st, st.miner.GetRawMempool(), "mempool not "+
@@ -487,33 +388,61 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 	return st
 }
 
-// shutdownNonStandbyNodes will shutdown any non-standby nodes.
-func (h *HarnessTest) shutdownNonStandbyNodes() {
-	h.shutdownNodes(true)
+// checkAndLimitBlocksMined asserts that the blocks mined in a single test
+// doesn't exceed 50, which implicitly discourage table-drive tests, which are
+// hard to maintain and take a long time to run.
+func (h *HarnessTest) checkAndLimitBlocksMined(startHeight int32) {
+	_, endHeight := h.GetBestBlock()
+	blocksMined := endHeight - startHeight
+
+	h.Logf("finished test: %s, start height=%d, end height=%d, mined "+
+		"blocks=%d", h.manager.currentTestCase, startHeight, endHeight,
+		blocksMined)
+
+	// If the number of blocks is less than 40, we consider the test
+	// healthy.
+	if blocksMined < 40 {
+		return
+	}
+
+	// Otherwise log a warning if it's mining more than 40 blocks.
+	desc := "!============================================!\n"
+
+	desc += fmt.Sprintf("Too many blocks (%v) mined in one test! Tips:\n",
+		blocksMined)
+
+	desc += "1. break test into smaller individual tests, especially if " +
+		"this is a table-drive test.\n" +
+		"2. use smaller CSV via `--bitcoin.defaultremotedelay=1.`\n" +
+		"3. use smaller CLTV via `--bitcoin.timelockdelta=24.`\n" +
+		"4. remove unnecessary CloseChannel when test ends.\n" +
+		"5. use `CreateSimpleNetwork` for efficient channel creation.\n"
+	h.Log(desc)
+
+	// We enforce that the test should not mine more than
+	// MaxBlocksMinedPerTest (70 by default) blocks, which is more than
+	// enough to test a multi hop force close scenario.
+	require.LessOrEqualf(
+		h, int(blocksMined), MaxBlocksMinedPerTest,
+		"cannot mine more than %d blocks in one test",
+		MaxBlocksMinedPerTest,
+	)
+}
+
+// shutdownNodesNoAssert will shutdown all running nodes without assertions.
+// This is used when the test has already failed, we don't want to log more
+// errors but focusing on the original error.
+func (h *HarnessTest) shutdownNodesNoAssert() {
+	for _, node := range h.manager.activeNodes {
+		_ = h.manager.shutdownNode(node)
+	}
 }
 
 // shutdownAllNodes will shutdown all running nodes.
 func (h *HarnessTest) shutdownAllNodes() {
-	h.shutdownNodes(false)
-}
-
-// shutdownNodes will shutdown any non-standby nodes. If skipStandby is false,
-// all the standby nodes will be shutdown too.
-func (h *HarnessTest) shutdownNodes(skipStandby bool) {
-	for nid, node := range h.manager.activeNodes {
-		// If it's a standby node, skip.
-		_, ok := h.manager.standbyNodes[nid]
-		if ok && skipStandby {
-			continue
-		}
-
-		// The process may not be in a state to always shutdown
-		// immediately, so we'll retry up to a hard limit to ensure we
-		// eventually shutdown.
-		err := wait.NoError(func() error {
-			return h.manager.shutdownNode(node)
-		}, DefaultTimeout)
-
+	var lastErr error
+	for _, node := range h.manager.activeNodes {
+		err := h.manager.shutdownNode(node)
 		if err == nil {
 			continue
 		}
@@ -522,7 +451,11 @@ func (h *HarnessTest) shutdownNodes(skipStandby bool) {
 		// is needed so other nodes can continue their shutdown
 		// processes.
 		h.Logf("unable to shutdown %s, got err: %v", node.Name(), err)
+
+		lastErr = err
 	}
+
+	require.NoError(h, lastErr, "failed to shutdown all nodes")
 }
 
 // cleanupStandbyNode is a function should be called with defer whenever a
@@ -555,26 +488,14 @@ func (h *HarnessTest) cleanupStandbyNode(hn *node.HarnessNode) {
 func (h *HarnessTest) removeConnectionns(hn *node.HarnessNode) {
 	resp := hn.RPC.ListPeers()
 	for _, peer := range resp.Peers {
-		// Skip disconnecting Alice and Bob.
-		switch peer.PubKey {
-		case h.Alice.PubKeyStr:
-			continue
-		case h.Bob.PubKeyStr:
-			continue
-		}
-
 		hn.RPC.DisconnectPeer(peer.PubKey)
 	}
 }
 
 // SetTestName set the test case name.
 func (h *HarnessTest) SetTestName(name string) {
-	h.manager.currentTestCase = name
-
-	// Overwrite the old log filename so we can create new log files.
-	for _, node := range h.manager.standbyNodes {
-		node.Cfg.LogFilenamePrefix = name
-	}
+	cleanTestCaseName := strings.ReplaceAll(name, " ", "_")
+	h.manager.currentTestCase = cleanTestCaseName
 }
 
 // NewNode creates a new node and asserts its creation. The node is guaranteed
@@ -589,17 +510,50 @@ func (h *HarnessTest) NewNode(name string,
 	err = node.Start(h.runCtx)
 	require.NoError(h, err, "failed to start node %s", node.Name())
 
+	// Get the miner's best block hash.
+	bestBlock, _ := h.miner.GetBestBlock()
+
+	// Wait until the node's chain backend is synced to the miner's best
+	// block.
+	h.WaitForBlockchainSyncTo(node, *bestBlock)
+
+	return node
+}
+
+// NewNodeWithCoins creates a new node and asserts its creation. The node is
+// guaranteed to have finished its initialization and all its subservers are
+// started. In addition, 5 UTXO of 1 BTC each are sent to the node.
+func (h *HarnessTest) NewNodeWithCoins(name string,
+	extraArgs []string) *node.HarnessNode {
+
+	node := h.NewNode(name, extraArgs)
+
+	// Load up the wallets of the node with 5 outputs of 1 BTC each.
+	const (
+		numOutputs  = 5
+		fundAmount  = 1 * btcutil.SatoshiPerBitcoin
+		totalAmount = fundAmount * numOutputs
+	)
+
+	for i := 0; i < numOutputs; i++ {
+		h.createAndSendOutput(
+			node, fundAmount,
+			lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+		)
+	}
+
+	// Mine a block to confirm the transactions.
+	h.MineBlocksAndAssertNumTxes(1, numOutputs)
+
+	// Now block until the wallet have fully synced up.
+	h.WaitForBalanceConfirmed(node, totalAmount)
+
 	return node
 }
 
 // Shutdown shuts down the given node and asserts that no errors occur.
 func (h *HarnessTest) Shutdown(node *node.HarnessNode) {
-	// The process may not be in a state to always shutdown immediately, so
-	// we'll retry up to a hard limit to ensure we eventually shutdown.
-	err := wait.NoError(func() error {
-		return h.manager.shutdownNode(node)
-	}, DefaultTimeout)
-
+	err := h.manager.shutdownNode(node)
 	require.NoErrorf(h, err, "unable to shutdown %v in %v", node.Name(),
 		h.manager.currentTestCase)
 }
@@ -840,10 +794,12 @@ func (h *HarnessTest) NewNodeRemoteSigner(name string, extraArgs []string,
 	return hn
 }
 
-// KillNode kills the node (but won't wait for the node process to stop).
+// KillNode kills the node and waits for the node process to stop.
 func (h *HarnessTest) KillNode(hn *node.HarnessNode) {
-	require.NoErrorf(h, hn.Kill(), "%s: kill got error", hn.Name())
 	delete(h.manager.activeNodes, hn.Cfg.NodeID)
+
+	h.Logf("Manually killing the node %s", hn.Name())
+	require.NoErrorf(h, hn.KillAndWait(), "%s: kill got error", hn.Name())
 }
 
 // SetFeeEstimate sets a fee rate to be returned from fee estimator.
@@ -906,6 +862,18 @@ func (h *HarnessTest) validateNodeState(hn *node.HarnessNode) error {
 	if hn.State.Payment.Total != 0 {
 		return fmt.Errorf("%s: found uncleaned payments, please "+
 			"delete all of them properly", hn.Name())
+	}
+
+	// The number of public edges should be zero.
+	if hn.State.Edge.Public != 0 {
+		return fmt.Errorf("%s: found active public egdes, please "+
+			"clean them properly", hn.Name())
+	}
+
+	// The number of edges should be zero.
+	if hn.State.Edge.Total != 0 {
+		return fmt.Errorf("%s: found active edges, please "+
+			"clean them properly", hn.Name())
 	}
 
 	return nil
@@ -1206,8 +1174,8 @@ func (h *HarnessTest) openChannel(alice, bob *node.HarnessNode,
 
 	// Check that both alice and bob have seen the channel from their
 	// network topology.
-	h.AssertTopologyChannelOpen(alice, fundingChanPoint)
-	h.AssertTopologyChannelOpen(bob, fundingChanPoint)
+	h.AssertChannelInGraph(alice, fundingChanPoint)
+	h.AssertChannelInGraph(bob, fundingChanPoint)
 
 	// Check that the channel can be seen in their ListChannels.
 	h.AssertChannelExists(alice, fundingChanPoint)
@@ -1228,8 +1196,8 @@ func (h *HarnessTest) openChannelZeroConf(alice, bob *node.HarnessNode,
 
 	// Check that both alice and bob have seen the channel from their
 	// network topology.
-	h.AssertTopologyChannelOpen(alice, fundingChanPoint)
-	h.AssertTopologyChannelOpen(bob, fundingChanPoint)
+	h.AssertChannelInGraph(alice, fundingChanPoint)
+	h.AssertChannelInGraph(bob, fundingChanPoint)
 
 	// Finally, check that the channel can be seen in their ListChannels.
 	h.AssertChannelExists(alice, fundingChanPoint)
@@ -1257,14 +1225,79 @@ func (h *HarnessTest) OpenChannelAssertErr(srcNode, destNode *node.HarnessNode,
 		"error returned, want %v, got %v", expectedErr, err)
 }
 
+// closeChannelOpts holds the options for closing a channel.
+type closeChannelOpts struct {
+	feeRate fn.Option[chainfee.SatPerVByte]
+
+	// localTxOnly is a boolean indicating if we should only attempt to
+	// consume close pending notifications for the local transaction.
+	localTxOnly bool
+
+	// skipMempoolCheck is a boolean indicating if we should skip the normal
+	// mempool check after a coop close.
+	skipMempoolCheck bool
+
+	// errString is an expected error. If this is non-blank, then we'll
+	// assert that the coop close wasn't possible, and returns an error that
+	// contains this err string.
+	errString string
+}
+
+// CloseChanOpt is a functional option to modify the way we close a channel.
+type CloseChanOpt func(*closeChannelOpts)
+
+// WithCoopCloseFeeRate is a functional option to set the fee rate for a coop
+// close attempt.
+func WithCoopCloseFeeRate(rate chainfee.SatPerVByte) CloseChanOpt {
+	return func(o *closeChannelOpts) {
+		o.feeRate = fn.Some(rate)
+	}
+}
+
+// WithLocalTxNotify is a functional option to indicate that we should only
+// notify for the local txn. This is useful for the RBF coop close type, as
+// it'll notify for both local and remote txns.
+func WithLocalTxNotify() CloseChanOpt {
+	return func(o *closeChannelOpts) {
+		o.localTxOnly = true
+	}
+}
+
+// WithSkipMempoolCheck is a functional option to indicate that we should skip
+// the mempool check. This can be used when a coop close iteration may not
+// result in a newly broadcast transaction.
+func WithSkipMempoolCheck() CloseChanOpt {
+	return func(o *closeChannelOpts) {
+		o.skipMempoolCheck = true
+	}
+}
+
+// WithExpectedErrString is a functional option that can be used to assert that
+// an error occurs during the coop close process.
+func WithExpectedErrString(errString string) CloseChanOpt {
+	return func(o *closeChannelOpts) {
+		o.errString = errString
+	}
+}
+
+// defaultCloseOpts returns the set of default close options.
+func defaultCloseOpts() *closeChannelOpts {
+	return &closeChannelOpts{}
+}
+
 // CloseChannelAssertPending attempts to close the channel indicated by the
 // passed channel point, initiated by the passed node. Once the CloseChannel
 // rpc is called, it will consume one event and assert it's a close pending
 // event. In addition, it will check that the closing tx can be found in the
 // mempool.
 func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
-	cp *lnrpc.ChannelPoint,
-	force bool) (rpc.CloseChanClient, chainhash.Hash) {
+	cp *lnrpc.ChannelPoint, force bool,
+	opts ...CloseChanOpt) (rpc.CloseChanClient, *lnrpc.CloseStatusUpdate) {
+
+	closeOpts := defaultCloseOpts()
+	for _, optFunc := range opts {
+		optFunc(closeOpts)
+	}
 
 	// Calls the rpc to close the channel.
 	closeReq := &lnrpc.CloseChannelRequest{
@@ -1273,10 +1306,9 @@ func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
 		NoWait:       true,
 	}
 
-	// For coop close, we use a default confg target of 6.
-	if !force {
-		closeReq.TargetConf = 6
-	}
+	closeOpts.feeRate.WhenSome(func(feeRate chainfee.SatPerVByte) {
+		closeReq.SatPerVbyte = uint64(feeRate)
+	})
 
 	var (
 		stream rpc.CloseChanClient
@@ -1291,25 +1323,53 @@ func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
 	_, err = h.ReceiveCloseChannelUpdate(stream)
 	require.NoError(h, err, "close channel update got error: %v", err)
 
-	event, err = h.ReceiveCloseChannelUpdate(stream)
-	if err != nil {
-		h.Logf("Test: %s, close channel got error: %v",
-			h.manager.currentTestCase, err)
+	var closeTxid *chainhash.Hash
+	for {
+		event, err = h.ReceiveCloseChannelUpdate(stream)
+		if err != nil {
+			h.Logf("Test: %s, close channel got error: %v",
+				h.manager.currentTestCase, err)
+		}
+		if err != nil && closeOpts.errString == "" {
+			require.NoError(h, err, "retry closing channel failed")
+		} else if err != nil && closeOpts.errString != "" {
+			require.ErrorContains(h, err, closeOpts.errString)
+			return nil, nil
+		}
+
+		//nolint:ll
+		pendingClose, ok := event.Update.(*lnrpc.CloseStatusUpdate_ClosePending)
+		require.Truef(h, ok, "expected channel close "+
+			"update, instead got %v", pendingClose)
+
+		if !pendingClose.ClosePending.LocalCloseTx &&
+			closeOpts.localTxOnly {
+
+			continue
+		}
+
+		notifyRate := pendingClose.ClosePending.FeePerVbyte
+		if closeOpts.localTxOnly &&
+			notifyRate != int64(closeReq.SatPerVbyte) {
+
+			continue
+		}
+
+		closeTxid, err = chainhash.NewHash(
+			pendingClose.ClosePending.Txid,
+		)
+		require.NoErrorf(h, err, "unable to decode closeTxid: %v",
+			pendingClose.ClosePending.Txid)
+
+		break
 	}
-	require.NoError(h, err, "retry closing channel failed")
 
-	pendingClose, ok := event.Update.(*lnrpc.CloseStatusUpdate_ClosePending)
-	require.Truef(h, ok, "expected channel close update, instead got %v",
-		pendingClose)
+	if !closeOpts.skipMempoolCheck {
+		// Assert the closing tx is in the mempool.
+		h.miner.AssertTxInMempool(*closeTxid)
+	}
 
-	closeTxid, err := chainhash.NewHash(pendingClose.ClosePending.Txid)
-	require.NoErrorf(h, err, "unable to decode closeTxid: %v",
-		pendingClose.ClosePending.Txid)
-
-	// Assert the closing tx is in the mempool.
-	h.miner.AssertTxInMempool(*closeTxid)
-
-	return stream, *closeTxid
+	return stream, event
 }
 
 // CloseChannel attempts to coop close a non-anchored channel identified by the
@@ -1356,14 +1416,10 @@ func (h *HarnessTest) ForceCloseChannel(hn *node.HarnessNode,
 // CloseChannelAssertErr closes the given channel and asserts an error
 // returned.
 func (h *HarnessTest) CloseChannelAssertErr(hn *node.HarnessNode,
-	cp *lnrpc.ChannelPoint, force bool) error {
+	req *lnrpc.CloseChannelRequest) error {
 
 	// Calls the rpc to close the channel.
-	closeReq := &lnrpc.CloseChannelRequest{
-		ChannelPoint: cp,
-		Force:        force,
-	}
-	stream := hn.RPC.CloseChannel(closeReq)
+	stream := hn.RPC.CloseChannel(req)
 
 	// Consume the "channel close" update in order to wait for the closing
 	// transaction to be broadcast, then wait for the closing tx to be seen
@@ -1382,12 +1438,30 @@ func (h *HarnessTest) IsNeutrinoBackend() bool {
 	return h.manager.chainBackend.Name() == NeutrinoBackendName
 }
 
+// IsPostgresBackend returns true if the test harness is configured to use a
+// Postgres database backend.
+func (h *HarnessTest) IsPostgresBackend() bool {
+	return h.manager.dbBackend == node.BackendPostgres
+}
+
+// UsesClosedChanTombstones reports whether the test harness's database
+// backend closes channels via tombstone markers rather than cascading the
+// nested-bucket delete. This is true on the KV-over-SQL backends (sqlite,
+// postgres) and false on bbolt. Tests that observe forwarding-package or
+// revocation-log deletion immediately after a channel close should consult
+// this predicate; on tombstone backends the bulk state remains on disk
+// until the upcoming native-SQL channel-state migration reclaims it.
+func (h *HarnessTest) UsesClosedChanTombstones() bool {
+	return h.manager.dbBackend == node.BackendSqlite ||
+		h.manager.dbBackend == node.BackendPostgres
+}
+
 // fundCoins attempts to send amt satoshis from the internal mining node to the
 // targeted lightning node. The confirmed boolean indicates whether the
 // transaction that pays to the target should confirm. For neutrino backend,
 // the `confirmed` param is ignored.
 func (h *HarnessTest) fundCoins(amt btcutil.Amount, target *node.HarnessNode,
-	addrType lnrpc.AddressType, confirmed bool) {
+	addrType lnrpc.AddressType, confirmed bool) *wire.MsgTx {
 
 	initialBalance := target.RPC.WalletBalance()
 
@@ -1405,25 +1479,14 @@ func (h *HarnessTest) fundCoins(amt btcutil.Amount, target *node.HarnessNode,
 		PkScript: addrScript,
 		Value:    int64(amt),
 	}
-	h.miner.SendOutput(output, defaultMinerFeeRate)
+	txid := h.miner.SendOutput(output, defaultMinerFeeRate)
 
-	// Encode the pkScript in hex as this the format that it will be
-	// returned via rpc.
-	expPkScriptStr := hex.EncodeToString(addrScript)
+	// Get the funding tx.
+	tx := h.GetRawTransaction(*txid)
+	msgTx := tx.MsgTx()
 
-	// Now, wait for ListUnspent to show the unconfirmed transaction
-	// containing the correct pkscript.
-	//
 	// Since neutrino doesn't support unconfirmed outputs, skip this check.
 	if !h.IsNeutrinoBackend() {
-		utxos := h.AssertNumUTXOsUnconfirmed(target, 1)
-
-		// Assert that the lone unconfirmed utxo contains the same
-		// pkscript as the output generated above.
-		pkScriptStr := utxos[0].PkScript
-		require.Equal(h, pkScriptStr, expPkScriptStr,
-			"pkscript mismatch")
-
 		expectedBalance := btcutil.Amount(
 			initialBalance.UnconfirmedBalance,
 		) + amt
@@ -1434,48 +1497,90 @@ func (h *HarnessTest) fundCoins(amt btcutil.Amount, target *node.HarnessNode,
 	// the target node's unconfirmed balance reflects the expected balance
 	// and exit.
 	if !confirmed {
-		return
+		return msgTx
 	}
 
 	// Otherwise, we'll generate 1 new blocks to ensure the output gains a
 	// sufficient number of confirmations and wait for the balance to
 	// reflect what's expected.
-	h.MineBlocksAndAssertNumTxes(1, 1)
+	h.MineBlockWithTx(msgTx)
 
 	expectedBalance := btcutil.Amount(initialBalance.ConfirmedBalance) + amt
 	h.WaitForBalanceConfirmed(target, expectedBalance)
+
+	return msgTx
 }
 
 // FundCoins attempts to send amt satoshis from the internal mining node to the
-// targeted lightning node using a P2WKH address. 2 blocks are mined after in
+// targeted lightning node using a P2WKH address. 1 blocks are mined after in
 // order to confirm the transaction.
-func (h *HarnessTest) FundCoins(amt btcutil.Amount, hn *node.HarnessNode) {
-	h.fundCoins(amt, hn, lnrpc.AddressType_WITNESS_PUBKEY_HASH, true)
+func (h *HarnessTest) FundCoins(amt btcutil.Amount,
+	hn *node.HarnessNode) *wire.MsgTx {
+
+	return h.fundCoins(amt, hn, lnrpc.AddressType_WITNESS_PUBKEY_HASH, true)
 }
 
 // FundCoinsUnconfirmed attempts to send amt satoshis from the internal mining
 // node to the targeted lightning node using a P2WKH address. No blocks are
 // mined after and the UTXOs are unconfirmed.
 func (h *HarnessTest) FundCoinsUnconfirmed(amt btcutil.Amount,
-	hn *node.HarnessNode) {
+	hn *node.HarnessNode) *wire.MsgTx {
 
-	h.fundCoins(amt, hn, lnrpc.AddressType_WITNESS_PUBKEY_HASH, false)
+	return h.fundCoins(
+		amt, hn, lnrpc.AddressType_WITNESS_PUBKEY_HASH, false,
+	)
 }
 
 // FundCoinsNP2WKH attempts to send amt satoshis from the internal mining node
 // to the targeted lightning node using a NP2WKH address.
 func (h *HarnessTest) FundCoinsNP2WKH(amt btcutil.Amount,
-	target *node.HarnessNode) {
+	target *node.HarnessNode) *wire.MsgTx {
 
-	h.fundCoins(amt, target, lnrpc.AddressType_NESTED_PUBKEY_HASH, true)
+	return h.fundCoins(
+		amt, target, lnrpc.AddressType_NESTED_PUBKEY_HASH, true,
+	)
 }
 
 // FundCoinsP2TR attempts to send amt satoshis from the internal mining node to
 // the targeted lightning node using a P2TR address.
 func (h *HarnessTest) FundCoinsP2TR(amt btcutil.Amount,
-	target *node.HarnessNode) {
+	target *node.HarnessNode) *wire.MsgTx {
 
-	h.fundCoins(amt, target, lnrpc.AddressType_TAPROOT_PUBKEY, true)
+	return h.fundCoins(amt, target, lnrpc.AddressType_TAPROOT_PUBKEY, true)
+}
+
+// FundNumCoins attempts to send the given number of UTXOs from the internal
+// mining node to the targeted lightning node using a P2WKH address. Each UTXO
+// has an amount of 1 BTC. 1 blocks are mined to confirm the tx.
+func (h *HarnessTest) FundNumCoins(hn *node.HarnessNode, num int) {
+	// Get the initial balance first.
+	resp := hn.RPC.WalletBalance()
+	initialBalance := btcutil.Amount(resp.ConfirmedBalance)
+
+	const fundAmount = 1 * btcutil.SatoshiPerBitcoin
+
+	// Send out the outputs from the miner.
+	for i := 0; i < num; i++ {
+		h.createAndSendOutput(
+			hn, fundAmount, lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+		)
+	}
+
+	// Wait for ListUnspent to show the correct number of unconfirmed
+	// UTXOs.
+	//
+	// Since neutrino doesn't support unconfirmed outputs, skip this check.
+	if !h.IsNeutrinoBackend() {
+		h.AssertNumUTXOsUnconfirmed(hn, num)
+	}
+
+	// Mine a block to confirm the transactions.
+	h.MineBlocksAndAssertNumTxes(1, num)
+
+	// Now block until the wallet have fully synced up.
+	totalAmount := btcutil.Amount(fundAmount * num)
+	expectedBalance := initialBalance + totalAmount
+	h.WaitForBalanceConfirmed(hn, expectedBalance)
 }
 
 // completePaymentRequestsAssertStatus sends payments from a node to complete
@@ -1520,7 +1625,8 @@ func (h *HarnessTest) completePaymentRequestsAssertStatus(hn *node.HarnessNode,
 		h.AssertPaymentStatusFromStream(stream, status)
 
 	case <-timer:
-		require.Fail(h, "timeout", "waiting payment results timeout")
+		require.Failf(h, "timeout", "%s: waiting payment results "+
+			"timeout", hn.Name())
 	}
 }
 
@@ -1536,8 +1642,9 @@ func (h *HarnessTest) CompletePaymentRequests(hn *node.HarnessNode,
 }
 
 // CompletePaymentRequestsNoWait sends payments from a node to complete all
-// payment requests without waiting for the results. Instead, it checks the
-// number of updates in the specified channel has increased.
+// payment requests without waiting for the results. Instead, it waits for
+// all HTLCs to be locked in on the sender's channel by checking the number
+// of pending HTLCs.
 func (h *HarnessTest) CompletePaymentRequestsNoWait(hn *node.HarnessNode,
 	paymentRequests []string, chanPoint *lnrpc.ChannelPoint) {
 
@@ -1546,31 +1653,50 @@ func (h *HarnessTest) CompletePaymentRequestsNoWait(hn *node.HarnessNode,
 	// we return.
 	oldResp := h.GetChannelByChanPoint(hn, chanPoint)
 
+	// countOutgoing counts the number of outgoing HTLCs in the given list.
+	countOutgoing := func(htlcs []*lnrpc.HTLC) int {
+		count := 0
+		for _, htlc := range htlcs {
+			if !htlc.Incoming {
+				count++
+			}
+		}
+
+		return count
+	}
+
+	// Count existing outgoing HTLCs before sending.
+	oldOutgoingCount := countOutgoing(oldResp.PendingHtlcs)
+
+	numPayments := len(paymentRequests)
+
 	// Send payments and assert they are in-flight.
 	h.completePaymentRequestsAssertStatus(
 		hn, paymentRequests, lnrpc.Payment_IN_FLIGHT,
 	)
 
-	// We are not waiting for feedback in the form of a response, but we
-	// should still wait long enough for the server to receive and handle
-	// the send before cancelling the request. We wait for the number of
-	// updates to one of our channels has increased before we return.
+	// Wait for all HTLCs to be locked in. We check that the number of
+	// outgoing pending HTLCs has increased by exactly the number of
+	// payments sent. This ensures all HTLCs are committed on the sender's
+	// side.
 	err := wait.NoError(func() error {
 		newResp := h.GetChannelByChanPoint(hn, chanPoint)
 
-		// If this channel has an increased number of updates, we
-		// assume the payments are committed, and we can return.
-		if newResp.NumUpdates > oldResp.NumUpdates {
+		// Count current outgoing HTLCs.
+		newOutgoingCount := countOutgoing(newResp.PendingHtlcs)
+
+		htlcsAdded := newOutgoingCount - oldOutgoingCount
+
+		// Verify all HTLCs are locked in.
+		if htlcsAdded == numPayments {
 			return nil
 		}
 
-		// Otherwise return an error as the NumUpdates are not
-		// increased.
-		return fmt.Errorf("%s: channel:%v not updated after sending "+
-			"payments, old updates: %v, new updates: %v", hn.Name(),
-			chanPoint, oldResp.NumUpdates, newResp.NumUpdates)
+		return fmt.Errorf("%s: channel:%v waiting for HTLCs, "+
+			"added: %d/%d", hn.Name(), chanPoint,
+			htlcsAdded, numPayments)
 	}, DefaultTimeout)
-	require.NoError(h, err, "timeout while checking for channel updates")
+	require.NoError(h, err, "timeout while waiting for HTLCs to lock in")
 }
 
 // OpenChannelPsbt attempts to open a channel between srcNode and destNode with
@@ -1616,7 +1742,9 @@ func (h *HarnessTest) OpenChannelPsbt(srcNode, destNode *node.HarnessNode,
 	require.NoError(h, err)
 
 	switch p.CommitmentType {
-	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT,
+		lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
+
 		require.IsType(h, &btcutil.AddressTaproot{}, fundingAddr)
 
 	default:
@@ -1635,6 +1763,22 @@ func (h *HarnessTest) OpenChannelPsbt(srcNode, destNode *node.HarnessNode,
 func (h *HarnessTest) CleanupForceClose(hn *node.HarnessNode) {
 	// Wait for the channel to be marked pending force close.
 	h.AssertNumPendingForceClose(hn, 1)
+
+	// Mine enough blocks for the node to sweep its funds from the force
+	// closed channel. The commit sweep resolver is offers the input to the
+	// sweeper when it's force closed, and broadcast the sweep tx at
+	// defaulCSV-1.
+	//
+	// NOTE: we might empty blocks here as we don't know the exact number
+	// of blocks to mine. This may end up mining more blocks than needed.
+	h.MineEmptyBlocks(node.DefaultCSV - 1)
+
+	// Assert there is one pending sweep.
+	h.AssertNumPendingSweeps(hn, 1)
+
+	// The node should now sweep the funds, clean up by mining the sweeping
+	// tx.
+	h.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Mine blocks to get any second level HTLC resolved. If there are no
 	// HTLCs, this will behave like h.AssertNumPendingCloseChannels.
@@ -1707,9 +1851,9 @@ func (h *HarnessTest) RestartNodeAndRestoreDB(hn *node.HarnessNode) {
 // closures as the caller doesn't need to mine all the blocks to make sure the
 // mempool is empty.
 func (h *HarnessTest) CleanShutDown() {
-	// First, shutdown all non-standby nodes to prevent new transactions
-	// being created and fed into the mempool.
-	h.shutdownNonStandbyNodes()
+	// First, shutdown all nodes to prevent new transactions being created
+	// and fed into the mempool.
+	h.shutdownAllNodes()
 
 	// Now mine blocks till the mempool is empty.
 	h.cleanMempool()
@@ -1813,8 +1957,8 @@ func (h *HarnessTest) OpenMultiChannelsAsync(
 		if !req.Param.Private {
 			// Check that both alice and bob have seen the channel
 			// from their channel watch request.
-			h.AssertTopologyChannelOpen(req.Local, cp)
-			h.AssertTopologyChannelOpen(req.Remote, cp)
+			h.AssertChannelInGraph(req.Local, cp)
+			h.AssertChannelInGraph(req.Remote, cp)
 		}
 
 		// Finally, check that the channel can be seen in their
@@ -1962,9 +2106,14 @@ func (h *HarnessTest) CalculateTxesFeeRate(txns []*wire.MsgTx) int64 {
 func (h *HarnessTest) AssertSweepFound(hn *node.HarnessNode,
 	sweep string, verbose bool, startHeight int32) {
 
+	req := &walletrpc.ListSweepsRequest{
+		Verbose:     verbose,
+		StartHeight: startHeight,
+	}
+
 	err := wait.NoError(func() error {
 		// List all sweeps that alice's node had broadcast.
-		sweepResp := hn.RPC.ListSweeps(verbose, startHeight)
+		sweepResp := hn.RPC.ListSweeps(req)
 
 		var found bool
 		if verbose {
@@ -1977,7 +2126,8 @@ func (h *HarnessTest) AssertSweepFound(hn *node.HarnessNode,
 			return nil
 		}
 
-		return fmt.Errorf("sweep tx %v not found", sweep)
+		return fmt.Errorf("sweep tx %v not found in resp %v", sweep,
+			sweepResp)
 	}, wait.DefaultTimeout)
 	require.NoError(h, err, "%s: timeout checking sweep tx", hn.Name())
 }
@@ -2137,7 +2287,7 @@ func (h *HarnessTest) ReceiveChannelEvent(
 
 	select {
 	case <-time.After(DefaultTimeout):
-		require.Fail(h, "timeout", "timeout intercepting htlc")
+		require.Fail(h, "timeout", "timeout receiving channel events")
 
 	case err := <-errChan:
 		require.Failf(h, "err from stream",
@@ -2160,9 +2310,13 @@ func (h *HarnessTest) GetOutputIndex(txid chainhash.Hash, addr string) int {
 	p2trOutputIndex := -1
 	for i, txOut := range tx.MsgTx().TxOut {
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-			txOut.PkScript, h.miner.ActiveNet,
+			txOut.PkScript, miner.HarnessNetParams,
 		)
 		require.NoError(h, err)
+
+		if len(addrs) == 0 {
+			continue
+		}
 
 		if addrs[0].String() == addr {
 			p2trOutputIndex = i
@@ -2195,4 +2349,380 @@ func (h *HarnessTest) SendCoins(a, b *node.HarnessNode,
 	tx := h.GetNumTxsFromMempool(1)[0]
 
 	return tx
+}
+
+// SendCoins sends all coins from node A to node B, returns the sending tx.
+func (h *HarnessTest) SendAllCoins(a, b *node.HarnessNode) *wire.MsgTx {
+	// Create an address for Bob receive the coins.
+	req := &lnrpc.NewAddressRequest{
+		Type: lnrpc.AddressType_TAPROOT_PUBKEY,
+	}
+	resp := b.RPC.NewAddress(req)
+
+	// Send the coins from Alice to Bob. We should expect a tx to be
+	// broadcast and seen in the mempool.
+	sendReq := &lnrpc.SendCoinsRequest{
+		Addr:             resp.Address,
+		TargetConf:       6,
+		SendAll:          true,
+		SpendUnconfirmed: true,
+	}
+	a.RPC.SendCoins(sendReq)
+	tx := h.GetNumTxsFromMempool(1)[0]
+
+	return tx
+}
+
+// CreateSimpleNetwork creates the number of nodes specified by the number of
+// configs and makes a topology of `node1 -> node2 -> node3...`. Each node is
+// created using the specified config, the neighbors are connected, and the
+// channels are opened. Each node will be funded with a single UTXO of 1 BTC
+// except the last one.
+//
+// For instance, to create a network with 2 nodes that share the same node
+// config,
+//
+//	cfg := []string{"--protocol.anchors"}
+//	cfgs := [][]string{cfg, cfg}
+//	params := OpenChannelParams{...}
+//	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, params)
+//
+// This will create two nodes and open an anchor channel between them.
+func (h *HarnessTest) CreateSimpleNetwork(nodeCfgs [][]string,
+	p OpenChannelParams) ([]*lnrpc.ChannelPoint, []*node.HarnessNode) {
+
+	// Create new nodes.
+	nodes := h.createNodes(nodeCfgs)
+
+	var resp []*lnrpc.ChannelPoint
+
+	// Open zero-conf channels if specified.
+	if p.ZeroConf {
+		resp = h.openZeroConfChannelsForNodes(nodes, p)
+	} else {
+		// Open channels between the nodes.
+		resp = h.openChannelsForNodes(nodes, p)
+	}
+
+	return resp, nodes
+}
+
+// acceptChannel is used to accept a single channel that comes across. This
+// should be run in a goroutine and is used to test nodes with the zero-conf
+// feature bit.
+func acceptChannel(t *testing.T, zeroConf bool, stream rpc.AcceptorClient) {
+	req, err := stream.Recv()
+	require.NoError(t, err)
+
+	resp := &lnrpc.ChannelAcceptResponse{
+		Accept:        true,
+		PendingChanId: req.PendingChanId,
+		ZeroConf:      zeroConf,
+	}
+	err = stream.Send(resp)
+	require.NoError(t, err)
+}
+
+// nodeNames defines a slice of human-reable names for the nodes created in the
+// `createNodes` method. 8 nodes are defined here as by default we can only
+// create this many nodes in one test.
+var nodeNames = []string{
+	"Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi",
+}
+
+// createNodes creates the number of nodes specified by the number of configs.
+// Each node is created using the specified config, the neighbors are
+// connected.
+func (h *HarnessTest) createNodes(nodeCfgs [][]string) []*node.HarnessNode {
+	// Get the number of nodes.
+	numNodes := len(nodeCfgs)
+
+	// Make sure we are creating a reasonable number of nodes.
+	require.LessOrEqual(h, numNodes, len(nodeNames), "too many nodes")
+
+	// Make a slice of nodes.
+	nodes := make([]*node.HarnessNode, numNodes)
+
+	// Create new nodes.
+	for i, nodeCfg := range nodeCfgs {
+		nodeName := nodeNames[i]
+		n := h.NewNode(nodeName, nodeCfg)
+		nodes[i] = n
+	}
+
+	// Connect the nodes in a chain.
+	for i := 1; i < len(nodes); i++ {
+		nodeA := nodes[i-1]
+		nodeB := nodes[i]
+		h.EnsureConnected(nodeA, nodeB)
+	}
+
+	// Fund all the nodes expect the last one.
+	for i := 0; i < len(nodes)-1; i++ {
+		node := nodes[i]
+		h.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, node)
+	}
+
+	// Mine 1 block to get the above coins confirmed.
+	h.MineBlocksAndAssertNumTxes(1, numNodes-1)
+
+	return nodes
+}
+
+// openChannelsForNodes takes a list of nodes and makes a topology of `node1 ->
+// node2 -> node3...`.
+func (h *HarnessTest) openChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// Sanity check the params.
+	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
+
+	// attachFundingShim is a helper closure that optionally attaches a
+	// funding shim to the open channel params and returns it.
+	attachFundingShim := func(
+		nodeA, nodeB *node.HarnessNode) OpenChannelParams {
+
+		// If this channel is not a script enforced lease channel,
+		// we'll do nothing and return the params.
+		leasedType := lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE
+		if p.CommitmentType != leasedType {
+			return p
+		}
+
+		// Otherwise derive the funding shim, attach it to the original
+		// open channel params and return it.
+		minerHeight := h.CurrentHeight()
+		thawHeight := minerHeight + thawHeightDelta
+		fundingShim, _ := h.DeriveFundingShim(
+			nodeA, nodeB, p.Amt, thawHeight, true, leasedType,
+		)
+
+		p.FundingShim = fundingShim
+
+		return p
+	}
+
+	// Open channels in batch to save blocks mined.
+	reqs := make([]*OpenChannelRequest, 0, len(nodes)-1)
+	for i := 0; i < len(nodes)-1; i++ {
+		nodeA := nodes[i]
+		nodeB := nodes[i+1]
+
+		// Optionally attach a funding shim to the open channel params.
+		p = attachFundingShim(nodeA, nodeB)
+
+		req := &OpenChannelRequest{
+			Local:  nodeA,
+			Remote: nodeB,
+			Param:  p,
+		}
+		reqs = append(reqs, req)
+	}
+	resp := h.OpenMultiChannelsAsync(reqs)
+
+	// If the channels are private, make sure the channel participants know
+	// the relevant channels.
+	if p.Private {
+		for i, chanPoint := range resp {
+			// Get the channel participants - for n channels we
+			// would have n+1 nodes.
+			nodeA, nodeB := nodes[i], nodes[i+1]
+			h.AssertChannelInGraph(nodeA, chanPoint)
+			h.AssertChannelInGraph(nodeB, chanPoint)
+		}
+	} else {
+		// Make sure the all nodes know all the channels if they are
+		// public.
+		for _, node := range nodes {
+			for _, chanPoint := range resp {
+				h.AssertChannelInGraph(node, chanPoint)
+			}
+
+			// Make sure every node has updated its cached graph
+			// about the edges as indicated in `DescribeGraph`.
+			h.AssertNumEdges(node, len(resp), false)
+		}
+	}
+
+	return resp
+}
+
+// openZeroConfChannelsForNodes takes a list of nodes and makes a topology of
+// `node1 -> node2 -> node3...` with zero-conf channels.
+func (h *HarnessTest) openZeroConfChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// Sanity check the params.
+	require.True(h, p.ZeroConf, "zero-conf channels must be enabled")
+	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
+
+	// We are opening numNodes-1 channels.
+	cancels := make([]context.CancelFunc, 0, len(nodes)-1)
+
+	// Create the channel acceptors.
+	for _, node := range nodes[1:] {
+		acceptor, cancel := node.RPC.ChannelAcceptor()
+		go acceptChannel(h.T, true, acceptor)
+
+		cancels = append(cancels, cancel)
+	}
+
+	// Open channels between the nodes.
+	resp := h.openChannelsForNodes(nodes, p)
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	return resp
+}
+
+// DeriveFundingShim creates a channel funding shim by deriving the necessary
+// keys on both sides.
+func (h *HarnessTest) DeriveFundingShim(alice, bob *node.HarnessNode,
+	chanSize btcutil.Amount, thawHeight uint32, publish bool,
+	commitType lnrpc.CommitmentType) (*lnrpc.FundingShim,
+	*lnrpc.ChannelPoint) {
+
+	keyLoc := &signrpc.KeyLocator{KeyFamily: 9999}
+	carolFundingKey := alice.RPC.DeriveKey(keyLoc)
+	daveFundingKey := bob.RPC.DeriveKey(keyLoc)
+
+	// Now that we have the multi-sig keys for each party, we can manually
+	// construct the funding transaction. We'll instruct the backend to
+	// immediately create and broadcast a transaction paying out an exact
+	// amount. Normally this would reside in the mempool, but we just
+	// confirm it now for simplicity.
+	var (
+		fundingOutput *wire.TxOut
+		musig2        bool
+		err           error
+	)
+
+	if commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT ||
+		commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL ||
+		commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_OVERLAY {
+
+		var carolKey, daveKey *btcec.PublicKey
+		carolKey, err = btcec.ParsePubKey(carolFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+		daveKey, err = btcec.ParsePubKey(daveFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+
+		_, fundingOutput, err = input.GenTaprootFundingScript(
+			carolKey, daveKey, int64(chanSize),
+			fn.None[chainhash.Hash](),
+		)
+		require.NoError(h, err)
+
+		musig2 = true
+	} else {
+		_, fundingOutput, err = input.GenFundingPkScript(
+			carolFundingKey.RawKeyBytes, daveFundingKey.RawKeyBytes,
+			int64(chanSize),
+		)
+		require.NoError(h, err)
+	}
+
+	var txid *chainhash.Hash
+	var outputIndex uint32
+	targetOutputs := []*wire.TxOut{fundingOutput}
+
+	findFundingOutputIndex := func(tx *wire.MsgTx) uint32 {
+		for i, out := range tx.TxOut {
+			if out.Value != fundingOutput.Value {
+				continue
+			}
+			if !bytes.Equal(out.PkScript, fundingOutput.PkScript) {
+				continue
+			}
+
+			return uint32(i)
+		}
+
+		require.Failf(
+			h, "funding output not found",
+			"funding output not found in tx %v", txid,
+		)
+
+		return 0
+	}
+
+	if publish {
+		txid = h.SendOutputsWithoutChange(targetOutputs, 5)
+
+		// If we published the funding transaction, then we need to
+		// look it up in the mempool to locate the actual output
+		// index.
+		tx := h.GetRawTransaction(*txid).MsgTx()
+		outputIndex = findFundingOutputIndex(tx)
+	} else {
+		tx := h.CreateTransaction(targetOutputs, 5)
+
+		txHash := tx.TxHash()
+		txid = &txHash
+		outputIndex = findFundingOutputIndex(tx)
+	}
+
+	// At this point, we can being our external channel funding workflow.
+	// We'll start by generating a pending channel ID externally that will
+	// be used to track this new funding type.
+	pendingChanID := h.Random32Bytes()
+
+	// Now that we have the pending channel ID, Dave (our responder) will
+	// register the intent to receive a new channel funding workflow using
+	// the pending channel ID.
+	chanPoint := &lnrpc.ChannelPoint{
+		FundingTxid: &lnrpc.ChannelPoint_FundingTxidBytes{
+			FundingTxidBytes: txid[:],
+		},
+		OutputIndex: outputIndex,
+	}
+	chanPointShim := &lnrpc.ChanPointShim{
+		Amt:       int64(chanSize),
+		ChanPoint: chanPoint,
+		LocalKey: &lnrpc.KeyDescriptor{
+			RawKeyBytes: daveFundingKey.RawKeyBytes,
+			KeyLoc: &lnrpc.KeyLocator{
+				KeyFamily: daveFundingKey.KeyLoc.KeyFamily,
+				KeyIndex:  daveFundingKey.KeyLoc.KeyIndex,
+			},
+		},
+		RemoteKey:     carolFundingKey.RawKeyBytes,
+		PendingChanId: pendingChanID,
+		ThawHeight:    thawHeight,
+		Musig2:        musig2,
+	}
+	fundingShim := &lnrpc.FundingShim{
+		Shim: &lnrpc.FundingShim_ChanPointShim{
+			ChanPointShim: chanPointShim,
+		},
+	}
+	bob.RPC.FundingStateStep(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// If we attempt to register the same shim (has the same pending chan
+	// ID), then we should get an error.
+	bob.RPC.FundingStateStepAssertErr(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// We'll take the chan point shim we just registered for Dave (the
+	// responder), and swap the local/remote keys before we feed it in as
+	// Carol's funding shim as the initiator.
+	fundingShim.GetChanPointShim().LocalKey = &lnrpc.KeyDescriptor{
+		RawKeyBytes: carolFundingKey.RawKeyBytes,
+		KeyLoc: &lnrpc.KeyLocator{
+			KeyFamily: carolFundingKey.KeyLoc.KeyFamily,
+			KeyIndex:  carolFundingKey.KeyLoc.KeyIndex,
+		},
+	}
+	fundingShim.GetChanPointShim().RemoteKey = daveFundingKey.RawKeyBytes
+
+	return fundingShim, chanPoint
 }

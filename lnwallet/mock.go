@@ -18,7 +18,7 @@ import (
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -49,9 +49,9 @@ func (w *mockWalletController) BackEnd() string {
 	return "mock"
 }
 
-// FetchInputInfo will be called to get info about the inputs to the funding
+// FetchOutpointInfo will be called to get info about the inputs to the funding
 // transaction.
-func (w *mockWalletController) FetchInputInfo(
+func (w *mockWalletController) FetchOutpointInfo(
 	prevOut *wire.OutPoint) (*Utxo, error) {
 
 	utxo := &Utxo{
@@ -198,16 +198,16 @@ func (w *mockWalletController) ListUnspentWitness(int32, int32,
 
 // ListTransactionDetails currently returns dummy values.
 func (w *mockWalletController) ListTransactionDetails(int32, int32,
-	string) ([]*TransactionDetail, error) {
+	string, uint32, uint32) ([]*TransactionDetail, uint64, uint64, error) {
 
-	return nil, nil
+	return nil, 0, 0, nil
 }
 
 // LeaseOutput returns the current time and a nil error.
 func (w *mockWalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, []byte, btcutil.Amount, error) {
+	time.Duration) (time.Time, error) {
 
-	return time.Now(), nil, 0, nil
+	return time.Now(), nil
 }
 
 // ReleaseOutput currently does nothing.
@@ -302,6 +302,14 @@ func (w *mockWalletController) FetchTx(chainhash.Hash) (*wire.MsgTx, error) {
 
 func (w *mockWalletController) RemoveDescendants(*wire.MsgTx) error {
 	return nil
+}
+
+// FetchDerivationInfo queries for the wallet's knowledge of the passed
+// pkScript and constructs the derivation info and returns it.
+func (w *mockWalletController) FetchDerivationInfo(
+	pkScript []byte) (*psbt.Bip32Derivation, error) {
+
+	return nil, nil
 }
 
 func (w *mockWalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {

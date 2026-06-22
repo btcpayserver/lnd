@@ -5,7 +5,6 @@ package commands
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,7 +20,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
@@ -39,6 +38,7 @@ var (
 			fundPsbtCommand,
 			fundTemplatePsbtCommand,
 			finalizePsbtCommand,
+			signPsbtCommand,
 		},
 	}
 
@@ -171,7 +171,7 @@ func estimateFeeRate(ctx *cli.Context) error {
 		SatPerKw            int64 `json:"sat_per_kw"`
 		SatPerVByte         int64 `json:"sat_per_vbyte"`
 		MinRelayFeeSatPerKw int64 `json:"min_relay_fee_sat_per_kw"`
-		//nolint:lll
+		//nolint:ll
 		MinRelayFeeSatPerVByte int64 `json:"min_relay_fee_sat_per_vbyte"`
 	}{
 		SatPerKw:               int64(rateKW),
@@ -270,9 +270,10 @@ var bumpFeeCommand = cli.Command{
 		cli.Uint64Flag{
 			Name: "conf_target",
 			Usage: `
-	The deadline in number of blocks that the input should be spent within.
-	When not set, for new inputs, the default value (1008) is used; for
-	exiting inputs, their current values will be retained.`,
+	The conf target is the starting fee rate of the fee function expressed
+	in number of blocks. So instead of using sat_per_vbyte the conf target
+	can be specified and LND will query its fee estimator for the current
+	fee rate for the given target.`,
 		},
 		cli.Uint64Flag{
 			Name:   "sat_per_byte",
@@ -309,6 +310,14 @@ var bumpFeeCommand = cli.Command{
 	the budget for fee bumping; for existing inputs, their current budgets
 	will be retained.`,
 		},
+		cli.Uint64Flag{
+			Name: "deadline_delta",
+			Usage: `
+	The deadline delta in number of blocks that this input should be spent
+	within to bump the transaction. When specified also a budget value is
+	required. When the deadline is reached, ALL the budget will be spent as
+	fee.`,
+		},
 	},
 	Action: actionDecorator(bumpFee),
 }
@@ -323,7 +332,7 @@ func bumpFee(ctx *cli.Context) error {
 	}
 
 	// Validate and parse the relevant arguments/flags.
-	protoOutPoint, err := NewProtoOutPoint(ctx.Args().Get(0))
+	protoOutPoint, err := lnd.NewProtoOutPoint(ctx.Args().Get(0))
 	if err != nil {
 		return err
 	}
@@ -346,11 +355,12 @@ func bumpFee(ctx *cli.Context) error {
 	}
 
 	resp, err := client.BumpFee(ctxc, &walletrpc.BumpFeeRequest{
-		Outpoint:    protoOutPoint,
-		TargetConf:  uint32(ctx.Uint64("conf_target")),
-		Immediate:   immediate,
-		Budget:      ctx.Uint64("budget"),
-		SatPerVbyte: ctx.Uint64("sat_per_vbyte"),
+		Outpoint:      protoOutPoint,
+		TargetConf:    uint32(ctx.Uint64("conf_target")),
+		Immediate:     immediate,
+		Budget:        ctx.Uint64("budget"),
+		SatPerVbyte:   ctx.Uint64("sat_per_vbyte"),
+		DeadlineDelta: uint32(ctx.Uint64("deadline_delta")),
 	})
 	if err != nil {
 		return err
@@ -379,9 +389,10 @@ var bumpCloseFeeCommand = cli.Command{
 		cli.Uint64Flag{
 			Name: "conf_target",
 			Usage: `
-	The deadline in number of blocks that the input should be spent within.
-	When not set, for new inputs, the default value (1008) is used; for
-	exiting inputs, their current values will be retained.`,
+	The conf target is the starting fee rate of the fee function expressed
+	in number of blocks. So instead of using sat_per_vbyte the conf target
+	can be specified and LND will query its fee estimator for the current
+	fee rate for the given target.`,
 		},
 		cli.Uint64Flag{
 			Name:   "sat_per_byte",
@@ -431,51 +442,59 @@ var bumpForceCloseFeeCommand = cli.Command{
 	allows the fee of a channel force closing transaction to be increased by
 	using the child-pays-for-parent mechanism. It will instruct the sweeper
 	to sweep the anchor outputs of the closing transaction at the requested
-	fee rate or confirmation target. The specified fee rate will be the
-	effective fee rate taking the parent fee into account.
+	confirmation target and limit the fees to the specified budget.
 	`,
 	Flags: []cli.Flag{
 		cli.Uint64Flag{
 			Name: "conf_target",
 			Usage: `
-	The deadline in number of blocks that the input should be spent within.
-	When not set, for new inputs, the default value (1008) is used; for
-	exiting inputs, their current values will be retained.`,
+	The conf target is the starting fee rate of the fee function expressed
+	in number of blocks. So instead of using sat_per_vbyte the conf target
+	can be specified and LND will query its fee estimator for the current
+	fee rate for the given target.`,
+		},
+		cli.Uint64Flag{
+			Name: "deadline_delta",
+			Usage: `
+	The deadline delta in number of blocks that the anchor output should
+	be spent within to bump the closing transaction. When the deadline is
+	reached, ALL the budget will be spent as fees.`,
 		},
 		cli.Uint64Flag{
 			Name:   "sat_per_byte",
 			Usage:  "Deprecated, use sat_per_vbyte instead.",
 			Hidden: true,
 		},
+		cli.Uint64Flag{
+			Name: "sat_per_vbyte",
+			Usage: `
+	The starting fee rate, expressed in sat/vbyte. This value will be used
+	by the sweeper's fee function as its starting fee rate. When not set,
+	the sweeper will use the estimated fee rate using the target_conf as the
+	starting fee rate.`,
+		},
 		cli.BoolFlag{
 			Name:   "force",
 			Usage:  "Deprecated, use immediate instead.",
 			Hidden: true,
 		},
-		cli.Uint64Flag{
-			Name: "sat_per_vbyte",
-			Usage: `
-	The starting fee rate, expressed in sat/vbyte, that will be used to
-	spend the input with initially. This value will be used by the
-	sweeper's fee function as its starting fee rate. When not set, the
-	sweeper will use the estimated fee rate using the target_conf as the
-	starting fee rate.`,
-		},
 		cli.BoolFlag{
 			Name: "immediate",
 			Usage: `
-	Whether this input will be swept immediately. When set to true, the
-	sweeper will sweep this input without waiting for the next batch.`,
+	Whether this cpfp transaction will be triggered immediately. When set to
+	true, the sweeper will consider all currently pending registered sweeps
+	and trigger new batch transactions including the sweeping of the anchor 
+	output related to the selected force close transaction.`,
 		},
 		cli.Uint64Flag{
 			Name: "budget",
 			Usage: `
-	The max amount in sats that can be used as the fees. Setting this value
-	greater than the input's value may result in CPFP - one or more wallet
-	utxos will be used to pay the fees specified by the budget. If not set,
-	for new inputs, by default 50% of the input's value will be treated as
-	the budget for fee bumping; for existing inputs, their current budgets
-	will be retained.`,
+	The max amount in sats that can be used as the fees. For already
+	registered anchor outputs if not set explicitly the old value will be
+	used. For channel force closes which have no HTLCs in their commitment
+	transaction this value has to be set to an appropriate amount to pay for
+	the cpfp transaction of the force closed channel otherwise the fee 
+	bumping will fail.`,
 		},
 	},
 	Action: actionDecorator(bumpForceCloseFee),
@@ -492,97 +511,43 @@ func bumpForceCloseFee(ctx *cli.Context) error {
 
 	// Validate the channel point.
 	channelPoint := ctx.Args().Get(0)
-	_, err := NewProtoOutPoint(channelPoint)
+	rpcChannelPoint, err := parseChanPoint(channelPoint)
 	if err != nil {
 		return err
 	}
 
-	// Fetch all waiting close channels.
-	client, cleanUp := getClient(ctx)
-	defer cleanUp()
-
-	// Fetch waiting close channel commitments.
-	commitments, err := getWaitingCloseCommitments(
-		ctxc, client, channelPoint,
-	)
-	if err != nil {
-		return err
+	// `sat_per_byte` was deprecated we only use sats/vbyte now.
+	if ctx.IsSet("sat_per_byte") {
+		return fmt.Errorf("deprecated, use sat_per_vbyte instead")
 	}
 
 	// Retrieve pending sweeps.
 	walletClient, cleanUp := getWalletClient(ctx)
 	defer cleanUp()
 
-	sweeps, err := walletClient.PendingSweeps(
-		ctxc, &walletrpc.PendingSweepsRequest{},
-	)
+	// Parse immediate flag (force flag was deprecated).
+	if ctx.IsSet("immediate") && ctx.IsSet("force") {
+		return fmt.Errorf("cannot set immediate and force flag at " +
+			"the same time")
+	}
+	immediate := ctx.Bool("immediate") || ctx.Bool("force")
+
+	resp, err := walletClient.BumpForceCloseFee(
+		ctxc, &walletrpc.BumpForceCloseFeeRequest{
+			ChanPoint:       rpcChannelPoint,
+			Budget:          ctx.Uint64("budget"),
+			Immediate:       immediate,
+			StartingFeerate: ctx.Uint64("sat_per_vbyte"),
+			TargetConf:      uint32(ctx.Uint64("conf_target")),
+			DeadlineDelta:   uint32(ctx.Uint64("deadline_delta")),
+		})
 	if err != nil {
 		return err
 	}
 
-	// Match pending sweeps with commitments of the channel for which a bump
-	// is requested and bump their fees.
-	commitSet := map[string]struct{}{
-		commitments.LocalTxid:  {},
-		commitments.RemoteTxid: {},
-	}
-	if commitments.RemotePendingTxid != "" {
-		commitSet[commitments.RemotePendingTxid] = struct{}{}
-	}
-
-	for _, sweep := range sweeps.PendingSweeps {
-		// Only bump anchor sweeps.
-		if sweep.WitnessType != walletrpc.WitnessType_COMMITMENT_ANCHOR {
-			continue
-		}
-
-		// Skip unrelated sweeps.
-		sweepTxID, err := chainhash.NewHash(sweep.Outpoint.TxidBytes)
-		if err != nil {
-			return err
-		}
-		if _, match := commitSet[sweepTxID.String()]; !match {
-			continue
-		}
-
-		resp, err := walletClient.BumpFee(
-			ctxc, &walletrpc.BumpFeeRequest{
-				Outpoint:    sweep.Outpoint,
-				TargetConf:  uint32(ctx.Uint64("conf_target")),
-				Budget:      ctx.Uint64("budget"),
-				Immediate:   ctx.Bool("immediate"),
-				SatPerVbyte: ctx.Uint64("sat_per_vbyte"),
-			})
-		if err != nil {
-			return err
-		}
-
-		// Bump fee of the anchor sweep.
-		fmt.Printf("Bumping fee of %v:%v: %v\n",
-			sweepTxID, sweep.Outpoint.OutputIndex, resp.GetStatus())
-	}
+	fmt.Printf("BumpForceCloseFee result: %s\n", resp.Status)
 
 	return nil
-}
-
-func getWaitingCloseCommitments(ctxc context.Context,
-	client lnrpc.LightningClient, channelPoint string) (
-	*lnrpc.PendingChannelsResponse_Commitments, error) {
-
-	req := &lnrpc.PendingChannelsRequest{}
-	resp, err := client.PendingChannels(ctxc, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Lookup the channel commit tx hashes.
-	for _, channel := range resp.WaitingCloseChannels {
-		if channel.Channel.ChannelPoint == channelPoint {
-			return channel.Commitments, nil
-		}
-	}
-
-	return nil, errors.New("channel not found")
 }
 
 var listSweepsCommand = cli.Command{
@@ -849,11 +814,11 @@ func removeTransaction(ctx *cli.Context) error {
 
 // utxoLease contains JSON annotations for a lease on an unspent output.
 type utxoLease struct {
-	ID         string   `json:"id"`
-	OutPoint   OutPoint `json:"outpoint"`
-	Expiration uint64   `json:"expiration"`
-	PkScript   []byte   `json:"pk_script"`
-	Value      uint64   `json:"value"`
+	ID         string       `json:"id"`
+	OutPoint   lnd.OutPoint `json:"outpoint"`
+	Expiration uint64       `json:"expiration"`
+	PkScript   []byte       `json:"pk_script"`
+	Value      uint64       `json:"value"`
 }
 
 // fundPsbtResponse is a struct that contains JSON annotations for nice result
@@ -1218,7 +1183,8 @@ var fundPsbtCommand = cli.Command{
 	Name:  "fund",
 	Usage: "Fund a Partially Signed Bitcoin Transaction (PSBT).",
 	ArgsUsage: "[--template_psbt=T | [--outputs=O [--inputs=I]]] " +
-		"[--conf_target=C | --sat_per_vbyte=S] [--change_type=A]",
+		"[--conf_target=C | --sat_per_vbyte=S | --sat_per_kw=K] " +
+		"[--change_type=A]",
 	Description: `
 	The fund command creates a fully populated PSBT that contains enough
 	inputs to fund the outputs specified in either the PSBT or the
@@ -1280,6 +1246,11 @@ var fundPsbtCommand = cli.Command{
 			Usage: "a manual fee expressed in sat/vbyte that " +
 				"should be used when creating the transaction",
 		},
+		cli.Uint64Flag{
+			Name: "sat_per_kw",
+			Usage: "a manual fee expressed in sat/kw that " +
+				"should be used when creating the transaction",
+		},
 		cli.StringFlag{
 			Name: "account",
 			Usage: "(optional) the name of the account to use to " +
@@ -1304,6 +1275,12 @@ var fundPsbtCommand = cli.Command{
 			Value: defaultUtxoMinConf,
 		},
 		coinSelectionStrategyFlag,
+		cli.Float64Flag{
+			Name: "max_fee_ratio",
+			Usage: "the maximum fee to total output amount ratio " +
+				"that this psbt should adhere to",
+			Value: chanfunding.DefaultMaxFeeRatio,
+		},
 	},
 	Action: actionDecorator(fundPsbt),
 }
@@ -1360,10 +1337,11 @@ func fundPsbt(ctx *cli.Context) error {
 		)
 
 		if len(ctx.String("outputs")) > 0 {
-			// Parse the address to amount map as JSON now. At least one
-			// entry must be present.
+			// Parse the address to amount map as JSON now. At least
+			// one entry must be present.
 			jsonMap := []byte(ctx.String("outputs"))
-			if err := json.Unmarshal(jsonMap, &amountToAddr); err != nil {
+			err := json.Unmarshal(jsonMap, &amountToAddr)
+			if err != nil {
 				return fmt.Errorf("error parsing outputs "+
 					"JSON: %w", err)
 			}
@@ -1375,13 +1353,14 @@ func fundPsbt(ctx *cli.Context) error {
 			var inputs []string
 
 			jsonList := []byte(ctx.String("inputs"))
-			if err := json.Unmarshal(jsonList, &inputs); err != nil {
+			err := json.Unmarshal(jsonList, &inputs)
+			if err != nil {
 				return fmt.Errorf("error parsing inputs JSON: "+
 					"%v", err)
 			}
 
 			for idx, input := range inputs {
-				op, err := NewProtoOutPoint(input)
+				op, err := lnd.NewProtoOutPoint(input)
 				if err != nil {
 					return fmt.Errorf("error parsing "+
 						"UTXO outpoint %d: %v", idx,
@@ -1402,13 +1381,21 @@ func fundPsbt(ctx *cli.Context) error {
 
 	// Parse fee flags.
 	switch {
-	case ctx.IsSet("conf_target") && ctx.IsSet("sat_per_vbyte"):
-		return fmt.Errorf("cannot set conf_target and sat_per_vbyte " +
-			"at the same time")
+	case ctx.IsSet("conf_target") && ctx.IsSet("sat_per_vbyte") ||
+		ctx.IsSet("conf_target") && ctx.IsSet("sat_per_kw") ||
+		ctx.IsSet("sat_per_vbyte") && ctx.IsSet("sat_per_kw"):
+
+		return fmt.Errorf("only one of conf_target, sat_per_vbyte, " +
+			"or sat_per_kw can be set at the same time")
 
 	case ctx.Uint64("sat_per_vbyte") > 0:
 		req.Fees = &walletrpc.FundPsbtRequest_SatPerVbyte{
 			SatPerVbyte: ctx.Uint64("sat_per_vbyte"),
+		}
+
+	case ctx.Uint64("sat_per_kw") > 0:
+		req.Fees = &walletrpc.FundPsbtRequest_SatPerKw{
+			SatPerKw: ctx.Uint64("sat_per_kw"),
 		}
 
 	// Check conf_target last because it has a default value.
@@ -1431,6 +1418,8 @@ func fundPsbt(ctx *cli.Context) error {
 				addressType)
 		}
 	}
+
+	req.MaxFeeRatio = ctx.Float64("max_fee_ratio")
 
 	walletClient, cleanUp := getWalletClient(ctx)
 	defer cleanUp()
@@ -1460,7 +1449,7 @@ func marshallLocks(lockedUtxos []*walletrpc.UtxoLease) []*utxoLease {
 	for idx, lock := range lockedUtxos {
 		jsonLocks[idx] = &utxoLease{
 			ID:         hex.EncodeToString(lock.Id),
-			OutPoint:   NewOutPointFromProto(lock.Outpoint),
+			OutPoint:   lnd.NewOutPointFromProto(lock.Outpoint),
 			Expiration: lock.Expiration,
 			PkScript:   lock.PkScript,
 			Value:      lock.Value,
@@ -1484,7 +1473,9 @@ var finalizePsbtCommand = cli.Command{
 	Description: `
 	The finalize command expects a partial transaction with all inputs
 	and outputs fully declared and tries to sign all inputs that belong to
-	the wallet. Lnd must be the last signer of the transaction. That means,
+	the wallet (only standard, single-signature P2WKH, NP2WKH and P2TR
+	inputs, for any other use cases use the 'sign' subcommand instead).
+	Lnd must be the last signer of the transaction. That means,
 	if there are any unsigned non-witness inputs or inputs without UTXO
 	information attached or inputs without witness data that do not belong
 	to lnd's wallet, this method will fail. If no error is returned, the
@@ -1554,6 +1545,85 @@ func finalizePsbt(ctx *cli.Context) error {
 	return nil
 }
 
+// signPsbtResponse is a struct that contains JSON annotations for nice
+// result serialization.
+type signPsbtResponse struct {
+	Psbt               string   `json:"psbt"`
+	SignedInputIndexes []uint32 `json:"signed_input_indexes"`
+}
+
+var signPsbtCommand = cli.Command{
+	Name:      "sign",
+	Usage:     "Sign a Partially Signed Bitcoin Transaction (PSBT).",
+	ArgsUsage: "funded_psbt",
+	Description: `
+	The sign command expects a partial transaction with all inputs
+	and outputs fully declared and tries to sign all inputs that can be
+	identified by the wallet as belonging to it. All fields to identify a
+	signer, such as root key fingerprints, derivation paths and public keys,
+	must be set to be able to sign the transaction.
+
+	This method does NOT finalize or publish the transaction after it's been
+	signed. If lnd was the last signer and all required signatures are
+	present, use the finalize command to finalize the transaction.
+	`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "funded_psbt",
+			Usage: "the base64 encoded PSBT to sign",
+		},
+	},
+	Action: actionDecorator(signPsbt),
+}
+
+func signPsbt(ctx *cli.Context) error {
+	ctxc := getContext()
+
+	// Display the command's help message if we do not have the expected
+	// number of arguments/flags.
+	if ctx.NArg() > 1 || ctx.NumFlags() > 1 {
+		return cli.ShowCommandHelp(ctx, "sign")
+	}
+
+	var (
+		args       = ctx.Args()
+		psbtBase64 string
+	)
+	switch {
+	case ctx.IsSet("funded_psbt"):
+		psbtBase64 = ctx.String("funded_psbt")
+	case args.Present():
+		psbtBase64 = args.First()
+	default:
+		return fmt.Errorf("funded_psbt argument missing")
+	}
+
+	psbtBytes, err := base64.StdEncoding.DecodeString(psbtBase64)
+	if err != nil {
+		return err
+	}
+	req := &walletrpc.SignPsbtRequest{
+		FundedPsbt: psbtBytes,
+	}
+
+	walletClient, cleanUp := getWalletClient(ctx)
+	defer cleanUp()
+
+	response, err := walletClient.SignPsbt(ctxc, req)
+	if err != nil {
+		return err
+	}
+
+	printJSON(&signPsbtResponse{
+		Psbt: base64.StdEncoding.EncodeToString(
+			response.SignedPsbt,
+		),
+		SignedInputIndexes: response.SignedInputs,
+	})
+
+	return nil
+}
+
 var leaseOutputCommand = cli.Command{
 	Name:  "leaseoutput",
 	Usage: "Lease an output.",
@@ -1591,7 +1661,7 @@ func leaseOutput(ctx *cli.Context) error {
 	}
 
 	outpointStr := ctx.String("outpoint")
-	outpoint, err := NewProtoOutPoint(outpointStr)
+	outpoint, err := lnd.NewProtoOutPoint(outpointStr)
 	if err != nil {
 		return fmt.Errorf("error parsing outpoint: %w", err)
 	}
@@ -1676,7 +1746,7 @@ func releaseOutput(ctx *cli.Context) error {
 		return fmt.Errorf("outpoint argument missing")
 	}
 
-	outpoint, err := NewProtoOutPoint(outpointStr)
+	outpoint, err := lnd.NewProtoOutPoint(outpointStr)
 	if err != nil {
 		return fmt.Errorf("error parsing outpoint: %w", err)
 	}

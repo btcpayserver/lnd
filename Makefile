@@ -1,25 +1,31 @@
 PKG := github.com/lightningnetwork/lnd
-ESCPKG := github.com\/lightningnetwork\/lnd
 MOBILE_PKG := $(PKG)/mobile
 TOOLS_DIR := tools
+TOOLS_MOD := $(TOOLS_DIR)/go.mod
 
+GOCC ?= go
 PREFIX ?= /usr/local
 
+GOTOOL := GOWORK=off $(GOCC) tool -modfile=$(TOOLS_MOD)
+
+
 BTCD_PKG := github.com/btcsuite/btcd
-GOACC_PKG := github.com/ory/go-acc
 GOIMPORTS_PKG := github.com/rinchsan/gosimports/cmd/gosimports
+GOLINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 
 GO_BIN := ${GOPATH}/bin
 BTCD_BIN := $(GO_BIN)/btcd
-GOIMPORTS_BIN := $(GO_BIN)/gosimports
 GOMOBILE_BIN := $(GO_BIN)/gomobile
-GOACC_BIN := $(GO_BIN)/go-acc
 
 MOBILE_BUILD_DIR :=${GOPATH}/src/$(MOBILE_PKG)/build
 IOS_BUILD_DIR := $(MOBILE_BUILD_DIR)/ios
 IOS_BUILD := $(IOS_BUILD_DIR)/Lndmobile.xcframework
 ANDROID_BUILD_DIR := $(MOBILE_BUILD_DIR)/android
 ANDROID_BUILD := $(ANDROID_BUILD_DIR)/Lndmobile.aar
+# For Android, set max page size to 16KB to support devices using 16KB memory pages.
+# Reference: https://developer.android.com/guide/practices/page-sizes
+ANDROID_MAX_PAGE_SIZE := 16384
+ANDROID_EXTLDFLAGS := -extldflags '-Wl,-z,max-page-size=$(ANDROID_MAX_PAGE_SIZE)'
 
 COMMIT := $(shell git describe --tags --dirty)
 
@@ -27,27 +33,17 @@ COMMIT := $(subst -dirty,-fresh-btcpay,$(COMMIT))
 LDFLAGS := -ldflags "-X $(PKG)/build.Commit=$(COMMIT)"
 
 # Determine the minor version of the active Go installation.
-ACTIVE_GO_VERSION := $(shell go version | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
+ACTIVE_GO_VERSION := $(shell $(GOCC) version | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
 ACTIVE_GO_VERSION_MINOR := $(shell echo $(ACTIVE_GO_VERSION) | cut -d. -f2)
-
-LOOPVARFIX :=
-ifeq ($(shell expr $(ACTIVE_GO_VERSION_MINOR) \>= 21), 1)
-	LOOPVARFIX := GOEXPERIMENT=loopvar
-endif
-
-LOOPVARFIX :=
-ifeq ($(shell expr $(GO_VERSION_MINOR) \>= 21), 1)
-	LOOPVARFIX := GOEXPERIMENT=loopvar
-endif
 
 # GO_VERSION is the Go version used for the release build, docker files, and
 # GitHub Actions. This is the reference version for the project. All other Go
 # versions are checked against this version.
-GO_VERSION = 1.22.6
+GO_VERSION = 1.26.3
 
-GOBUILD := $(LOOPVARFIX) go build -v
-GOINSTALL := $(LOOPVARFIX) go install -v
-GOTEST := $(LOOPVARFIX) go test
+GOBUILD := $(GOCC) build -v
+GOINSTALL := $(GOCC) install -v
+GOTEST := $(GOCC) test
 
 GOFILES_NOVENDOR = $(shell find . -type f -name '*.go' -not -path "./vendor/*" -not -name "*pb.go" -not -name "*pb.gw.go" -not -name "*.pb.json.go")
 
@@ -79,12 +75,41 @@ ifneq ($(workers),)
 LINT_WORKERS = --concurrency=$(workers)
 endif
 
-DOCKER_TOOLS = docker run \
+# Docker cache mounting strategy:
+# - CI (GitHub Actions): Use bind mounts to host paths that GA caches persist.
+# - Local: Use Docker named volumes (much faster on macOS/Windows due to
+#   avoiding slow host-syncing overhead).
+# Paths inside container must match GOCACHE/GOMODCACHE in tools/Dockerfile.
+ifdef CI
+# CI mode: bind mount to host paths that GitHub Actions caches.
+DOCKER_TOOLS_BASE = docker run \
   --rm \
-  -v $(shell bash -c "go env GOCACHE || (mkdir -p /tmp/go-cache; echo /tmp/go-cache)"):/tmp/build/.cache \
-  -v $(shell bash -c "go env GOMODCACHE || (mkdir -p /tmp/go-modcache; echo /tmp/go-modcache)"):/tmp/build/.modcache \
-  -v $(shell bash -c "mkdir -p /tmp/go-lint-cache; echo /tmp/go-lint-cache"):/root/.cache/golangci-lint \
-  -v $$(pwd):/build lnd-tools
+  -v $${HOME}/.cache/go-build:/tmp/build/.cache \
+  -v $${HOME}/go/pkg/mod:/tmp/build/.modcache \
+  -v $${HOME}/.cache/golangci-lint:/root/.cache/golangci-lint \
+	-v $$(pwd):/build
+DOCKER_TOOLS = $(DOCKER_TOOLS_BASE) lnd-tools
+DOCKER_TOOLS_LINT = $(DOCKER_TOOLS)
+else
+# Local mode: Docker named volumes for fast macOS/Windows performance.
+# Detect if we're in a git worktree. Use git rev-parse --git-common-dir to get
+# the path to the main git directory for the linter's diff processor to work
+# correctly with the new-from-rev setting.
+GIT_COMMON_DIR := $(shell \
+  common_dir="$$(git rev-parse --git-common-dir 2>/dev/null)"; \
+  if [ "$$common_dir" != ".git" ] && [ -n "$$common_dir" ]; then \
+    echo "$$common_dir"; \
+  fi)
+GIT_VOLUME := $(if $(GIT_COMMON_DIR),-v "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro",)
+DOCKER_TOOLS_BASE = docker run \
+  --rm \
+  -v lnd-go-build-cache:/tmp/build/.cache \
+  -v lnd-go-mod-cache:/tmp/build/.modcache \
+  -v lnd-go-lint-cache:/root/.cache/golangci-lint \
+  -v $$(pwd):/build
+DOCKER_TOOLS = $(DOCKER_TOOLS_BASE) lnd-tools
+DOCKER_TOOLS_LINT = $(DOCKER_TOOLS_BASE) $(GIT_VOLUME) lnd-tools
+endif
 
 GREEN := "\\033[0;32m"
 NC := "\\033[0m"
@@ -99,17 +124,9 @@ all: scratch check install
 # ============
 # DEPENDENCIES
 # ============
-$(GOACC_BIN):
-	@$(call print, "Installing go-acc.")
-	cd $(TOOLS_DIR); go install -trimpath -tags=tools $(GOACC_PKG)
-
 $(BTCD_BIN):
 	@$(call print, "Installing btcd.")
-	cd $(TOOLS_DIR); go install -trimpath $(BTCD_PKG)
-
-$(GOIMPORTS_BIN):
-	@$(call print, "Installing goimports.")
-	cd $(TOOLS_DIR); go install -trimpath $(GOIMPORTS_PKG)
+	cd $(TOOLS_DIR); $(GOCC) install -trimpath $(BTCD_PKG)
 
 # ============
 # INSTALLATION
@@ -153,9 +170,7 @@ manpages:
 #? install: Build and install lnd and lncli binaries and place them in $GOPATH/bin.
 install: install-binaries
 
-#? install-all: Performs all the same tasks as the install command along with generating and
-# installing the man pages for the lnd and lncli binaries. This command is useful in an
-# environment where a user has root access and so has write access to the man page directory.
+#? install-all: Performs all the same tasks as the install command along with generating and installing the man pages for the lnd and lncli binaries. This command is useful in an environment where a user has root access and so has write access to the man page directory.
 install-all: install manpages
 
 #? release-install: Build and install lnd and lncli release binaries, place them in $GOPATH/bin
@@ -164,13 +179,27 @@ release-install:
 	env CGO_ENABLED=0 $(GOINSTALL) -v -trimpath -ldflags="$(RELEASE_LDFLAGS)" -tags="$(RELEASE_TAGS)" $(PKG)/cmd/lnd
 	env CGO_ENABLED=0 $(GOINSTALL) -v -trimpath -ldflags="$(RELEASE_LDFLAGS)" -tags="$(RELEASE_TAGS)" $(PKG)/cmd/lncli
 
-#? release: Build the full set of reproducible release binaries for all supported platforms
-# Make sure the generated mobile RPC stubs don't influence our vendor package
-# by removing them first in the clean-mobile target.
+#? cross-release-install: Build lnd and lncli release binaries for single/all supported platforms to /tmp (useful for checking cross compilation or priming release build cache).
+cross-release-install:
+	@$(call print, "Cross compiling release lnd and lncli.")
+	for sys in $(BUILD_SYSTEM); do \
+		echo "Building lnd and lncli for $$sys"; \
+		export CGO_ENABLED=0 GOOS=$$(echo $$sys | cut -d- -f1) GOARCH=$$(echo $$sys | cut -d- -f2); \
+		if [ "$$GOARCH" = "armv6" ]; then \
+			export GOARCH=arm; GOARM=6; \
+		elif [ "$$GOARCH" = "armv7" ]; then \
+			export GOARCH=arm; GOARM=7; \
+		fi; \
+		$(GOBUILD) -trimpath -ldflags="$(RELEASE_LDFLAGS)" -tags="$(RELEASE_TAGS)" -o /tmp/lnd-$$sys $(PKG)/cmd/lnd; \
+		$(GOBUILD) -trimpath -ldflags="$(RELEASE_LDFLAGS)" -tags="$(RELEASE_TAGS)" -o /tmp/lncli-$$sys $(PKG)/cmd/lncli; \
+		echo; \
+	done
+
+#? release: Build the full set of reproducible release binaries for all supported platforms. Make sure the generated mobile RPC stubs don't influence our vendor package by removing them first in the clean-mobile target.
 release: clean-mobile
 	@$(call print, "Releasing lnd and lncli binaries.")
 	$(VERSION_CHECK)
-	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)"
+	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)" "$(GO_VERSION)"
 
 #? docker-release: Same as release but within a docker container to support reproducible builds on BSD/MacOS platforms
 docker-release:
@@ -203,20 +232,32 @@ ifeq ($(dbbackend),postgres)
 	docker rm lnd-postgres --force || echo "Starting new postgres container"
 
 	# Start a fresh postgres instance. Allow a maximum of 500 connections so
-	# that multiple lnd instances with a maximum number of connections of 50
-	# each can run concurrently.
-	docker run --name lnd-postgres -e POSTGRES_PASSWORD=postgres -p 6432:5432 -d postgres:13-alpine -N 500
-	docker logs -f lnd-postgres &
+	# that multiple lnd instances with a maximum number of connections of 20
+	# each can run concurrently. Note that many of the settings here are
+	# specifically for integration testing and are not fit for running
+	# production nodes. The increase in max connections ensures that there
+	# are enough entries allocated for the RWConflictPool to allow multiple
+	# conflicting transactions to track serialization conflicts. The
+	# increase in predicate locks and locks per transaction is to allow the
+	# queries to lock individual rows instead of entire tables, helping
+	# reduce serialization conflicts. Disabling sequential scan for small
+	# tables also helps prevent serialization conflicts by ensuring lookups
+	# lock only relevant rows in the index rather than the entire table.
+	docker run --name lnd-postgres -e POSTGRES_PASSWORD=postgres -p 6432:5432 -d postgres:13-alpine -N 1500 -c max_pred_locks_per_transaction=1024 -c max_locks_per_transaction=128 -c enable_seqscan=off
+	docker logs -f lnd-postgres >itest/postgres.log 2>&1 &
 
 	# Wait for the instance to be started.
 	sleep $(POSTGRES_START_DELAY)
 endif
 
+clean-itest-logs:
+	rm -rf itest/*.log itest/.logs-*
+
 #? itest-only: Only run integration tests without re-building binaries
-itest-only: db-instance
+itest-only: clean-itest-logs db-instance
 	@$(call print, "Running integration tests with ${backend} backend.")
-	rm -rf itest/*.log itest/.logs-*; date
-	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_part.sh 0 1 $(TEST_FLAGS) $(ITEST_FLAGS)
+	date
+	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_part.sh 0 1 $(SHUFFLE_SEED) $(TEST_FLAGS) $(ITEST_FLAGS) -test.v
 	$(COLLECT_ITEST_COVERAGE)
 
 #? itest: Build and run integration tests
@@ -226,10 +267,10 @@ itest: build-itest itest-only
 itest-race: build-itest-race itest-only
 
 #? itest-parallel: Build and run integration tests in parallel mode, running up to ITEST_PARALLELISM test tranches in parallel (default 4)
-itest-parallel: build-itest db-instance
+itest-parallel: clean-itest-logs build-itest db-instance
 	@$(call print, "Running tests")
-	rm -rf itest/*.log itest/.logs-*; date
-	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_parallel.sh $(ITEST_PARALLELISM) $(NUM_ITEST_TRANCHES) $(TEST_FLAGS) $(ITEST_FLAGS)
+	date
+	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_parallel.sh $(ITEST_PARALLELISM) $(NUM_ITEST_TRANCHES) $(SHUFFLE_SEED) $(TEST_FLAGS) $(ITEST_FLAGS)
 	$(COLLECT_ITEST_COVERAGE)
 
 #? itest-clean: Kill all running itest processes
@@ -253,12 +294,12 @@ unit-debug: $(BTCD_BIN)
 	$(UNIT_DEBUG)
 
 #? unit-cover: Run unit tests in coverage mode
-unit-cover: $(GOACC_BIN)
+unit-cover: $(BTCD_BIN)
 	@$(call print, "Running unit coverage tests.")
-	$(GOACC)
+	$(UNIT_COVER)
 
 #? unit-race: Run unit tests in race detector mode
-unit-race:
+unit-race: $(BTCD_BIN)
 	@$(call print, "Running unit race tests.")
 	env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(UNIT_RACE)
 
@@ -271,18 +312,28 @@ unit-bench: $(BTCD_BIN)
 # FLAKE HUNTING
 # =============
 
-#? flakehunter: Run the integration tests continuously until one fails
-flakehunter: build-itest
+#? flakehunter-itest: Run the integration tests continuously until one fails
+flakehunter-itest: build-itest
 	@$(call print, "Flake hunting ${backend} integration tests.")
 	while [ $$? -eq 0 ]; do make itest-only icase='${icase}' backend='${backend}'; done
 
-#? flake-unit: Run the unit tests continuously until one fails
-flake-unit:
-	@$(call print, "Flake hunting unit tests.")
-	while [ $$? -eq 0 ]; do GOTRACEBACK=all $(UNIT) -count=1; done
+#? flakehunter-unit: Run the unit tests continuously until one fails
+flakehunter-unit:
+	@$(call print, "Flake hunting unit test.")
+	scripts/unit-test-flake-hunter.sh ${pkg} ${case}
 
-#? flakehunter-parallel: Run the integration tests continuously until one fails, running up to ITEST_PARALLELISM test tranches in parallel (default 4)
-flakehunter-parallel:
+#? flakehunter-unit-all: Run all unit tests continuously until one fails
+flakehunter-unit-all: $(BTCD_BIN)
+	@$(call print, "Flake hunting unit tests.")
+	while [ $$? -eq 0 ]; do make unit; done
+
+#? flakehunter-unit-race: Run all unit tests in race detector mode continuously until one fails
+flakehunter-unit-race: $(BTCD_BIN)
+	@$(call print, "Flake hunting unit tests in race detector mode.")
+	while [ $$? -eq 0 ]; do make unit-race; done
+
+#? flakehunter-itest-parallel: Run the integration tests continuously until one fails, running up to ITEST_PARALLELISM test tranches in parallel (default 4)
+flakehunter-itest-parallel:
 	@$(call print, "Flake hunting ${backend} integration tests in parallel.")
 	while [ $$? -eq 0 ]; do make itest-parallel tranches=1 parallel=${ITEST_PARALLELISM} icase='${icase}' backend='${backend}'; done
 
@@ -300,9 +351,9 @@ fuzz:
 # =========
 
 #? fmt: Format source code and fix imports
-fmt: $(GOIMPORTS_BIN)
+fmt:
 	@$(call print, "Fixing imports.")
-	gosimports -w $(GOFILES_NOVENDOR)
+	$(GOTOOL) $(GOIMPORTS_PKG) -w $(GOFILES_NOVENDOR) 
 	@$(call print, "Formatting source.")
 	gofmt -l -w -s $(GOFILES_NOVENDOR)
 
@@ -327,10 +378,28 @@ check-go-version: check-go-version-dockerfile check-go-version-yaml
 #? lint-source: Run static code analysis
 lint-source: docker-tools
 	@$(call print, "Linting source.")
-	$(DOCKER_TOOLS) golangci-lint run -v $(LINT_WORKERS)
+	$(DOCKER_TOOLS_LINT) custom-gcl run -v $(LINT_WORKERS)
+
+#? lint-config-check: Verify that the lint config is up to date
+#  We use the official linter here not our custom one because for checking the
+#  config file it does not matter.
+lint-config-check:
+	@$(call print, "Checking lint config is up to date.")
+	$(GOTOOL) $(GOLINT_PKG) config verify -v
 
 #? lint: Run static code analysis
-lint: check-go-version lint-source
+lint: check-go-version lint-config-check lint-source
+
+#? build-native-linter: Build the custom golangci-lint binary natively
+build-native-linter:
+	@$(call print, "Building custom linter natively.")
+	cd tools && CGO_ENABLED=0 $(GOCC) tool $(GOLINT_PKG) custom
+
+#? lint-native: Run static code analysis without Docker (faster on macOS)
+lint-native: check-go-version lint-config-check build-native-linter
+	@$(call print, "Linting source (native).")
+	GOWORK=off ./tools/custom-gcl run -v $(LINT_WORKERS) \
+	  --new-from-rev=$$(git merge-base HEAD master)
 
 #? protolint: Lint proto files using protolint
 protolint:
@@ -358,6 +427,11 @@ list:
 help: Makefile
 	@$(call print, "Listing commands:")
 	@sed -n 's/^#?//p' $< | column -t -s ':' |  sort | sed -e 's/^/ /'
+
+#? backwards-compat-test: Run basic backwards compatibility test
+backwards-compat-test:
+	@$(call print, "Running backwards compatability test")
+	./scripts/bw-compatibility-test/test.sh
 
 #? sqlc: Generate sql models and queries in Go
 sqlc:
@@ -403,7 +477,7 @@ mobile-rpc:
 #? vendor: Create a vendor directory with all dependencies
 vendor:
 	@$(call print, "Re-creating vendor directory.")
-	rm -r vendor/; go mod vendor
+	rm -r vendor/; $(GOCC) mod vendor
 
 #? apple: Build mobile RPC stubs and project template for iOS and macOS
 apple: mobile-rpc
@@ -427,7 +501,7 @@ macos: mobile-rpc
 android: mobile-rpc
 	@$(call print, "Building Android library ($(ANDROID_BUILD)).")
 	mkdir -p $(ANDROID_BUILD_DIR)
-	$(GOMOBILE_BIN) bind -target=android -androidapi 21 -tags="mobile $(DEV_TAGS) $(RPC_TAGS)" -ldflags "$(RELEASE_LDFLAGS)" -v -o $(ANDROID_BUILD) $(MOBILE_PKG)
+	$(GOMOBILE_BIN) bind -target=android -androidapi 21 -tags="mobile $(DEV_TAGS) $(RPC_TAGS)" -ldflags "$(RELEASE_LDFLAGS) $(ANDROID_EXTLDFLAGS)" -v -o $(ANDROID_BUILD) $(MOBILE_PKG)
 
 #? mobile: Build mobile RPC stubs and project templates for iOS and Android
 mobile: ios android
@@ -444,6 +518,11 @@ clean-mobile:
 	@$(call print, "Cleaning autogenerated mobile RPC stubs.")
 	$(RM) -r mobile/build
 	$(RM) mobile/*_generated.go
+
+#? clean-docker-volumes: Remove Docker cache volumes used for local development
+clean-docker-volumes:
+	@$(call print, "Removing Docker cache volumes.")
+	docker volume rm lnd-go-build-cache lnd-go-mod-cache lnd-go-lint-cache 2>/dev/null || true
 
 .PHONY: all \
 	btcd \
@@ -463,6 +542,7 @@ clean-mobile:
 	flake-unit \
 	fmt \
 	lint \
+	lint-native \
 	list \
 	rpc \
 	rpc-format \
@@ -473,4 +553,5 @@ clean-mobile:
 	ios \
 	android \
 	mobile \
-	clean
+	clean \
+	clean-docker-volumes

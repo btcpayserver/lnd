@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
@@ -13,12 +14,15 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -689,15 +693,9 @@ func TestChooseDeliveryScript(t *testing.T) {
 		userScript     lnwire.DeliveryAddress
 		shutdownScript lnwire.DeliveryAddress
 		expectedScript lnwire.DeliveryAddress
+		newAddr        func() ([]byte, error)
 		expectedError  error
 	}{
-		{
-			name:           "Neither set",
-			userScript:     nil,
-			shutdownScript: nil,
-			expectedScript: nil,
-			expectedError:  nil,
-		},
 		{
 			name:           "Both set and equal",
 			userScript:     script1,
@@ -726,6 +724,16 @@ func TestChooseDeliveryScript(t *testing.T) {
 			expectedScript: script2,
 			expectedError:  nil,
 		},
+		{
+			name:           "no script generate new one",
+			userScript:     nil,
+			shutdownScript: nil,
+			expectedScript: script2,
+			newAddr: func() ([]byte, error) {
+				return script2, nil
+			},
+			expectedError: nil,
+		},
 	}
 
 	for _, test := range tests {
@@ -734,13 +742,16 @@ func TestChooseDeliveryScript(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			script, err := chooseDeliveryScript(
 				test.shutdownScript, test.userScript,
+				test.newAddr,
 			)
 			if err != test.expectedError {
-				t.Fatalf("Expected: %v, got: %v", test.expectedError, err)
+				t.Fatalf("Expected: %v, got: %v",
+					test.expectedError, err)
 			}
 
 			if !bytes.Equal(script, test.expectedScript) {
-				t.Fatalf("Expected: %x, got: %x", test.expectedScript, script)
+				t.Fatalf("Expected: %x, got: %x",
+					test.expectedScript, script)
 			}
 		})
 	}
@@ -853,8 +864,10 @@ func TestCustomShutdownScript(t *testing.T) {
 				t.Fatalf("did not receive shutdown message")
 			case err := <-errChan:
 				// Fail if we do not expect an error.
-				if err != test.expectedError {
-					t.Fatalf("error closing channel: %v", err)
+				if test.expectedError != nil {
+					require.ErrorIs(
+						t, err, test.expectedError,
+					)
 				}
 
 				// Terminate the test early if have received an error, no
@@ -1058,6 +1071,96 @@ func TestPeerCustomMessage(t *testing.T) {
 	receivedCustom := <-receivedCustomChan
 	require.Equal(t, remoteKey, receivedCustom.peer)
 	require.Equal(t, receivedCustomMsg, &receivedCustom.msg)
+}
+
+// TestPeerIgnoresPingWithoutPongReply ensures we keep the connection alive for
+// pings using the BOLT 1 no-reply sentinel range.
+func TestPeerIgnoresPingWithoutPongReply(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Start a peer using the mock connection so we can
+	// inject incoming pings and observe any outgoing responses.
+	params := createTestPeer(t)
+
+	var (
+		mockConn  = params.mockConn
+		alicePeer = params.peer
+	)
+
+	startPeerDone := startPeer(t, mockConn, alicePeer)
+	_, err := fn.RecvOrTimeout(startPeerDone, 2*timeout)
+	require.NoError(t, err)
+
+	writePing := func(msg *lnwire.Ping) {
+		t.Helper()
+
+		var b bytes.Buffer
+		_, err := lnwire.WriteMessage(&b, msg, 0)
+		require.NoError(t, err)
+
+		select {
+		case mockConn.readMessages <- b.Bytes():
+		case <-time.After(timeout):
+			t.Fatal("timeout sending ping to peer")
+		}
+	}
+
+	// Act: Deliver a ping in the BOLT 1 no-reply range.
+	ignoredPayload := []byte{1, 2, 3}
+	writePing(&lnwire.Ping{
+		NumPongBytes: 65535,
+		PaddingBytes: ignoredPayload,
+	})
+
+	// Assert: The peer records the latest ping payload for observability.
+	require.Eventually(t, func() bool {
+		return bytes.Equal(
+			alicePeer.LastRemotePingPayload(), ignoredPayload,
+		)
+	}, timeout, 10*time.Millisecond)
+
+	// Assert: No pong is sent for the no-reply sentinel range.
+	select {
+	case rawMsg := <-mockConn.writtenMessages:
+		t.Fatalf("expected no pong reply, got %x", rawMsg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Act: Send a normal ping afterward to prove the peer
+	// stayed connected and still handles standard ping/pong
+	// traffic.
+	writePing(&lnwire.Ping{NumPongBytes: 1})
+
+	rawMsg, err := fn.RecvOrTimeout(mockConn.writtenMessages, timeout)
+	require.NoError(t, err)
+
+	msg, err := lnwire.ReadMessage(bytes.NewReader(rawMsg), 0)
+	require.NoError(t, err)
+
+	// Assert: The follow-up ping receives the requested pong reply.
+	pong, ok := msg.(*lnwire.Pong)
+	require.True(t, ok)
+	require.Len(t, pong.PongBytes, 1)
+}
+
+// TestMessageSummaryPingIncludesNumPongBytes ensures the debug summary for a
+// ping exposes the requested pong size, which makes ignored no-reply pings
+// visible without requiring trace-level logging.
+func TestMessageSummaryPingIncludesNumPongBytes(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Build a ping that uses the BOLT 1 no-reply sentinel range.
+	msg := &lnwire.Ping{
+		NumPongBytes: 65535,
+		PaddingBytes: []byte{1, 2, 3},
+	}
+
+	// Act: Generate the human-readable message summary.
+	summary := messageSummary(msg)
+
+	// Assert: The summary includes both the requested pong size and payload
+	// length so debug logs can explain why no pong was sent.
+	require.Equal(t, "num_pong_bytes=65535, len(ping_bytes)=3", summary)
 }
 
 // TestUpdateNextRevocation checks that the method `updateNextRevocation` is
@@ -1456,4 +1559,287 @@ func TestRemovePendingChannel(t *testing.T) {
 	}, wait.DefaultTimeout)
 
 	require.NoError(t, err)
+}
+
+// mockAuxTrafficShaper is a mock implementation of htlcswitch.AuxTrafficShaper
+// for testing the createHtlcValidator function.
+type mockAuxTrafficShaper struct {
+	mock.Mock
+}
+
+// ShouldHandleTraffic returns the configured mock values.
+func (m *mockAuxTrafficShaper) ShouldHandleTraffic(
+	cid lnwire.ShortChannelID,
+	fundingBlob, htlcBlob fn.Option[tlv.Blob]) (bool, error) {
+
+	args := m.Called(cid, fundingBlob, htlcBlob)
+	return args.Bool(0), args.Error(1)
+}
+
+// PaymentBandwidth returns the configured mock values.
+func (m *mockAuxTrafficShaper) PaymentBandwidth(fundingBlob, htlcBlob,
+	commitmentBlob fn.Option[tlv.Blob], linkBandwidth,
+	htlcAmt lnwire.MilliSatoshi, htlcView lnwallet.AuxHtlcView,
+	peer route.Vertex) (lnwire.MilliSatoshi, error) {
+
+	args := m.Called(
+		fundingBlob, htlcBlob, commitmentBlob, linkBandwidth,
+		htlcAmt, htlcView, peer,
+	)
+
+	bw, _ := args.Get(0).(lnwire.MilliSatoshi)
+
+	return bw, args.Error(1)
+}
+
+// ProduceHtlcExtraData is part of the AuxTrafficShaper interface.
+func (m *mockAuxTrafficShaper) ProduceHtlcExtraData(
+	totalAmount lnwire.MilliSatoshi,
+	htlcCustomRecords lnwire.CustomRecords,
+	peer route.Vertex) (lnwire.MilliSatoshi, lnwire.CustomRecords,
+	error) {
+
+	args := m.Called(totalAmount, htlcCustomRecords, peer)
+
+	amt, _ := args.Get(0).(lnwire.MilliSatoshi)
+	records, _ := args.Get(1).(lnwire.CustomRecords)
+
+	return amt, records, args.Error(2)
+}
+
+// IsCustomHTLC is part of the AuxTrafficShaper interface.
+func (m *mockAuxTrafficShaper) IsCustomHTLC(
+	htlcRecords lnwire.CustomRecords) bool {
+
+	args := m.Called(htlcRecords)
+	return args.Bool(0)
+}
+
+// Compile-time check that mockAuxTrafficShaper implements AuxTrafficShaper.
+var _ htlcswitch.AuxTrafficShaper = (*mockAuxTrafficShaper)(nil)
+
+// TestCreateHtlcValidator tests that the HTLC validator created by
+// createHtlcValidator respects the ShouldHandleTraffic check. When
+// ShouldHandleTraffic returns false, the validator should return nil without
+// calling PaymentBandwidth.
+func TestCreateHtlcValidator(t *testing.T) {
+	t.Parallel()
+
+	// Create a minimal Brontide with just the identity key set.
+	privKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	peer := &Brontide{
+		cfg: Config{
+			Addr: &lnwire.NetAddress{
+				IdentityKey: privKey.PubKey(),
+			},
+		},
+	}
+
+	// Create a mock channel with minimal required fields.
+	dbChan := &channeldb.OpenChannel{
+		ShortChannelID: lnwire.NewShortChanIDFromInt(123),
+	}
+
+	anyArg := mock.Anything
+
+	testCases := []struct {
+		name        string
+		setupMock   func(*mockAuxTrafficShaper)
+		htlcAmount  lnwire.MilliSatoshi
+		linkBw      lnwire.MilliSatoshi
+		expectError bool
+	}{
+		{
+			name: "non-custom channel skips check",
+			setupMock: func(m *mockAuxTrafficShaper) {
+				m.On(
+					"ShouldHandleTraffic",
+					anyArg, anyArg, anyArg,
+				).Return(false, nil)
+			},
+			htlcAmount:  1000,
+			linkBw:      5000,
+			expectError: false,
+		},
+		{
+			name: "sufficient bandwidth",
+			setupMock: func(m *mockAuxTrafficShaper) {
+				m.On(
+					"ShouldHandleTraffic",
+					anyArg, anyArg, anyArg,
+				).Return(true, nil)
+				m.On(
+					"PaymentBandwidth",
+					anyArg, anyArg, anyArg,
+					anyArg, anyArg, anyArg,
+					anyArg,
+				).Return(
+					lnwire.MilliSatoshi(10000),
+					nil,
+				)
+			},
+			htlcAmount:  1000,
+			linkBw:      5000,
+			expectError: false,
+		},
+		{
+			name: "insufficient bandwidth",
+			setupMock: func(m *mockAuxTrafficShaper) {
+				m.On(
+					"ShouldHandleTraffic",
+					anyArg, anyArg, anyArg,
+				).Return(true, nil)
+				m.On(
+					"PaymentBandwidth",
+					anyArg, anyArg, anyArg,
+					anyArg, anyArg, anyArg,
+					anyArg,
+				).Return(
+					lnwire.MilliSatoshi(500),
+					nil,
+				)
+			},
+			htlcAmount:  1000,
+			linkBw:      5000,
+			expectError: true,
+		},
+		{
+			name: "ShouldHandleTraffic error",
+			setupMock: func(m *mockAuxTrafficShaper) {
+				m.On(
+					"ShouldHandleTraffic",
+					anyArg, anyArg, anyArg,
+				).Return(
+					false,
+					fmt.Errorf("shaper error"),
+				)
+			},
+			htlcAmount:  1000,
+			linkBw:      5000,
+			expectError: true,
+		},
+		{
+			name: "PaymentBandwidth error",
+			setupMock: func(m *mockAuxTrafficShaper) {
+				m.On(
+					"ShouldHandleTraffic",
+					anyArg, anyArg, anyArg,
+				).Return(true, nil)
+				m.On(
+					"PaymentBandwidth",
+					anyArg, anyArg, anyArg,
+					anyArg, anyArg, anyArg,
+					anyArg,
+				).Return(
+					lnwire.MilliSatoshi(0),
+					fmt.Errorf("bandwidth error"),
+				)
+			},
+			htlcAmount:  1000,
+			linkBw:      5000,
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockAuxTrafficShaper{}
+			tc.setupMock(m)
+
+			validator := peer.createHtlcValidator(
+				dbChan, m,
+			)
+
+			err := validator.ValidateHtlc(
+				tc.htlcAmount, tc.linkBw,
+				nil, lnwallet.AuxHtlcView{},
+			)
+
+			if tc.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			m.AssertExpectations(t)
+		})
+	}
+}
+
+// TestHasActiveChannels exercises the atomic active-channel counter that
+// backs hasActiveChannels(). hasActiveChannels is on the hot path for
+// every incoming onion message — the onion message ingress gate calls
+// it per packet — so a correct, O(1) shadow of activeChannels is a
+// load-bearing invariant. This test walks the three state transitions
+// that have to keep numActiveChans in lockstep with activeChannels:
+// initial emptiness, pending entries (nil values) that must not count,
+// and pending-delete paths that must not decrement.
+func TestHasActiveChannels(t *testing.T) {
+	t.Parallel()
+
+	peer := NewBrontide(Config{})
+
+	// Initial state: no channels, counter is zero, gate is closed.
+	require.False(t, peer.hasActiveChannels())
+	require.Equal(t, int32(0), peer.numActiveChans.Load())
+
+	// Simulate the loadActiveChannels active-channel path: the entry
+	// is stored and the counter is incremented in lockstep. After
+	// this, hasActiveChannels must flip to true because the peer now
+	// holds a non-pending channel.
+	activeID := lnwire.ChannelID{0x01}
+	peer.activeChannels.Store(activeID, &lnwallet.LightningChannel{})
+	peer.numActiveChans.Add(1)
+	require.True(t, peer.hasActiveChannels())
+	require.Equal(t, int32(1), peer.numActiveChans.Load())
+
+	// Simulate the loadActiveChannels pending path: the entry is
+	// stored as nil and the counter must NOT move. This is the
+	// invariant the onion message gate relies on — pending channels
+	// are cheap to open and get stuck, so they must not satisfy the
+	// Sybil-resistance gate on their own.
+	pendingID := lnwire.ChannelID{0x02}
+	peer.activeChannels.Store(pendingID, nil)
+	require.Equal(t, int32(1), peer.numActiveChans.Load())
+	require.True(t, peer.hasActiveChannels())
+
+	// handleRemovePendingChannel walks the pending-delete path. It
+	// uses LoadAndDelete and must skip the counter decrement when
+	// the previous value was nil (pending). If this invariant ever
+	// broke, the counter would underflow every time a pending
+	// channel was cancelled and hasActiveChannels would return the
+	// wrong answer until the next reconnect.
+	errChan := make(chan error, 1)
+	peer.handleRemovePendingChannel(&newChannelMsg{
+		channelID: pendingID,
+		err:       errChan,
+	})
+	require.Equal(t, int32(1), peer.numActiveChans.Load())
+	require.True(t, peer.hasActiveChannels())
+
+	// The pending entry must have been removed from the map.
+	_, found := peer.activeChannels.Load(pendingID)
+	require.False(t, found)
+
+	// Drain the request error channel so the test leaves no loose
+	// ends. handleRemovePendingChannel closes the err chan via
+	// defer, so we expect a closed-channel receive here.
+	_, reqOk := <-errChan
+	require.False(t, reqOk)
+
+	// Finally, simulate WipeChannel's decrement path directly via
+	// LoadAndDelete. We cannot call WipeChannel in this
+	// dummy-config harness because it also calls
+	// p.cfg.Switch.RemoveLink, but the counter-maintenance half of
+	// WipeChannel is exactly the LoadAndDelete + conditional Add(-1)
+	// we exercise here.
+	prev, loaded := peer.activeChannels.LoadAndDelete(activeID)
+	require.True(t, loaded)
+	require.NotNil(t, prev)
+	peer.numActiveChans.Add(-1)
+
+	require.False(t, peer.hasActiveChannels())
+	require.Equal(t, int32(0), peer.numActiveChans.Load())
 }

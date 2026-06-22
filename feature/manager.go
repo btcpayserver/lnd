@@ -63,8 +63,23 @@ type Config struct {
 	// NoRouteBlinding unsets route blinding feature bits.
 	NoRouteBlinding bool
 
+	// NoQuiescence unsets quiescence feature bits.
+	NoQuiescence bool
+
 	// NoTaprootOverlay unsets the taproot overlay channel feature bits.
 	NoTaprootOverlay bool
+
+	// NoExperimentalAccountability unsets any bits that signal support for
+	// forwarding experimental accountability.
+	NoExperimentalAccountability bool
+
+	// NoRbfCoopClose unsets any bits that signal support for using RBF for
+	// coop close.
+	NoRbfCoopClose bool
+
+	// NoOnionMessages unsets any bits that signal support for onion
+	// messaging.
+	NoOnionMessages bool
 
 	// CustomFeatures is a set of custom features to advertise in each
 	// set.
@@ -188,6 +203,8 @@ func newManager(cfg Config, desc setDesc) (*Manager, error) {
 		if cfg.NoTaprootChans {
 			raw.Unset(lnwire.SimpleTaprootChannelsOptionalStaging)
 			raw.Unset(lnwire.SimpleTaprootChannelsRequiredStaging)
+			raw.Unset(lnwire.SimpleTaprootChannelsOptionalFinal)
+			raw.Unset(lnwire.SimpleTaprootChannelsRequiredFinal)
 		}
 		if cfg.NoRouteBlinding {
 			raw.Unset(lnwire.RouteBlindingOptional)
@@ -195,10 +212,26 @@ func newManager(cfg Config, desc setDesc) (*Manager, error) {
 			raw.Unset(lnwire.Bolt11BlindedPathsOptional)
 			raw.Unset(lnwire.Bolt11BlindedPathsRequired)
 		}
+		if cfg.NoQuiescence {
+			raw.Unset(lnwire.QuiescenceOptional)
+		}
 		if cfg.NoTaprootOverlay {
 			raw.Unset(lnwire.SimpleTaprootOverlayChansOptional)
 			raw.Unset(lnwire.SimpleTaprootOverlayChansRequired)
 		}
+		if cfg.NoExperimentalAccountability {
+			raw.Unset(lnwire.ExperimentalAccountabilityOptional)
+			raw.Unset(lnwire.ExperimentalAccountabilityRequired)
+		}
+		if cfg.NoRbfCoopClose {
+			raw.Unset(lnwire.RbfCoopCloseOptionalStaging)
+			raw.Unset(lnwire.RbfCoopCloseOptional)
+		}
+		if cfg.NoOnionMessages {
+			raw.Unset(lnwire.OnionMessagesOptional)
+			raw.Unset(lnwire.OnionMessagesRequired)
+		}
+
 		for _, custom := range cfg.CustomFeatures[set] {
 			if custom > set.Maximum() {
 				return nil, fmt.Errorf("feature bit: %v "+

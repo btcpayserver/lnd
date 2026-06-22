@@ -19,8 +19,9 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -260,6 +261,17 @@ type openChannelTlvData struct {
 	// customBlob is an optional TLV encoded blob of data representing
 	// custom channel funding information.
 	customBlob tlv.OptionalRecordT[tlv.TlvType7, tlv.Blob]
+
+	// confirmationHeight records the block height at which the funding
+	// transaction was first confirmed.
+	confirmationHeight tlv.RecordT[tlv.TlvType8, uint32]
+
+	// closeConfirmationHeight records the block height at which the closing
+	// transaction was first confirmed. This is used to calculate the
+	// remaining confirmations until the channel is considered fully closed.
+	// Note: if not set, it means either the channel has not been
+	// closed yet, or it was closed before this field was introduced.
+	closeConfirmationHeight tlv.OptionalRecordT[tlv.TlvType9, uint32]
 }
 
 // encode serializes the openChannelTlvData to the given io.Writer.
@@ -269,6 +281,7 @@ func (c *openChannelTlvData) encode(w io.Writer) error {
 		c.initialLocalBalance.Record(),
 		c.initialRemoteBalance.Record(),
 		c.realScid.Record(),
+		c.confirmationHeight.Record(),
 	}
 	c.memo.WhenSome(func(memo tlv.RecordT[tlv.TlvType5, []byte]) {
 		tlvRecords = append(tlvRecords, memo.Record())
@@ -281,6 +294,13 @@ func (c *openChannelTlvData) encode(w io.Writer) error {
 	c.customBlob.WhenSome(func(blob tlv.RecordT[tlv.TlvType7, tlv.Blob]) {
 		tlvRecords = append(tlvRecords, blob.Record())
 	})
+	c.closeConfirmationHeight.WhenSome(
+		func(h tlv.RecordT[tlv.TlvType9, uint32]) {
+			tlvRecords = append(tlvRecords, h.Record())
+		},
+	)
+
+	tlv.SortRecords(tlvRecords)
 
 	// Create the tlv stream.
 	tlvStream, err := tlv.NewStream(tlvRecords...)
@@ -296,6 +316,7 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 	memo := c.memo.Zero()
 	tapscriptRoot := c.tapscriptRoot.Zero()
 	blob := c.customBlob.Zero()
+	closeConfHeight := c.closeConfirmationHeight.Zero()
 
 	// Create the tlv stream.
 	tlvStream, err := tlv.NewStream(
@@ -306,6 +327,8 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 		memo.Record(),
 		tapscriptRoot.Record(),
 		blob.Record(),
+		c.confirmationHeight.Record(),
+		closeConfHeight.Record(),
 	)
 	if err != nil {
 		return err
@@ -325,6 +348,9 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 	if _, ok := tlvs[c.customBlob.TlvType()]; ok {
 		c.customBlob = tlv.SomeRecordT(blob)
 	}
+	if _, ok := tlvs[closeConfHeight.TlvType()]; ok {
+		c.closeConfirmationHeight = tlv.SomeRecordT(closeConfHeight)
+	}
 
 	return nil
 }
@@ -341,6 +367,37 @@ const (
 	// index.
 	outpointClosed indexStatus = 1
 )
+
+// isOutpointClosed reports whether the supplied chanKey has been flipped to
+// outpointClosed in the supplied outpointBucket. The flip is performed in the
+// same transaction as the rest of CloseChannel (sync and tombstone paths
+// alike), so a true result is the authoritative "this channel went through
+// CloseChannel" signal. On tombstone-enabled backends the chanBucket may still
+// exist on disk; readers consult this helper to skip those entries. Callers
+// fetch outpointBucket once and pass it in, which lets loop-style readers
+// hoist the bucket lookup out of the inner loop.
+func isOutpointClosed(opBucket kvdb.RBucket, chanKey []byte) (bool, error) {
+	if opBucket == nil {
+		return false, nil
+	}
+	raw := opBucket.Get(chanKey)
+	if raw == nil {
+		return false, nil
+	}
+
+	var status uint8
+	statusRecord := tlv.MakePrimitiveRecord(indexStatusType, &status)
+	stream, err := tlv.NewStream(statusRecord)
+	if err != nil {
+		return false, err
+	}
+	if err := stream.Decode(bytes.NewReader(raw)); err != nil {
+		return false, fmt.Errorf("decode outpoint status for "+
+			"chan_key=%x: %w", chanKey, err)
+	}
+
+	return indexStatus(status) == outpointClosed, nil
+}
 
 // ChannelType is an enum-like type that describes one of several possible
 // channel types. Each open channel is associated with a particular type as the
@@ -411,6 +468,11 @@ const (
 	// level tapscript commitment. This MUST be set along with the
 	// SimpleTaprootFeatureBit.
 	TapscriptRootBit ChannelType = 1 << 11
+
+	// TaprootFinalBit indicates that this is a MuSig2 channel using the
+	// final/production taproot scripts and feature bits 80/81. This MUST
+	// be set along with the SimpleTaprootFeatureBit.
+	TaprootFinalBit ChannelType = 1 << 12
 )
 
 // IsSingleFunder returns true if the channel type if one of the known single
@@ -485,6 +547,12 @@ func (c ChannelType) IsTaproot() bool {
 // root commitment.
 func (c ChannelType) HasTapscriptRoot() bool {
 	return c&TapscriptRootBit == TapscriptRootBit
+}
+
+// IsTaprootFinal returns true if the channel is using final/production taproot
+// scripts and feature bits.
+func (c ChannelType) IsTaprootFinal() bool {
+	return c&TaprootFinalBit == TaprootFinalBit
 }
 
 // ChannelStateBounds are the parameters from OpenChannel and AcceptChannel
@@ -737,6 +805,33 @@ func (c *ChannelCommitment) extractTlvData() commitTlvData {
 	return auxData
 }
 
+// copy returns a deep copy of the channel commitment.
+func (c *ChannelCommitment) copy() ChannelCommitment {
+	c2 := *c
+	if c.CommitTx != nil {
+		c2.CommitTx = c.CommitTx.Copy()
+	}
+	if len(c.CommitSig) > 0 {
+		c2.CommitSig = make([]byte, len(c.CommitSig))
+		copy(c2.CommitSig, c.CommitSig)
+	}
+
+	c.CustomBlob.WhenSome(func(blob tlv.Blob) {
+		blobCopy := make([]byte, len(blob))
+		copy(blobCopy, blob)
+		c2.CustomBlob = fn.Some(blobCopy)
+	})
+
+	if len(c.Htlcs) > 0 {
+		c2.Htlcs = make([]HTLC, len(c.Htlcs))
+		for i, h := range c.Htlcs {
+			c2.Htlcs[i] = h.Copy()
+		}
+	}
+
+	return c2
+}
+
 // ChannelStatus is a bit vector used to indicate whether an OpenChannel is in
 // the default usable state, or a state where it shouldn't be used.
 type ChannelStatus uint64
@@ -904,6 +999,18 @@ type OpenChannel struct {
 	// sub-systems to determine if a channel is stale and/or should have
 	// been confirmed before a certain height.
 	FundingBroadcastHeight uint32
+
+	// ConfirmationHeight records the block height at which the funding
+	// transaction was first confirmed.
+	ConfirmationHeight uint32
+
+	// CloseConfirmationHeight records the block height at which the closing
+	// transaction was first confirmed. This is used to track remaining
+	// confirmations until the channel is considered fully closed. It is
+	// None if the closing transaction has not yet been confirmed, or if
+	// this data was not available (e.g. channels closed before this
+	// field was introduced).
+	CloseConfirmationHeight fn.Option[uint32]
 
 	// NumConfsRequired is the number of confirmations a channel's funding
 	// transaction must have received in order to be considered available
@@ -1206,6 +1313,7 @@ func (c *OpenChannel) amendTlvData(auxData openChannelTlvData) {
 		auxData.initialRemoteBalance.Val,
 	)
 	c.confirmedScid = auxData.realScid.Val
+	c.ConfirmationHeight = auxData.confirmationHeight.Val
 
 	auxData.memo.WhenSomeV(func(memo []byte) {
 		c.Memo = memo
@@ -1215,6 +1323,9 @@ func (c *OpenChannel) amendTlvData(auxData openChannelTlvData) {
 	})
 	auxData.customBlob.WhenSomeV(func(blob tlv.Blob) {
 		c.CustomBlob = fn.Some(blob)
+	})
+	auxData.closeConfirmationHeight.WhenSomeV(func(h uint32) {
+		c.CloseConfirmationHeight = fn.Some(h)
 	})
 }
 
@@ -1233,6 +1344,9 @@ func (c *OpenChannel) extractTlvData() openChannelTlvData {
 		realScid: tlv.NewRecordT[tlv.TlvType4](
 			c.confirmedScid,
 		),
+		confirmationHeight: tlv.NewPrimitiveRecord[tlv.TlvType8](
+			c.ConfirmationHeight,
+		),
 	}
 
 	if len(c.Memo) != 0 {
@@ -1248,6 +1362,11 @@ func (c *OpenChannel) extractTlvData() openChannelTlvData {
 	c.CustomBlob.WhenSome(func(blob tlv.Blob) {
 		auxData.customBlob = tlv.SomeRecordT(
 			tlv.NewPrimitiveRecord[tlv.TlvType7](blob),
+		)
+	})
+	c.CloseConfirmationHeight.WhenSome(func(h uint32) {
+		auxData.closeConfirmationHeight = tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[tlv.TlvType9](h),
 		)
 	})
 
@@ -1330,10 +1449,23 @@ func fetchChanBucket(tx kvdb.RTx, nodeKey *btcec.PublicKey,
 	// With the bucket for the node and chain fetched, we can now go down
 	// another level, for this channel itself.
 	var chanPointBuf bytes.Buffer
-	if err := writeOutpoint(&chanPointBuf, outPoint); err != nil {
+	if err := graphdb.WriteOutpoint(&chanPointBuf, outPoint); err != nil {
 		return nil, err
 	}
-	chanBucket := chainBucket.NestedReadBucket(chanPointBuf.Bytes())
+	chanKey := chanPointBuf.Bytes()
+
+	// Treat already-closed channels as gone. The chanBucket may still
+	// exist on tombstone-enabled backends; the outpoint flip is the
+	// source of truth.
+	closed, err := isOutpointClosed(tx.ReadBucket(outpointBucket), chanKey)
+	if err != nil {
+		return nil, err
+	}
+	if closed {
+		return nil, ErrChannelNotFound
+	}
+
+	chanBucket := chainBucket.NestedReadBucket(chanKey)
 	if chanBucket == nil {
 		return nil, ErrChannelNotFound
 	}
@@ -1377,10 +1509,23 @@ func fetchChanBucketRw(tx kvdb.RwTx, nodeKey *btcec.PublicKey,
 	// With the bucket for the node and chain fetched, we can now go down
 	// another level, for this channel itself.
 	var chanPointBuf bytes.Buffer
-	if err := writeOutpoint(&chanPointBuf, outPoint); err != nil {
+	if err := graphdb.WriteOutpoint(&chanPointBuf, outPoint); err != nil {
 		return nil, err
 	}
-	chanBucket := chainBucket.NestedReadWriteBucket(chanPointBuf.Bytes())
+	chanKey := chanPointBuf.Bytes()
+
+	// Treat already-closed channels as gone. The chanBucket may still
+	// exist on tombstone-enabled backends; the outpoint flip is the
+	// source of truth.
+	closed, err := isOutpointClosed(tx.ReadBucket(outpointBucket), chanKey)
+	if err != nil {
+		return nil, err
+	}
+	if closed {
+		return nil, ErrChannelNotFound
+	}
+
+	chanBucket := chainBucket.NestedReadWriteBucket(chanKey)
 	if chanBucket == nil {
 		return nil, ErrChannelNotFound
 	}
@@ -1422,7 +1567,8 @@ func (c *OpenChannel) fullSync(tx kvdb.RwTx) error {
 	}
 
 	var chanPointBuf bytes.Buffer
-	if err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint); err != nil {
+	err := graphdb.WriteOutpoint(&chanPointBuf, &c.FundingOutpoint)
+	if err != nil {
 		return err
 	}
 
@@ -1497,6 +1643,76 @@ func (c *OpenChannel) fullSync(tx kvdb.RwTx) error {
 	}
 
 	return putOpenChannel(chanBucket, c)
+}
+
+// MarkConfirmationHeight updates the channel's confirmation height once the
+// channel opening transaction receives one confirmation.
+func (c *OpenChannel) MarkConfirmationHeight(height uint32) error {
+	c.Lock()
+	defer c.Unlock()
+
+	if err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		channel.ConfirmationHeight = height
+
+		return putOpenChannel(chanBucket, channel)
+	}, func() {}); err != nil {
+		return err
+	}
+
+	c.ConfirmationHeight = height
+
+	return nil
+}
+
+// ResetCloseConfirmationHeight clears the channel's close confirmation height
+// when the spending transaction is reorged out.
+func (c *OpenChannel) ResetCloseConfirmationHeight() error {
+	return c.MarkCloseConfirmationHeight(fn.None[uint32]())
+}
+
+// MarkCloseConfirmationHeight updates the channel's close confirmation height
+// when the closing transaction is first detected in a block (spend height).
+func (c *OpenChannel) MarkCloseConfirmationHeight(
+	height fn.Option[uint32]) error {
+
+	c.Lock()
+	defer c.Unlock()
+
+	if err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		channel.CloseConfirmationHeight = height
+
+		return putOpenChannel(chanBucket, channel)
+	}, func() {}); err != nil {
+		return err
+	}
+
+	c.CloseConfirmationHeight = height
+
+	return nil
 }
 
 // MarkAsOpen marks a channel as fully open given a locator that uniquely
@@ -1689,7 +1905,7 @@ var (
 
 // DeriveMusig2Shachain derives a shachain producer for the taproot channel
 // from normal shachain revocation root.
-func DeriveMusig2Shachain(revRoot shachain.Producer) (shachain.Producer, error) { //nolint:lll
+func DeriveMusig2Shachain(revRoot shachain.Producer) (shachain.Producer, error) { //nolint:ll
 	// In order to obtain the revocation root hash to create the taproot
 	// revocation, we'll encode the producer into a buffer, then use that
 	// to derive the shachain root needed.
@@ -1755,6 +1971,7 @@ func NewMusigVerificationNonce(pubKey *btcec.PublicKey, targetHeight uint64,
 // modify our typical chan sync message to ensure they force close even if
 // we're on the very first state.
 func (c *OpenChannel) ChanSyncMsg() (*lnwire.ChannelReestablish, error) {
+
 	c.Lock()
 	defer c.Unlock()
 
@@ -1813,7 +2030,10 @@ func (c *OpenChannel) ChanSyncMsg() (*lnwire.ChannelReestablish, error) {
 	// If this is a taproot channel, then we'll need to generate our next
 	// verification nonce to send to the remote party. They'll use this to
 	// sign the next update to our commitment transaction.
-	var nextTaprootNonce lnwire.OptMusig2NonceTLV
+	var (
+		nextTaprootNonce lnwire.OptMusig2NonceTLV
+		nextLocalNonces  lnwire.OptLocalNonces
+	)
 	if c.ChanType.IsTaproot() {
 		taprootRevProducer, err := DeriveMusig2Shachain(
 			c.RevocationProducer,
@@ -1831,7 +2051,21 @@ func (c *OpenChannel) ChanSyncMsg() (*lnwire.ChannelReestablish, error) {
 				"nonce: %w", err)
 		}
 
-		nextTaprootNonce = lnwire.SomeMusig2Nonce(nextNonce.PubNonce)
+		fundingTxid := c.FundingOutpoint.Hash
+		nonce := nextNonce.PubNonce
+
+		// Final taproot channels use the map-based LocalNonces
+		// field keyed by funding TXID. Staging channels use the
+		// legacy single LocalNonce field.
+		if c.ChanType.IsTaprootFinal() {
+			noncesMap := make(map[chainhash.Hash]lnwire.Musig2Nonce)
+			noncesMap[fundingTxid] = nonce
+			nextLocalNonces = lnwire.SomeLocalNonces(
+				lnwire.LocalNoncesData{NoncesMap: noncesMap},
+			)
+		} else {
+			nextTaprootNonce = lnwire.SomeMusig2Nonce(nonce)
+		}
 	}
 
 	return &lnwire.ChannelReestablish{
@@ -1844,7 +2078,8 @@ func (c *OpenChannel) ChanSyncMsg() (*lnwire.ChannelReestablish, error) {
 		LocalUnrevokedCommitPoint: input.ComputeCommitmentPoint(
 			currentCommitSecret[:],
 		),
-		LocalNonce: nextTaprootNonce,
+		LocalNonce:  nextTaprootNonce,
+		LocalNonces: nextLocalNonces,
 	}, nil
 }
 
@@ -3144,7 +3379,7 @@ func (c *OpenChannel) RemoteCommitChainTip() (*CommitDiff, error) {
 		return nil, err
 	}
 
-	return cd, err
+	return cd, nil
 }
 
 // UnsignedAckedUpdates retrieves the persisted unsigned acked remote log
@@ -3791,153 +4026,240 @@ type ChannelCloseSummary struct {
 	LastChanSyncMsg *lnwire.ChannelReestablish
 }
 
-// CloseChannel closes a previously active Lightning channel. Closing a channel
-// entails deleting all saved state within the database concerning this
-// channel. This method also takes a struct that summarizes the state of the
-// channel at closing, this compact representation will be the only component
-// of a channel left over after a full closing. It takes an optional set of
-// channel statuses which will be written to the historical channel bucket.
-// These statuses are used to record close initiators.
+// CloseChannel closes a previously active Lightning channel. Closing a
+// channel entails persisting a record of the close while either purging the
+// nested per-channel state inline (synchronous backends like bbolt and etcd)
+// or skipping the cascading delete on tombstone-enabled backends, where the
+// outpoint-index flip to outpointClosed is the authoritative marker. The
+// compact summary written to closedChannelBucket and the historical record
+// under historicalChannelBucket are populated identically across both paths,
+// so historical reads remain uniform regardless of backend. The optional set
+// of channel statuses is OR'd into the chanStatus written to the historical
+// bucket and is used to record close initiators.
 func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary,
 	statuses ...ChannelStatus) error {
 
 	c.Lock()
 	defer c.Unlock()
 
-	return kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
-		openChanBucket := tx.ReadWriteBucket(openChannelBucket)
-		if openChanBucket == nil {
-			return ErrNoChanDBExists
-		}
+	return c.Db.CloseChannel(c, summary, statuses...)
+}
 
-		nodePub := c.IdentityPub.SerializeCompressed()
-		nodeChanBucket := openChanBucket.NestedReadWriteBucket(nodePub)
-		if nodeChanBucket == nil {
-			return ErrNoActiveChannels
-		}
+// CloseChannel closes the supplied channel via the strategy selected at DB
+// construction. On synchronous backends the channel's nested state — the
+// revocation log, the per-channel forwarding-package bucket, and the
+// chanBucket itself — is deleted inline. On tombstone-enabled backends none
+// of the bulk state is touched; the outpointBucket flip to outpointClosed
+// signals that the channel is logically closed.
+func (c *ChannelStateDB) CloseChannel(channel *OpenChannel,
+	summary *ChannelCloseSummary, statuses ...ChannelStatus) error {
 
-		chainBucket := nodeChanBucket.NestedReadWriteBucket(c.ChainHash[:])
-		if chainBucket == nil {
-			return ErrNoActiveChannels
-		}
+	if c.tombstoneClosedChannels {
+		return c.closeChannelTombstone(channel, summary, statuses...)
+	}
 
-		var chanPointBuf bytes.Buffer
-		err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint)
+	return c.closeChannelSync(channel, summary, statuses...)
+}
+
+// locateOpenChannel performs the open-channel-bucket descent for a
+// CloseChannel transaction: it returns the chain bucket, the channel bucket,
+// and the serialized chanKey for the supplied OpenChannel. A chanKey already
+// flipped to outpointClosed surfaces ErrChannelNotFound so a redundant
+// CloseChannel does not re-archive or re-flip the index.
+func locateOpenChannel(tx kvdb.RwTx, channel *OpenChannel) (kvdb.RwBucket,
+	kvdb.RwBucket, []byte, error) {
+
+	openChanBucket := tx.ReadWriteBucket(openChannelBucket)
+	if openChanBucket == nil {
+		return nil, nil, nil, ErrNoChanDBExists
+	}
+
+	nodePub := channel.IdentityPub.SerializeCompressed()
+	nodeChanBucket := openChanBucket.NestedReadWriteBucket(nodePub)
+	if nodeChanBucket == nil {
+		return nil, nil, nil, ErrNoActiveChannels
+	}
+
+	chainBucket := nodeChanBucket.NestedReadWriteBucket(
+		channel.ChainHash[:],
+	)
+	if chainBucket == nil {
+		return nil, nil, nil, ErrNoActiveChannels
+	}
+
+	var chanPointBuf bytes.Buffer
+	if err := graphdb.WriteOutpoint(
+		&chanPointBuf, &channel.FundingOutpoint,
+	); err != nil {
+		return nil, nil, nil, err
+	}
+	chanKey := chanPointBuf.Bytes()
+
+	chanBucket := chainBucket.NestedReadWriteBucket(chanKey)
+	if chanBucket == nil {
+		return nil, nil, nil, ErrNoActiveChannels
+	}
+
+	// A channel whose outpoint is already flipped to outpointClosed must
+	// not be re-closed: on tombstone backends the chanBucket survives a
+	// previous close, but the index flip is the authoritative record that
+	// the channel is gone from the open-channel view.
+	closed, err := isOutpointClosed(tx.ReadBucket(outpointBucket), chanKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if closed {
+		return nil, nil, nil, ErrChannelNotFound
+	}
+
+	return chainBucket, chanBucket, chanKey, nil
+}
+
+// updateClosedOutpointIndex flips the outpoint index entry for chanKey from
+// open to closed. The index entry must already exist; it was placed there
+// when the channel was opened.
+func updateClosedOutpointIndex(tx kvdb.RwTx, chanKey []byte) error {
+	opBucket := tx.ReadWriteBucket(outpointBucket)
+	if opBucket == nil {
+		return ErrNoChanDBExists
+	}
+	if opBucket.Get(chanKey) == nil {
+		return ErrMissingIndexEntry
+	}
+
+	status := uint8(outpointClosed)
+	statusRecord := tlv.MakePrimitiveRecord(indexStatusType, &status)
+	opStream, err := tlv.NewStream(statusRecord)
+	if err != nil {
+		return err
+	}
+
+	var b bytes.Buffer
+	if err := opStream.Encode(&b); err != nil {
+		return err
+	}
+
+	return opBucket.Put(chanKey, b.Bytes())
+}
+
+// archiveClosedChannel writes the immutable close-time records of the
+// channel: a copy of the open-channel state under historicalChannelBucket
+// (with the supplied close statuses OR'd into chanStatus) and the close
+// summary under closeSummaryBucket.
+func archiveClosedChannel(tx kvdb.RwTx, chanKey []byte,
+	chanState *OpenChannel, summary *ChannelCloseSummary,
+	statuses ...ChannelStatus) error {
+
+	historicalBucket, err := tx.CreateTopLevelBucket(
+		historicalChannelBucket,
+	)
+	if err != nil {
+		return err
+	}
+	historicalChanBucket, err := historicalBucket.CreateBucketIfNotExists(
+		chanKey,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, s := range statuses {
+		chanState.chanStatus |= s
+	}
+
+	if err := putOpenChannel(historicalChanBucket, chanState); err != nil {
+		return err
+	}
+
+	return putChannelCloseSummary(tx, chanKey, summary, chanState)
+}
+
+// closeChannelSync performs the historical synchronous close path: in a
+// single write transaction it wipes the forwarding-package state, deletes
+// the channel bucket and its nested revocation log entries, updates the
+// outpoint index, and archives the close summary. It is used by backends
+// where nested-bucket deletion is cheap (bbolt, etcd).
+func (c *ChannelStateDB) closeChannelSync(channel *OpenChannel,
+	summary *ChannelCloseSummary, statuses ...ChannelStatus) error {
+
+	return kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
+		chainBucket, chanBucket, chanKey, err := locateOpenChannel(
+			tx, channel,
+		)
 		if err != nil {
 			return err
 		}
-		chanKey := chanPointBuf.Bytes()
-		chanBucket := chainBucket.NestedReadWriteBucket(
-			chanKey,
-		)
-		if chanBucket == nil {
-			return ErrNoActiveChannels
-		}
 
-		// Before we delete the channel state, we'll read out the full
-		// details, as we'll also store portions of this information
-		// for record keeping.
 		chanState, err := fetchOpenChannel(
-			chanBucket, &c.FundingOutpoint,
+			chanBucket, &channel.FundingOutpoint,
 		)
 		if err != nil {
 			return err
 		}
 
-		// Delete all the forwarding packages stored for this particular
-		// channel.
 		if err = chanState.Packager.Wipe(tx); err != nil {
 			return err
 		}
 
-		// Now that the index to this channel has been deleted, purge
-		// the remaining channel metadata from the database.
-		err = deleteOpenChannel(chanBucket)
-		if err != nil {
+		if err := deleteOpenChannel(chanBucket); err != nil {
 			return err
 		}
 
-		// We'll also remove the channel from the frozen channel bucket
-		// if we need to.
-		if c.ChanType.IsFrozen() || c.ChanType.HasLeaseExpiration() {
-			err := deleteThawHeight(chanBucket)
-			if err != nil {
+		if channel.ChanType.IsFrozen() ||
+			channel.ChanType.HasLeaseExpiration() {
+
+			if err := deleteThawHeight(chanBucket); err != nil {
 				return err
 			}
 		}
 
-		// With the base channel data deleted, attempt to delete the
-		// information stored within the revocation log.
 		if err := deleteLogBucket(chanBucket); err != nil {
 			return err
 		}
 
-		err = chainBucket.DeleteNestedBucket(chanPointBuf.Bytes())
+		if err := chainBucket.DeleteNestedBucket(chanKey); err != nil {
+			return err
+		}
+
+		if err := updateClosedOutpointIndex(tx, chanKey); err != nil {
+			return err
+		}
+
+		return archiveClosedChannel(
+			tx, chanKey, chanState, summary, statuses...,
+		)
+	}, func() {})
+}
+
+// closeChannelTombstone performs the tombstone close path used by
+// KV-over-SQL backends. The channel's per-channel state is left intact —
+// touching it would trigger the cascading nested-bucket delete this path
+// exists to avoid — and the outpointBucket flip from outpointOpen to
+// outpointClosed serves as the authoritative closed-channel marker. The
+// disk space is reclaimed wholesale by the upcoming native-SQL
+// channel-state migration.
+func (c *ChannelStateDB) closeChannelTombstone(channel *OpenChannel,
+	summary *ChannelCloseSummary, statuses ...ChannelStatus) error {
+
+	return kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
+		_, chanBucket, chanKey, err := locateOpenChannel(tx, channel)
 		if err != nil {
 			return err
 		}
 
-		// Fetch the outpoint bucket to see if the outpoint exists or
-		// not.
-		opBucket := tx.ReadWriteBucket(outpointBucket)
-		if opBucket == nil {
-			return ErrNoChanDBExists
-		}
-
-		// Add the closed outpoint to our outpoint index. This should
-		// replace an open outpoint in the index.
-		if opBucket.Get(chanPointBuf.Bytes()) == nil {
-			return ErrMissingIndexEntry
-		}
-
-		status := uint8(outpointClosed)
-
-		// Write the IndexStatus of this outpoint as the first entry in a tlv
-		// stream.
-		statusRecord := tlv.MakePrimitiveRecord(indexStatusType, &status)
-		opStream, err := tlv.NewStream(statusRecord)
-		if err != nil {
-			return err
-		}
-
-		var b bytes.Buffer
-		if err := opStream.Encode(&b); err != nil {
-			return err
-		}
-
-		// Finally add the closed outpoint and tlv stream to the index.
-		if err := opBucket.Put(chanPointBuf.Bytes(), b.Bytes()); err != nil {
-			return err
-		}
-
-		// Add channel state to the historical channel bucket.
-		historicalBucket, err := tx.CreateTopLevelBucket(
-			historicalChannelBucket,
+		chanState, err := fetchOpenChannel(
+			chanBucket, &channel.FundingOutpoint,
 		)
 		if err != nil {
 			return err
 		}
 
-		historicalChanBucket, err :=
-			historicalBucket.CreateBucketIfNotExists(chanKey)
-		if err != nil {
+		if err := updateClosedOutpointIndex(tx, chanKey); err != nil {
 			return err
 		}
 
-		// Apply any additional statuses to the channel state.
-		for _, status := range statuses {
-			chanState.chanStatus |= status
-		}
-
-		err = putOpenChannel(historicalChanBucket, chanState)
-		if err != nil {
-			return err
-		}
-
-		// Finally, create a summary of this channel in the closed
-		// channel bucket for this node.
-		return putChannelCloseSummary(
-			tx, chanPointBuf.Bytes(), summary, chanState,
+		return archiveClosedChannel(
+			tx, chanKey, chanState, summary, statuses...,
 		)
 	}, func() {})
 }
@@ -4015,6 +4337,78 @@ func (c *OpenChannel) Snapshot() *ChannelSnapshot {
 	}
 
 	return snapshot
+}
+
+// Copy returns a deep copy of the channel state.
+func (c *OpenChannel) Copy() *OpenChannel {
+	c.RLock()
+	defer c.RUnlock()
+
+	clone := &OpenChannel{
+		ChanType:                c.ChanType,
+		ChainHash:               c.ChainHash,
+		FundingOutpoint:         c.FundingOutpoint,
+		ShortChannelID:          c.ShortChannelID,
+		IsPending:               c.IsPending,
+		IsInitiator:             c.IsInitiator,
+		chanStatus:              c.chanStatus,
+		FundingBroadcastHeight:  c.FundingBroadcastHeight,
+		ConfirmationHeight:      c.ConfirmationHeight,
+		NumConfsRequired:        c.NumConfsRequired,
+		ChannelFlags:            c.ChannelFlags,
+		IdentityPub:             c.IdentityPub,
+		Capacity:                c.Capacity,
+		TotalMSatSent:           c.TotalMSatSent,
+		TotalMSatReceived:       c.TotalMSatReceived,
+		InitialLocalBalance:     c.InitialLocalBalance,
+		InitialRemoteBalance:    c.InitialRemoteBalance,
+		LocalChanCfg:            c.LocalChanCfg,
+		RemoteChanCfg:           c.RemoteChanCfg,
+		LocalCommitment:         c.LocalCommitment.copy(),
+		RemoteCommitment:        c.RemoteCommitment.copy(),
+		RemoteCurrentRevocation: c.RemoteCurrentRevocation,
+		RemoteNextRevocation:    c.RemoteNextRevocation,
+		RevocationProducer:      c.RevocationProducer,
+		RevocationStore:         c.RevocationStore,
+		Packager:                c.Packager,
+		ThawHeight:              c.ThawHeight,
+		LastWasRevoke:           c.LastWasRevoke,
+		RevocationKeyLocator:    c.RevocationKeyLocator,
+		confirmedScid:           c.confirmedScid,
+		TapscriptRoot:           c.TapscriptRoot,
+	}
+
+	if c.FundingTxn != nil {
+		clone.FundingTxn = c.FundingTxn.Copy()
+	}
+
+	if len(c.LocalShutdownScript) > 0 {
+		clone.LocalShutdownScript = make(
+			lnwire.DeliveryAddress,
+			len(c.LocalShutdownScript),
+		)
+		copy(clone.LocalShutdownScript, c.LocalShutdownScript)
+	}
+	if len(c.RemoteShutdownScript) > 0 {
+		clone.RemoteShutdownScript = make(
+			lnwire.DeliveryAddress,
+			len(c.RemoteShutdownScript),
+		)
+		copy(clone.RemoteShutdownScript, c.RemoteShutdownScript)
+	}
+
+	if len(c.Memo) > 0 {
+		clone.Memo = make([]byte, len(c.Memo))
+		copy(clone.Memo, c.Memo)
+	}
+
+	c.CustomBlob.WhenSome(func(blob tlv.Blob) {
+		blobCopy := make([]byte, len(blob))
+		copy(blobCopy, blob)
+		clone.CustomBlob = fn.Some(blobCopy)
+	})
+
+	return clone
 }
 
 // LatestCommitments returns the two latest commitments for both the local and
@@ -4100,6 +4494,34 @@ func (c *OpenChannel) AbsoluteThawHeight() (uint32, error) {
 	}
 
 	return c.ThawHeight, nil
+}
+
+// DeriveHeightHint derives the block height for the channel opening.
+func (c *OpenChannel) DeriveHeightHint() uint32 {
+	// As a height hint, we'll try to use the opening height, but if the
+	// channel isn't yet open, then we'll use the height it was broadcast
+	// at. This may be an unconfirmed zero-conf channel.
+	heightHint := c.ShortChanID().BlockHeight
+	if heightHint == 0 {
+		heightHint = c.BroadcastHeight()
+	}
+
+	// Since no zero-conf state is stored in a channel backup, the below
+	// logic will not be triggered for restored, zero-conf channels. Set
+	// the height hint for zero-conf channels.
+	if c.IsZeroConf() {
+		if c.ZeroConfConfirmed() {
+			// If the zero-conf channel is confirmed, we'll use the
+			// confirmed SCID's block height.
+			heightHint = c.ZeroConfRealScid().BlockHeight
+		} else {
+			// The zero-conf channel is unconfirmed. We'll need to
+			// use the FundingBroadcastHeight.
+			heightHint = c.BroadcastHeight()
+		}
+	}
+
+	return heightHint
 }
 
 func putChannelCloseSummary(tx kvdb.RwTx, chanID []byte,

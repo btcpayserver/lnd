@@ -75,17 +75,6 @@ http:
       delete: "/v1/channels/{channel_point.funding_txid_str}/{channel_point.output_index}"
     - selector: lnrpc.Lightning.AbandonChannel
       delete: "/v1/channels/abandon/{channel_point.funding_txid_str}/{channel_point.output_index}"
-    - selector: lnrpc.Lightning.SendPayment
-      post: "/v1/channels/transaction-stream"
-      body: "*"
-    - selector: lnrpc.Lightning.SendPaymentSync
-      post: "/v1/channels/transactions"
-      body: "*"
-    - selector: lnrpc.Lightning.SendToRoute
-      # deprecated, no REST endpoint
-    - selector: lnrpc.Lightning.SendToRouteSync
-      post: "/v1/channels/transactions/route"
-      body: "*"
     - selector: lnrpc.Lightning.AddInvoice
       post: "/v1/invoices"
       body: "*"
@@ -95,6 +84,8 @@ http:
       get: "/v1/invoice/{r_hash_str}"
     - selector: lnrpc.Lightning.SubscribeInvoices
       get: "/v1/invoices/subscribe"
+    - selector: lnrpc.Lightning.DeleteCanceledInvoice
+      delete: "/v1/invoices"
     - selector: lnrpc.Lightning.DecodePayReq
       get: "/v1/payreq/{pay_req}"
     - selector: lnrpc.Lightning.DeletePayment
@@ -164,7 +155,12 @@ http:
       post: "/v1/custommessage"
       body: "*"
     - selector: lnrpc.Lightning.SubscribeCustomMessages
-      get: "/v1/custommessage/subscribe"      
+      get: "/v1/custommessage/subscribe"
+    - selector: lnrpc.Lightning.SendOnionMessage
+      post: "/v1/onionmessage"
+      body: "*"
+    - selector: lnrpc.Lightning.SubscribeOnionMessages
+      get: "/v1/onionmessage/subscribe"    
     - selector: lnrpc.Lightning.ListAliases
       get: "/v1/aliases/list"
     - selector: lnrpc.Lightning.LookupHtlcResolution

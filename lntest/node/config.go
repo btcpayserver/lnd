@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/integration/rpctest"
@@ -28,6 +29,10 @@ const (
 )
 
 var (
+	// baseDirFlag is the default directory where all the node's data are
+	// saved. If not set, a temporary dir will be created.
+	baseDirFlag = flag.String("basedir", "", "default dir to save data")
+
 	// logOutput is a flag that can be set to append the output from the
 	// seed nodes to log files.
 	logOutput = flag.Bool("logoutput", false,
@@ -41,6 +46,46 @@ var (
 	btcdExecutable = flag.String(
 		"btcdexec", "", "full path to btcd binary",
 	)
+
+	// CfgLegacy specifies the config used to create a node that uses the
+	// legacy channel format.
+	CfgLegacy = []string{"--protocol.legacy.committweak"}
+
+	// CfgStaticRemoteKey specifies the config used to create a node that
+	// uses the static remote key feature.
+	CfgStaticRemoteKey = []string{}
+
+	// CfgAnchor specifies the config used to create a node that uses the
+	// anchor output feature.
+	CfgAnchor = []string{"--protocol.anchors"}
+
+	// CfgLeased specifies the config used to create a node that uses the
+	// leased channel feature.
+	CfgLeased = []string{
+		"--protocol.anchors",
+		"--protocol.script-enforced-lease",
+	}
+
+	// CfgSimpleTaproot specifies the config used to create a node that
+	// uses the simple taproot feature.
+	CfgSimpleTaproot = []string{
+		"--protocol.anchors",
+		"--protocol.simple-taproot-chans",
+	}
+
+	// CfgRbfCoopClose specifies the config used to create a node that
+	// supports the new RBF close protocol.
+	CfgRbfClose = []string{
+		"--protocol.rbf-coop-close",
+	}
+
+	// CfgZeroConf specifies the config used to create a node that uses the
+	// zero-conf channel feature.
+	CfgZeroConf = []string{
+		"--protocol.anchors",
+		"--protocol.option-scid-alias",
+		"--protocol.zero-conf",
+	}
 )
 
 type DatabaseBackend int
@@ -74,6 +119,9 @@ type BackendConfig interface {
 	// Credentials returns the rpc username, password and host for the
 	// backend.
 	Credentials() (string, string, string, error)
+
+	// P2PAddr return bitcoin p2p ip:port.
+	P2PAddr() (string, error)
 }
 
 // BaseNodeConfig is the base node configuration.
@@ -98,8 +146,9 @@ type BaseNodeConfig struct {
 	ReadMacPath    string
 	InvoiceMacPath string
 
-	SkipUnlock bool
-	Password   []byte
+	SkipUnlock        bool
+	Password          []byte
+	WithPeerBootstrap bool
 
 	P2PPort     int
 	RPCPort     int
@@ -118,6 +167,11 @@ type BaseNodeConfig struct {
 	// LndBinary is the full path to the lnd binary that was specifically
 	// compiled with all required itest flags.
 	LndBinary string
+
+	// SkipCleanup specifies whether the harness will remove the base dir or
+	// not when the test finishes. When using customized BaseDir, the
+	// cleanup will be skipped.
+	SkipCleanup bool
 
 	// backupDBDir is the path where a database backup is stored, if any.
 	backupDBDir string
@@ -180,6 +234,38 @@ func (cfg *BaseNodeConfig) BaseConfig() *BaseNodeConfig {
 	return cfg
 }
 
+// GenBaseDir creates a base dir that's used for the test.
+func (cfg *BaseNodeConfig) GenBaseDir() error {
+	// Exit early if the BaseDir is already set.
+	if cfg.BaseDir != "" {
+		return nil
+	}
+
+	dirBaseName := fmt.Sprintf("itest-%v-%v-%v-%v", cfg.LogFilenamePrefix,
+		cfg.Name, cfg.NodeID, time.Now().Unix())
+
+	// Create a temporary directory for the node's data and logs. Use dash
+	// suffix as a separator between base name and node ID.
+	if *baseDirFlag == "" {
+		var err error
+
+		cfg.BaseDir, err = os.MkdirTemp("", dirBaseName)
+
+		return err
+	}
+
+	// Create the customized base dir.
+	if err := os.MkdirAll(*baseDirFlag, 0700); err != nil {
+		return err
+	}
+
+	// Use customized base dir and skip the cleanups.
+	cfg.BaseDir = filepath.Join(*baseDirFlag, dirBaseName)
+	cfg.SkipCleanup = true
+
+	return nil
+}
+
 // GenArgs generates a slice of command line arguments from the lightning node
 // config struct.
 func (cfg *BaseNodeConfig) GenArgs() []string {
@@ -188,6 +274,8 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 	switch cfg.NetParams {
 	case &chaincfg.TestNet3Params:
 		args = append(args, "--bitcoin.testnet")
+	case &chaincfg.TestNet4Params:
+		args = append(args, "--bitcoin.testnet4")
 	case &chaincfg.SimNetParams:
 		args = append(args, "--bitcoin.simnet")
 	case &chaincfg.RegressionNetParams:
@@ -198,11 +286,11 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 	args = append(args, backendArgs...)
 
 	nodeArgs := []string{
-		"--nobootstrap",
 		"--debuglevel=debug",
 		"--bitcoin.defaultchanconfs=1",
 		"--accept-keysend",
 		"--keep-failed-payment-attempts",
+		"--logging.no-commit-hash",
 		fmt.Sprintf("--db.batch-commit-interval=%v", commitInterval),
 		fmt.Sprintf("--bitcoin.defaultremotedelay=%v", DefaultCSV),
 		fmt.Sprintf("--rpclisten=%v", cfg.RPCAddr()),
@@ -215,7 +303,6 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 		fmt.Sprintf("--readonlymacaroonpath=%v", cfg.ReadMacPath),
 		fmt.Sprintf("--invoicemacaroonpath=%v", cfg.InvoiceMacPath),
 		fmt.Sprintf("--trickledelay=%v", trickleDelay),
-		fmt.Sprintf("--profile=%d", cfg.ProfilePort),
 
 		// Use a small batch delay so we can broadcast the
 		// announcements quickly in the tests.
@@ -237,6 +324,10 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 
 	if cfg.Password == nil {
 		args = append(args, "--noseedbackup")
+	}
+
+	if !cfg.WithPeerBootstrap {
+		args = append(args, "--nobootstrap")
 	}
 
 	switch cfg.DBBackend {

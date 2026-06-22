@@ -1,7 +1,6 @@
 package invoices_test
 
 import (
-	"context"
 	"crypto/rand"
 	"database/sql"
 	"fmt"
@@ -11,9 +10,9 @@ import (
 	"time"
 
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/feature"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	invpkg "github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -166,6 +165,10 @@ func TestInvoices(t *testing.T) {
 		{
 			name: "FetchPendingInvoices",
 			test: testFetchPendingInvoices,
+		},
+		{
+			name: "FetchPendingInvoicesAccepted",
+			test: testFetchPendingInvoicesAccepted,
 		},
 		{
 			name: "DuplicateSettleInvoice",
@@ -373,7 +376,7 @@ func testInvoiceWorkflowImpl(t *testing.T, test invWorkflowTest,
 		ref = invpkg.InvoiceRefByHash(payHash)
 	}
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	// Add the invoice to the database, this should succeed as there aren't
 	// any existing invoices within the database with the same payment
 	// hash.
@@ -498,7 +501,7 @@ func testAddDuplicatePayAddr(t *testing.T,
 	require.NoError(t, err)
 	invoice2.Terms.PaymentAddr = invoice1.Terms.PaymentAddr
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// First insert should succeed.
 	inv1Hash := invoice1.Terms.PaymentPreimage.Hash()
@@ -529,7 +532,7 @@ func testAddDuplicateKeysendPayAddr(t *testing.T,
 	require.NoError(t, err)
 	invoice2.Terms.PaymentAddr = invpkg.BlankPayAddr
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// Inserting both should succeed without a duplicate payment address
 	// failure.
@@ -573,7 +576,7 @@ func testFailInvoiceLookupMPPPayAddrOnly(t *testing.T,
 	payHash := invoice.Terms.PaymentPreimage.Hash()
 	payAddr := invoice.Terms.PaymentAddr
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	_, err = db.AddInvoice(ctxb, invoice, payHash)
 	require.NoError(t, err)
 
@@ -601,7 +604,7 @@ func testInvRefEquivocation(t *testing.T,
 	invoice1, err := randInvoice(1000)
 	require.NoError(t, err)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	inv1Hash := invoice1.Terms.PaymentPreimage.Hash()
 	_, err = db.AddInvoice(ctxb, invoice1, inv1Hash)
 	require.NoError(t, err)
@@ -651,7 +654,7 @@ func testInvoiceCancelSingleHtlc(t *testing.T,
 		},
 	}
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	if _, err := db.AddInvoice(ctxb, testInvoice, paymentHash); err != nil {
 		t.Fatalf("unable to find invoice: %v", err)
 	}
@@ -729,7 +732,7 @@ func testInvoiceCancelSingleHtlcAMP(t *testing.T,
 	// preimages.
 	invoice.Terms.Features = ampFeatures
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	preimage := *invoice.Terms.PaymentPreimage
 	payHash := preimage.Hash()
 	_, err = db.AddInvoice(ctxb, invoice, payHash)
@@ -898,7 +901,7 @@ func testInvoiceAddTimeSeries(t *testing.T,
 	t.Parallel()
 	db := makeDB(t)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	_, err := db.InvoicesAddedSince(ctxb, 0)
 	require.NoError(t, err)
 
@@ -1073,7 +1076,7 @@ func testSettleIndexAmpPayments(t *testing.T,
 
 	// Add the invoice to the DB, we use a dummy payment hash here but the
 	// invoice will have a valid payment address set.
-	ctxb := context.Background()
+	ctxb := t.Context()
 	preimage := *testInvoice.Terms.PaymentPreimage
 	payHash := preimage.Hash()
 	_, err = db.AddInvoice(ctxb, testInvoice, payHash)
@@ -1236,7 +1239,7 @@ func testFetchPendingInvoices(t *testing.T,
 	t.Parallel()
 	db := makeDB(t)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// Make sure that fetching pending invoices from an empty database
 	// returns an empty result and no errors.
@@ -1289,6 +1292,115 @@ func testFetchPendingInvoices(t *testing.T,
 	require.Equal(t, pendingInvoices, pending)
 }
 
+// testFetchPendingInvoicesAccepted verifies that FetchPendingInvoices returns
+// invoices in both ContractOpen (state 0) and ContractAccepted (state 3)
+// states, and that ContractSettled (state 1) and ContractCanceled (state 2)
+// invoices are excluded. This specifically exercises the `state IN (0, 3)`
+// predicate in the underlying SQL query.
+func testFetchPendingInvoicesAccepted(t *testing.T,
+	makeDB func(t *testing.T) invpkg.InvoiceDB) {
+
+	t.Parallel()
+	db := makeDB(t)
+	ctxb := t.Context()
+
+	amt := lnwire.MilliSatoshi(1000)
+
+	// Add an invoice that stays in ContractOpen state.
+	openInvoice, err := randInvoice(amt)
+	require.NoError(t, err)
+	openHash := openInvoice.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(ctxb, openInvoice, openHash)
+	require.NoError(t, err)
+
+	// Add a second invoice and transition it to ContractAccepted by
+	// adding an HTLC while setting the new invoice state in a single
+	// UpdateInvoice call (addHTLCs processes the HTLC list before
+	// validating the state transition, so the empty-set check passes).
+	acceptedInvoice, err := randInvoice(amt)
+	require.NoError(t, err)
+	acceptedHash := acceptedInvoice.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(ctxb, acceptedInvoice, acceptedHash)
+	require.NoError(t, err)
+
+	acceptKey := models.CircuitKey{HtlcID: 1}
+	acceptRef := invpkg.InvoiceRefByHash(acceptedHash)
+	addHtlcs := map[models.CircuitKey]*invpkg.HtlcAcceptDesc{
+		acceptKey: {
+			Amt: amt,
+			CustomRecords: make(
+				record.CustomSet,
+			),
+		},
+	}
+	dbAccepted, err := db.UpdateInvoice(
+		ctxb, acceptRef, nil,
+		func(inv *invpkg.Invoice) (*invpkg.InvoiceUpdateDesc, error) {
+			return &invpkg.InvoiceUpdateDesc{
+				UpdateType: invpkg.AddHTLCsUpdate,
+				State: &invpkg.InvoiceStateUpdateDesc{
+					NewState: invpkg.ContractAccepted,
+				},
+				AddHtlcs: addHtlcs,
+			}, nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractAccepted, dbAccepted.State)
+
+	// Add a settled invoice – it must NOT appear in the pending result.
+	settledInvoice, err := randInvoice(amt)
+	require.NoError(t, err)
+	settledHash := settledInvoice.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(ctxb, settledInvoice, settledHash)
+	require.NoError(t, err)
+	_, err = db.UpdateInvoice(
+		ctxb, invpkg.InvoiceRefByHash(settledHash), nil,
+		getUpdateInvoice(2, amt),
+	)
+	require.NoError(t, err)
+
+	// Add a canceled invoice – it must also NOT appear in the pending
+	// result, verifying that state 2 (ContractCanceled) is excluded by
+	// the `state IN (0, 3)` SQL predicate.
+	canceledInvoice, err := randInvoice(amt)
+	require.NoError(t, err)
+	canceledHash := canceledInvoice.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(ctxb, canceledInvoice, canceledHash)
+	require.NoError(t, err)
+	_, err = db.UpdateInvoice(
+		ctxb, invpkg.InvoiceRefByHash(canceledHash), nil,
+		func(inv *invpkg.Invoice) (*invpkg.InvoiceUpdateDesc, error) {
+			return &invpkg.InvoiceUpdateDesc{
+				UpdateType: invpkg.CancelInvoiceUpdate,
+				State: &invpkg.InvoiceStateUpdateDesc{
+					NewState: invpkg.ContractCanceled,
+				},
+			}, nil
+		},
+	)
+	require.NoError(t, err)
+
+	// FetchPendingInvoices must return exactly the two pending invoices.
+	pending, err := db.FetchPendingInvoices(ctxb)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+
+	_, hasOpen := pending[openHash]
+	require.True(t, hasOpen, "ContractOpen invoice missing from results")
+
+	_, hasAccepted := pending[acceptedHash]
+	require.True(t, hasAccepted, "ContractAccepted invoice missing")
+
+	require.NotContains(t, pending, settledHash,
+		"ContractSettled invoice should not appear in pending results")
+	require.NotContains(t, pending, canceledHash,
+		"ContractCanceled invoice should not appear in pending results")
+
+	require.Equal(t, invpkg.ContractOpen, pending[openHash].State)
+	require.Equal(t, invpkg.ContractAccepted, pending[acceptedHash].State)
+}
+
 // testDuplicateSettleInvoice tests that if we add a new invoice and settle it
 // twice, then the second time we also receive the invoice that we settled as a
 // return argument.
@@ -1305,7 +1417,7 @@ func testDuplicateSettleInvoice(t *testing.T,
 
 	payHash := invoice.Terms.PaymentPreimage.Hash()
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	if _, err := db.AddInvoice(ctxb, invoice, payHash); err != nil {
 		t.Fatalf("unable to add invoice %v", err)
 	}
@@ -1372,7 +1484,7 @@ func testQueryInvoices(t *testing.T,
 		pendingInvoices []invpkg.Invoice
 	)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	for i := 1; i <= numInvoices; i++ {
 		amt := lnwire.MilliSatoshi(i)
 		invoice, err := randInvoice(amt)
@@ -1813,7 +1925,7 @@ func testCustomRecords(t *testing.T,
 		},
 	}
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	if _, err := db.AddInvoice(ctxb, testInvoice, paymentHash); err != nil {
 		t.Fatalf("unable to add invoice: %v", err)
 	}
@@ -1893,7 +2005,7 @@ func testInvoiceHtlcAMPFieldsImpl(t *testing.T, isAMP bool,
 		testInvoice.Terms.Features = ampFeatures
 	}
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	payHash := testInvoice.Terms.PaymentPreimage.Hash()
 	_, err = db.AddInvoice(ctxb, testInvoice, payHash)
 	require.Nil(t, err)
@@ -2101,7 +2213,7 @@ func testAddInvoiceWithHTLCs(t *testing.T,
 	testInvoice.Htlcs[key] = &invpkg.InvoiceHTLC{}
 
 	payHash := testInvoice.Terms.PaymentPreimage.Hash()
-	_, err = db.AddInvoice(context.Background(), testInvoice, payHash)
+	_, err = db.AddInvoice(t.Context(), testInvoice, payHash)
 	require.Equal(t, invpkg.ErrInvoiceHasHtlcs, err)
 }
 
@@ -2121,7 +2233,7 @@ func testSetIDIndex(t *testing.T, makeDB func(t *testing.T) invpkg.InvoiceDB) {
 	// preimages.
 	invoice.Terms.Features = ampFeatures
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	preimage := *invoice.Terms.PaymentPreimage
 	payHash := preimage.Hash()
 	_, err = db.AddInvoice(ctxb, invoice, payHash)
@@ -2460,7 +2572,7 @@ func testUnexpectedInvoicePreimage(t *testing.T,
 	invoice, err := randInvoice(lnwire.MilliSatoshi(100))
 	require.NoError(t, err)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// Add a random invoice indexed by payment hash and payment addr.
 	paymentHash := invoice.Terms.PaymentPreimage.Hash()
@@ -2530,7 +2642,7 @@ func testUpdateHTLCPreimagesImpl(t *testing.T, test updateHTLCPreimageTestCase,
 	// preimages.
 	invoice.Terms.Features = ampFeatures
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	_, err = db.AddInvoice(ctxb, invoice, payHash)
 	require.Nil(t, err)
 
@@ -2594,7 +2706,7 @@ func testDeleteInvoices(t *testing.T,
 	numInvoices := 3
 	invoicesToDelete := make([]invpkg.InvoiceDeleteRef, numInvoices)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	for i := 0; i < numInvoices; i++ {
 		invoice, err := randInvoice(lnwire.MilliSatoshi(i + 1))
 		require.NoError(t, err)
@@ -2689,7 +2801,7 @@ func testDeleteCanceledInvoices(t *testing.T,
 	}
 
 	// Test deletion of canceled invoices when there are none.
-	ctxb := context.Background()
+	ctxb := t.Context()
 	require.NoError(t, db.DeleteCanceledInvoices(ctxb))
 
 	// Add some invoices to the test db.
@@ -2750,7 +2862,7 @@ func testAddInvoiceInvalidFeatureDeps(t *testing.T,
 	)
 
 	hash := invoice.Terms.PaymentPreimage.Hash()
-	_, err = db.AddInvoice(context.Background(), invoice, hash)
+	_, err = db.AddInvoice(t.Context(), invoice, hash)
 	require.Error(t, err, feature.NewErrMissingFeatureDep(
 		lnwire.PaymentAddrOptional,
 	))

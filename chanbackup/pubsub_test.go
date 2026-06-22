@@ -1,6 +1,7 @@
 package chanbackup
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -62,8 +63,8 @@ func newMockChannelNotifier() *mockChannelNotifier {
 	}
 }
 
-func (m *mockChannelNotifier) SubscribeChans(chans map[wire.OutPoint]struct{}) (
-	*ChannelSubscription, error) {
+func (m *mockChannelNotifier) SubscribeChans(_ context.Context,
+	_ map[wire.OutPoint]struct{}) (*ChannelSubscription, error) {
 
 	if m.fail {
 		return nil, fmt.Errorf("fail")
@@ -80,6 +81,7 @@ func (m *mockChannelNotifier) SubscribeChans(chans map[wire.OutPoint]struct{}) (
 // channel subscription, then the entire sub-swapper will fail to start.
 func TestNewSubSwapperSubscribeFail(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	keyRing := &lnencrypt.MockKeyRing{}
 
@@ -88,10 +90,8 @@ func TestNewSubSwapperSubscribeFail(t *testing.T) {
 		fail: true,
 	}
 
-	_, err := NewSubSwapper(nil, &chanNotifier, keyRing, &swapper)
-	if err == nil {
-		t.Fatalf("expected fail due to lack of subscription")
-	}
+	_, err := NewSubSwapper(ctx, nil, &chanNotifier, keyRing, &swapper)
+	require.Error(t, err)
 }
 
 func assertExpectedBackupSwap(t *testing.T, swapper *mockSwapper,
@@ -158,7 +158,9 @@ func TestSubSwapperIdempotentStartStop(t *testing.T) {
 	var chanNotifier mockChannelNotifier
 
 	swapper := newMockSwapper(keyRing)
-	subSwapper, err := NewSubSwapper(nil, &chanNotifier, keyRing, swapper)
+	subSwapper, err := NewSubSwapper(
+		t.Context(), nil, &chanNotifier, keyRing, swapper,
+	)
 	require.NoError(t, err, "unable to init subSwapper")
 
 	if err := subSwapper.Start(); err != nil {
@@ -224,7 +226,7 @@ func TestSubSwapperUpdater(t *testing.T) {
 	// With our channel set created, we'll make a fresh sub swapper
 	// instance to begin our test.
 	subSwapper, err := NewSubSwapper(
-		initialChanSet, chanNotifier, keyRing, swapper,
+		t.Context(), initialChanSet, chanNotifier, keyRing, swapper,
 	)
 	require.NoError(t, err, "unable to make swapper")
 	if err := subSwapper.Start(); err != nil {
@@ -277,4 +279,18 @@ func TestSubSwapperUpdater(t *testing.T) {
 	// Verify that the new set of backups, now has one less after the
 	// sub-swapper switches the new set with the old.
 	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// Check ManualUpdate method.
+	channel, err := genRandomOpenChannelShell()
+	require.NoError(t, err)
+	single := NewSingle(channel, nil)
+	backupSet[channel.FundingOutpoint] = single
+	require.NoError(t, subSwapper.ManualUpdate([]Single{single}))
+
+	// Verify that the state of the backup is as expected.
+	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// Check the case ManualUpdate returns an error.
+	swapper.fail = true
+	require.Error(t, subSwapper.ManualUpdate([]Single{single}))
 }

@@ -58,6 +58,9 @@ type Config struct {
 
 	// WithTxLevelLock when set will ensure that there is a transaction
 	// level lock.
+	//
+	// NOTE: Temporary, should be removed when all parts of the LND code
+	// are more resilient against concurrent db access..
 	WithTxLevelLock bool
 }
 
@@ -79,14 +82,14 @@ type db struct {
 	// db is the underlying database connection instance.
 	db *sql.DB
 
-	// lock is the global write lock that ensures single writer. This is
-	// only used if cfg.WithTxLevelLock is set.
-	lock sync.RWMutex
-
 	// table is the name of the table that contains the data for all
 	// top-level buckets that have keys that cannot be mapped to a distinct
 	// sql table.
 	table string
+
+	// lock is the global write lock that ensures single writer. This is
+	// only used if cfg.WithTxLevelLock is set.
+	lock sync.RWMutex
 }
 
 // Enforce db implements the walletdb.DB interface.

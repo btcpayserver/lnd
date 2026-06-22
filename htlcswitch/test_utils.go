@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -21,11 +22,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/go-errors/errors"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
@@ -42,6 +42,10 @@ import (
 	"github.com/lightningnetwork/lnd/ticker"
 	"github.com/stretchr/testify/require"
 )
+
+// maxInflightHtlcs specifies the max number of inflight HTLCs. This number is
+// chosen to be smaller than the default 483 so the test can run faster.
+const maxInflightHtlcs = 50
 
 var (
 	alicePrivKey = []byte("alice priv key")
@@ -91,8 +95,10 @@ func genIDs() (lnwire.ChannelID, lnwire.ChannelID, lnwire.ShortChannelID,
 
 // mockGetChanUpdateMessage helper function which returns topology update of
 // the channel
-func mockGetChanUpdateMessage(cid lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
-	return &lnwire.ChannelUpdate{
+func mockGetChanUpdateMessage(_ lnwire.ShortChannelID) (*lnwire.ChannelUpdate1,
+	error) {
+
+	return &lnwire.ChannelUpdate1{
 		Signature: wireSig,
 	}, nil
 }
@@ -143,7 +149,7 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 			channelCapacity),
 		ChanReserve:      aliceReserve,
 		MinHTLC:          0,
-		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
+		MaxAcceptedHtlcs: maxInflightHtlcs,
 	}
 	aliceCommitParams := channeldb.CommitmentParams{
 		DustLimit: btcutil.Amount(200),
@@ -155,7 +161,7 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 			channelCapacity),
 		ChanReserve:      bobReserve,
 		MinHTLC:          0,
-		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
+		MaxAcceptedHtlcs: maxInflightHtlcs,
 	}
 	bobCommitParams := channeldb.CommitmentParams{
 		DustLimit: btcutil.Amount(800),
@@ -245,21 +251,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		return nil, nil, err
 	}
 
-	dbAlice, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbAlice.Close())
-	})
-
-	dbBob, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbBob.Close())
-	})
+	dbAlice := channeldb.OpenForTesting(t, t.TempDir())
+	dbBob := channeldb.OpenForTesting(t, t.TempDir())
 
 	estimator := chainfee.NewStaticEstimator(6000, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
@@ -397,21 +390,17 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		switch err {
 		case nil:
 		case kvdb.ErrDatabaseNotOpen:
-			dbAlice, err = channeldb.Open(dbAlice.Path())
-			if err != nil {
-				return nil, errors.Errorf("unable to reopen alice "+
-					"db: %v", err)
-			}
+			dbAlice = channeldb.OpenForTesting(t, dbAlice.Path())
 
 			aliceStoredChannels, err = dbAlice.ChannelStateDB().
 				FetchOpenChannels(aliceKeyPub)
 			if err != nil {
-				return nil, errors.Errorf("unable to fetch alice "+
-					"channel: %v", err)
+				return nil, fmt.Errorf("unable to fetch alice "+
+					"channel: %w", err)
 			}
 		default:
-			return nil, errors.Errorf("unable to fetch alice channel: "+
-				"%v", err)
+			return nil, fmt.Errorf("unable to fetch alice "+
+				"channel: %w", err)
 		}
 
 		var aliceStoredChannel *channeldb.OpenChannel
@@ -432,8 +421,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 			lnwallet.WithAuxSigner(signerMock),
 		)
 		if err != nil {
-			return nil, errors.Errorf("unable to create new channel: %v",
-				err)
+			return nil, fmt.Errorf("unable to create new "+
+				"channel: %w", err)
 		}
 
 		return newAliceChannel, nil
@@ -445,21 +434,21 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		switch err {
 		case nil:
 		case kvdb.ErrDatabaseNotOpen:
-			dbBob, err = channeldb.Open(dbBob.Path())
+			dbBob = channeldb.OpenForTesting(t, dbBob.Path())
 			if err != nil {
-				return nil, errors.Errorf("unable to reopen bob "+
-					"db: %v", err)
+				return nil, fmt.Errorf("unable to reopen bob "+
+					"db: %w", err)
 			}
 
 			bobStoredChannels, err = dbBob.ChannelStateDB().
 				FetchOpenChannels(bobKeyPub)
 			if err != nil {
-				return nil, errors.Errorf("unable to fetch bob "+
-					"channel: %v", err)
+				return nil, fmt.Errorf("unable to fetch bob "+
+					"channel: %w", err)
 			}
 		default:
-			return nil, errors.Errorf("unable to fetch bob channel: "+
-				"%v", err)
+			return nil, fmt.Errorf("unable to fetch bob channel: "+
+				"%w", err)
 		}
 
 		var bobStoredChannel *channeldb.OpenChannel
@@ -480,8 +469,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 			lnwallet.WithAuxSigner(signerMock),
 		)
 		if err != nil {
-			return nil, errors.Errorf("unable to create new channel: %v",
-				err)
+			return nil, fmt.Errorf("unable to create new "+
+				"channel: %w", err)
 		}
 		return newBobChannel, nil
 	}
@@ -892,16 +881,16 @@ func createClusterChannels(t *testing.T, aliceToBob, bobToCarol btcutil.Amount) 
 		bobPrivKey, aliceToBob, aliceToBob, 0, 0, firstChanID,
 	)
 	if err != nil {
-		return nil, nil, errors.Errorf("unable to create "+
-			"alice<->bob channel: %v", err)
+		return nil, nil, fmt.Errorf("unable to create "+
+			"alice<->bob channel: %w", err)
 	}
 
 	secondBobChannel, carolChannel, err := createTestChannel(t, bobPrivKey,
 		carolPrivKey, bobToCarol, bobToCarol, 0, 0, secondChanID,
 	)
 	if err != nil {
-		return nil, nil, errors.Errorf("unable to create "+
-			"bob<->carol channel: %v", err)
+		return nil, nil, fmt.Errorf("unable to create "+
+			"bob<->carol channel: %w", err)
 	}
 
 	restoreFromDb := func() (*clusterChannels, error) {
@@ -1081,8 +1070,8 @@ func createMirroredChannel(t *testing.T, aliceToBob,
 		aliceToBob, bobToAlice, 0, 0, firstChanID,
 	)
 	if err != nil {
-		return nil, nil, errors.Errorf("unable to create "+
-			"alice<->bob channel: %v", err)
+		return nil, nil, fmt.Errorf("unable to create "+
+			"alice<->bob channel: %w", err)
 	}
 
 	return alice, bob, nil
@@ -1148,6 +1137,7 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 		return server.htlcSwitch.ForwardPackets(linkQuit, packets...)
 	}
 
+	//nolint:ll
 	link := NewChannelLink(
 		ChannelLinkConfig{
 			BestHeight:         server.htlcSwitch.BestHeight,
@@ -1167,26 +1157,28 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 			UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 				return nil
 			},
-			NotifyContractUpdate:    notifyContractUpdate,
-			ChainEvents:             &contractcourt.ChainEventSubscription{},
-			SyncStates:              true,
-			BatchSize:               10,
-			BatchTicker:             ticker.NewForce(testBatchTimeout),
-			FwdPkgGCTicker:          ticker.NewForce(fwdPkgTimeout),
-			PendingCommitTicker:     ticker.New(2 * time.Minute),
-			MinUpdateTimeout:        minFeeUpdateTimeout,
-			MaxUpdateTimeout:        maxFeeUpdateTimeout,
-			OnChannelFailure:        func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
-			OutgoingCltvRejectDelta: 3,
-			MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
-			MaxFeeAllocation:        DefaultMaxLinkFeeAllocation,
-			MaxAnchorsCommitFeeRate: chainfee.SatPerKVByte(10 * 1000).FeePerKWeight(),
-			NotifyActiveLink:        func(wire.OutPoint) {},
-			NotifyActiveChannel:     func(wire.OutPoint) {},
-			NotifyInactiveChannel:   func(wire.OutPoint) {},
-			NotifyInactiveLinkEvent: func(wire.OutPoint) {},
-			HtlcNotifier:            server.htlcSwitch.cfg.HtlcNotifier,
-			GetAliases:              getAliases,
+			NotifyContractUpdate:       notifyContractUpdate,
+			ChainEvents:                &contractcourt.ChainEventSubscription{},
+			SyncStates:                 true,
+			BatchSize:                  10,
+			BatchTicker:                ticker.NewForce(testBatchTimeout),
+			FwdPkgGCTicker:             ticker.NewForce(fwdPkgTimeout),
+			PendingCommitTicker:        ticker.New(2 * time.Minute),
+			MinUpdateTimeout:           minFeeUpdateTimeout,
+			MaxUpdateTimeout:           maxFeeUpdateTimeout,
+			OnChannelFailure:           func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
+			OutgoingCltvRejectDelta:    3,
+			MaxOutgoingCltvExpiry:      DefaultMaxOutgoingCltvExpiry,
+			MaxFeeAllocation:           DefaultMaxLinkFeeAllocation,
+			MaxAnchorsCommitFeeRate:    chainfee.SatPerKVByte(10 * 1000).FeePerKWeight(),
+			NotifyActiveLink:           func(wire.OutPoint) {},
+			NotifyActiveChannel:        func(wire.OutPoint) {},
+			NotifyInactiveChannel:      func(wire.OutPoint) {},
+			NotifyInactiveLinkEvent:    func(wire.OutPoint) {},
+			NotifyChannelUpdate:        func(*channeldb.OpenChannel) {},
+			HtlcNotifier:               server.htlcSwitch.cfg.HtlcNotifier,
+			GetAliases:                 getAliases,
+			ShouldFwdExpAccountability: func() bool { return true },
 		},
 		channel,
 	)
@@ -1199,7 +1191,7 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 			for {
 				select {
 				case <-notifyUpdateChan:
-				case <-chanLink.Quit:
+				case <-chanLink.cg.Done():
 					close(doneChan)
 					return
 				}

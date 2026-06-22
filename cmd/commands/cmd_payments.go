@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -181,13 +183,13 @@ func PaymentFlags() []cli.Flag {
 		cancelableFlag,
 		cltvLimitFlag,
 		lastHopFlag,
-		cli.Int64SliceFlag{
+		cli.StringSliceFlag{
 			Name: "outgoing_chan_id",
 			Usage: "short channel id of the outgoing channel to " +
 				"use for the first hop of the payment; can " +
 				"be specified multiple times in the same " +
 				"command",
-			Value: &cli.Int64Slice{},
+			Value: &cli.StringSlice{},
 		},
 		cli.BoolFlag{
 			Name:  "force, f",
@@ -252,6 +254,15 @@ var SendPaymentCommand = cli.Command{
 		cli.BoolFlag{
 			Name:  "keysend",
 			Usage: "will generate a pre-image and encode it in the sphinx packet, a dest must be set [experimental]",
+		},
+		cli.StringFlag{
+			Name: "route_hints",
+			Usage: `route hints for sending through private ` +
+				`channels. eg: ` +
+				`'[{"hop_hints":[{"node_id":"A","chan_id":1,` +
+				`"fee_base_msat":2,` +
+				`"fee_proportional_millionths":3,` +
+				`"cltv_expiry_delta":4}]}]'`,
 		},
 	),
 	Action: SendPayment,
@@ -472,6 +483,20 @@ func SendPayment(ctx *cli.Context) error {
 
 	req.PaymentAddr = payAddr
 
+	if ctx.IsSet("route_hints") {
+		// Parse the route hints JSON.
+		routeHintsJSON := ctx.String("route_hints")
+		var routeHints []*lnrpc.RouteHint
+
+		err := json.Unmarshal([]byte(routeHintsJSON), &routeHints)
+		if err != nil {
+			return fmt.Errorf("error unmarshaling route_hints "+
+				"json: %w", err)
+		}
+
+		req.RouteHints = routeHints
+	}
+
 	return SendPaymentRequest(ctx, req, conn, conn, routerRPCSendPayment)
 }
 
@@ -496,12 +521,11 @@ func SendPaymentRequest(ctx *cli.Context, req *routerrpc.SendPaymentRequest,
 
 	lnClient := lnrpc.NewLightningClient(lnConn)
 
-	outChan := ctx.Int64Slice("outgoing_chan_id")
-	if len(outChan) != 0 {
-		req.OutgoingChanIds = make([]uint64, len(outChan))
-		for i, c := range outChan {
-			req.OutgoingChanIds[i] = uint64(c)
-		}
+	var err error
+	outChan := ctx.StringSlice("outgoing_chan_id")
+	req.OutgoingChanIds, err = parseChanIDs(outChan)
+	if err != nil {
+		return fmt.Errorf("unable to decode outgoing_chan_ids: %w", err)
 	}
 
 	if ctx.IsSet(lastHopFlag.Name) {
@@ -1133,10 +1157,11 @@ var queryRoutesCommand = cli.Command{
 			Name:  "use_mc",
 			Usage: "use mission control probabilities",
 		},
-		cli.Uint64Flag{
+		cli.StringSliceFlag{
 			Name: "outgoing_chan_id",
 			Usage: "(optional) the channel id of the channel " +
-				"that must be taken to the first hop",
+				"to use as the first hop. This flag can be " +
+				"specified multiple times in the same command.",
 		},
 		cli.StringSliceFlag{
 			Name: "ignore_pair",
@@ -1153,6 +1178,15 @@ var queryRoutesCommand = cli.Command{
 		blindedBaseFlag,
 		blindedPPMFlag,
 		blindedCLTVFlag,
+		cli.StringFlag{
+			Name: "route_hints",
+			Usage: `route hints for searching through private ` +
+				`channels (and no blinded paths set). eg: ` +
+				`'[{"hop_hints":[{"node_id":"A","chan_id":1,` +
+				`"fee_base_msat":2,` +
+				`"fee_proportional_millionths":3,` +
+				`"cltv_expiry_delta":4}]}]'`,
+		},
 	},
 	Action: actionDecorator(queryRoutes),
 }
@@ -1241,10 +1275,32 @@ func queryRoutes(ctx *cli.Context) error {
 		FinalCltvDelta:      int32(ctx.Int("final_cltv_delta")),
 		UseMissionControl:   ctx.Bool("use_mc"),
 		CltvLimit:           uint32(ctx.Uint64(cltvLimitFlag.Name)),
-		OutgoingChanId:      ctx.Uint64("outgoing_chan_id"),
 		TimePref:            ctx.Float64(timePrefFlag.Name),
 		IgnoredPairs:        ignoredPairs,
 		BlindedPaymentPaths: blindedRoutes,
+	}
+
+	outgoingChanIds := ctx.StringSlice("outgoing_chan_id")
+	req.OutgoingChanIds, err = parseChanIDs(outgoingChanIds)
+	if err != nil {
+		return fmt.Errorf("unable to decode outgoing_chan_id: %w", err)
+	}
+
+	if ctx.IsSet("route_hints") {
+		if len(blindedRoutes) > 0 {
+			return fmt.Errorf("--route_hints should not be used " +
+				"if blinded paths are set")
+		}
+		routeHintsJSON := ctx.String("route_hints")
+		var routeHints []*lnrpc.RouteHint
+
+		err := json.Unmarshal([]byte(routeHintsJSON), &routeHints)
+		if err != nil {
+			return fmt.Errorf("error unmarshaling route_hints "+
+				"json: %w", err)
+		}
+
+		req.RouteHints = routeHints
 	}
 
 	route, err := client.QueryRoutes(ctxc, req)
@@ -1253,6 +1309,7 @@ func queryRoutes(ctx *cli.Context) error {
 	}
 
 	printRespJSON(route)
+
 	return nil
 }
 
@@ -1440,6 +1497,11 @@ var listPaymentsCommand = cli.Command{
 				"payments with creation date less than or " +
 				"equal to it",
 		},
+		cli.BoolFlag{
+			Name: "omit_hops",
+			Usage: "if set, omit hop-level route data to " +
+				"reduce query cost and response size",
+		},
 	},
 	Action: actionDecorator(listPayments),
 }
@@ -1457,6 +1519,7 @@ func listPayments(ctx *cli.Context) error {
 		CountTotalPayments: ctx.Bool("count_total_payments"),
 		CreationDateStart:  ctx.Uint64("creation_date_start"),
 		CreationDateEnd:    ctx.Uint64("creation_date_end"),
+		OmitHops:           ctx.Bool("omit_hops"),
 	}
 
 	payments, err := client.ListPayments(ctxc, req)
@@ -1469,10 +1532,11 @@ func listPayments(ctx *cli.Context) error {
 }
 
 var forwardingHistoryCommand = cli.Command{
-	Name:      "fwdinghistory",
-	Category:  "Payments",
-	Usage:     "Query the history of all forwarded HTLCs.",
-	ArgsUsage: "start_time [end_time] [index_offset] [max_events]",
+	Name:     "fwdinghistory",
+	Category: "Payments",
+	Usage:    "Query the history of all forwarded HTLCs.",
+	ArgsUsage: "start_time [end_time] [index_offset] [max_events]" +
+		"[--incoming_channel_ids] [--outgoing_channel_ids]",
 	Description: `
 	Query the HTLC switch's internal forwarding log for all completed
 	payment circuits (HTLCs) over a particular time range (--start_time and
@@ -1486,6 +1550,9 @@ var forwardingHistoryCommand = cli.Command{
 
 	The max number of events returned is 50k. The default number is 100,
 	callers can use the --max_events param to modify this value.
+
+	Incoming and outgoing channel IDs can be provided to further filter
+	the events. If not provided, all events will be returned.
 
 	Finally, callers can skip a series of events using the --index_offset
 	parameter. Each response will contain the offset index of the last
@@ -1514,6 +1581,18 @@ var forwardingHistoryCommand = cli.Command{
 			Name: "skip_peer_alias_lookup",
 			Usage: "skip the peer alias lookup per forwarding " +
 				"event in order to improve performance",
+		},
+		cli.StringSliceFlag{
+			Name: "incoming_chan_ids",
+			Usage: "the short channel id of the incoming " +
+				"channel to filter events by; can be " +
+				"specified multiple times in the same command",
+		},
+		cli.StringSliceFlag{
+			Name: "outgoing_chan_ids",
+			Usage: "the short channel id of the outgoing " +
+				"channel to filter events by; can be " +
+				"specified multiple times in the same command",
 		},
 	},
 	Action: actionDecorator(forwardingHistory),
@@ -1595,6 +1674,19 @@ func forwardingHistory(ctx *cli.Context) error {
 		NumMaxEvents:    maxEvents,
 		PeerAliasLookup: lookupPeerAlias,
 	}
+
+	outgoingChannelIDs := ctx.StringSlice("outgoing_chan_ids")
+	req.OutgoingChanIds, err = parseChanIDs(outgoingChannelIDs)
+	if err != nil {
+		return fmt.Errorf("unable to decode outgoing_chan_ids: %w", err)
+	}
+
+	incomingChannelIDs := ctx.StringSlice("incoming_chan_ids")
+	req.IncomingChanIds, err = parseChanIDs(incomingChannelIDs)
+	if err != nil {
+		return fmt.Errorf("unable to decode incoming_chan_ids: %w", err)
+	}
+
 	resp, err := client.ForwardingHistory(ctxc, req)
 	if err != nil {
 		return err
@@ -1781,11 +1873,7 @@ func deletePayments(ctx *cli.Context) error {
 		failedHTLCsOnly  = ctx.Bool("failed_htlcs_only")
 		includeNonFailed = ctx.Bool("include_non_failed")
 		err              error
-		okMsg            = struct {
-			OK bool `json:"ok"`
-		}{
-			OK: true,
-		}
+		resp             proto.Message
 	)
 
 	// We pack two RPCs into the same CLI so there are a few non-valid
@@ -1812,10 +1900,12 @@ func deletePayments(ctx *cli.Context) error {
 				err)
 		}
 
-		_, err = client.DeletePayment(ctxc, &lnrpc.DeletePaymentRequest{
-			PaymentHash:     paymentHash,
-			FailedHtlcsOnly: failedHTLCsOnly,
-		})
+		resp, err = client.DeletePayment(
+			ctxc, &lnrpc.DeletePaymentRequest{
+				PaymentHash:     paymentHash,
+				FailedHtlcsOnly: failedHTLCsOnly,
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("error deleting single payment: %w",
 				err)
@@ -1832,7 +1922,7 @@ func deletePayments(ctx *cli.Context) error {
 
 		fmt.Printf("Removing %s payments, this might take a while...\n",
 			what)
-		_, err = client.DeleteAllPayments(
+		resp, err = client.DeleteAllPayments(
 			ctxc, &lnrpc.DeleteAllPaymentsRequest{
 				AllPayments:        includeNonFailed,
 				FailedPaymentsOnly: !includeNonFailed,
@@ -1842,11 +1932,132 @@ func deletePayments(ctx *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("error deleting payments: %w", err)
 		}
+
+	default:
+		return fmt.Errorf("either --all or --payment_hash must be set")
 	}
 
-	// Users are confused by empty JSON outputs so let's return a simple OK
-	// instead of just printing the empty response RPC message.
-	printJSON(okMsg)
+	printJSON(resp)
+
+	return nil
+}
+
+var deleteFwdHistoryCommand = cli.Command{
+	Name:      "deletefwdhistory",
+	Category:  "Payments",
+	Usage:     "Delete old forwarding history for privacy.",
+	ArgsUsage: "age | before",
+	Description: `
+	Deletes all forwarding history events with a timestamp at or before a
+	specified time. This is useful for implementing data retention policies
+	for privacy purposes. The command permanently removes old forwarding
+	events from the database and returns statistics about the deletion
+	including total fees earned.
+
+	Time can be specified in two ways:
+	1. Relative age (standard Go or custom units): e.g., "-1w", "-24h", 
+	   "-1M"
+	2. Absolute Unix timestamp: e.g., "1640995200"
+
+	Supported relative time units:
+	- Standard Go: ns, us/µs, ms, s, m, h (e.g., "-24h", "-1.5h")
+	- Custom units: d (days), w (weeks), M (months=30.44d), 
+	  y (years=365.25d)
+
+	Examples:
+	  # Delete events from ~1 month ago and earlier:
+	  lncli deletefwdhistory --age="-1M"       
+
+	   # Delete events from ~1 month ago and earlier
+	  lncli deletefwdhistory --age="-720h"    
+
+	  # Delete events at or before Jan 1, 2022:
+	  lncli deletefwdhistory --before=1640995200 
+
+	NOTE: As with deletepayments, removing events from the database frees up
+	disk space within bbolt, but that space is only reclaimed after 
+	compacting the database. Consider enabling auto-compaction 
+	(db.bolt.auto-compact=true).
+
+	WARNING: This operation is irreversible. Deleted forwarding history 
+	cannot be recovered. A minimum age validation is enforced to prevent 
+	accidental deletion of very recent data.
+	`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name: "age",
+			Usage: "delete events at or before this age in the " +
+				"past " +
+				`(e.g., "-1w", "-1M", "-24h", "-720h")`,
+		},
+		cli.Uint64Flag{
+			Name: "before",
+			Usage: "delete events at or before this Unix " +
+				"timestamp (seconds)",
+		},
+		cli.BoolFlag{
+			Name: "force, f",
+			Usage: "skip the confirmation prompt, useful for " +
+				"scripts",
+		},
+	},
+	Action: actionDecorator(deleteFwdHistory),
+}
+
+func deleteFwdHistory(ctx *cli.Context) error {
+	ctxc := getContext()
+	conn := getClientConn(ctx, false)
+	defer conn.Close()
+
+	client := routerrpc.NewRouterClient(conn)
+
+	// Show command help if no arguments or flags are provided.
+	if ctx.NArg() > 0 || (!ctx.IsSet("age") && !ctx.IsSet("before")) {
+		_ = cli.ShowCommandHelp(ctx, "deletefwdhistory")
+		return nil
+	}
+
+	// User must specify exactly one of age or until.
+	if ctx.IsSet("age") && ctx.IsSet("before") {
+		return fmt.Errorf("cannot use both --age and --before; " +
+			"specify one time parameter")
+	}
+
+	req := &routerrpc.DeleteForwardingHistoryRequest{}
+
+	//nolint:ll
+	switch {
+	case ctx.IsSet("age"):
+		req.TimeSpec = &routerrpc.DeleteForwardingHistoryRequest_DeleteBeforeDuration{
+			DeleteBeforeDuration: ctx.String("age"),
+		}
+
+	case ctx.IsSet("before"):
+		req.TimeSpec = &routerrpc.DeleteForwardingHistoryRequest_DeleteBeforeTime{
+			DeleteBeforeTime: ctx.Uint64("before"),
+		}
+	}
+
+	if !ctx.Bool("force") {
+		if !promptForConfirmation("WARNING: This operation is " +
+			"irreversible and will permanently delete forwarding " +
+			"history.\nProceed? (yes/no): ") {
+
+			fmt.Println("Operation cancelled.")
+			return nil
+		}
+	}
+
+	fmt.Println("Deleting forwarding history, this may take a while...")
+
+	resp, err := client.DeleteForwardingHistory(ctxc, req)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to delete forwarding history: %w", err,
+		)
+	}
+
+	printJSON(resp)
 
 	return nil
 }
@@ -1923,9 +2134,7 @@ func estimateRouteFee(ctx *cli.Context) error {
 
 	case ctx.IsSet("pay_req"):
 		req.PaymentRequest = StripPrefix(ctx.String("pay_req"))
-		if ctx.IsSet("timeout") {
-			req.Timeout = uint32(ctx.Duration("timeout").Seconds())
-		}
+		req.Timeout = uint32(ctx.Duration("timeout").Seconds())
 
 	default:
 		return fmt.Errorf("fee estimation arguments missing")
@@ -1965,4 +2174,25 @@ func ordinalNumber(num uint32) string {
 	default:
 		return fmt.Sprintf("%dth", num)
 	}
+}
+
+// parseChanIDs parses a slice of strings containing short channel IDs into a
+// slice of uint64 values.
+func parseChanIDs(idStrings []string) ([]uint64, error) {
+	// Return early if no chan IDs are passed.
+	if len(idStrings) == 0 {
+		return nil, nil
+	}
+
+	chanIDs := make([]uint64, len(idStrings))
+	for i, idStr := range idStrings {
+		scid, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		chanIDs[i] = scid
+	}
+
+	return chanIDs, nil
 }

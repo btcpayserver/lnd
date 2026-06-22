@@ -13,7 +13,7 @@ import (
 //
 // TODO(yy): delete this build flag to unify with `lncfg/protocol.go`.
 //
-//nolint:lll
+//nolint:ll
 type ProtocolOptions struct {
 	// LegacyProtocol is a sub-config that houses all the legacy protocol
 	// options.  These are mostly used for integration tests as most modern
@@ -40,6 +40,10 @@ type ProtocolOptions struct {
 	// Anchors enables anchor commitments.
 	// TODO(halseth): transition itests to anchors instead!
 	Anchors bool `long:"anchors" description:"enable support for anchor commitments"`
+
+	// RbfCoopClose should be set if we want to signal that we support for
+	// the new experimental RBF coop close feature.
+	RbfCoopClose bool `long:"rbf-coop-close" description:"if set, then lnd will signal that it supports the new RBF based coop close protocol"`
 
 	// ScriptEnforcedLease enables script enforced commitments for channel
 	// leases.
@@ -69,6 +73,53 @@ type ProtocolOptions struct {
 
 	// NoRouteBlindingOption disables forwarding of payments in blinded routes.
 	NoRouteBlindingOption bool `long:"no-route-blinding" description:"do not forward payments that are a part of a blinded route"`
+
+	// NoOnionMessagesOption disables onion message forwarding.
+	NoOnionMessagesOption bool `long:"no-onion-messages" description:"disable support for onion messaging"`
+
+	// OnionMsgPeerKbps is the maximum sustained onion message ingress
+	// bandwidth, in decimal kilobits per second (1 Kbps = 1000 bits/s),
+	// that will be accepted from any single peer. Setting this to zero,
+	// together with a zero burst, disables the per-peer onion message
+	// rate limiter.
+	OnionMsgPeerKbps uint64 `long:"onion-msg-peer-kbps" description:"max onion message ingress rate from a single peer, in decimal kilobits per second; set both this and onion-msg-peer-burst-bytes to 0 to disable the per-peer limiter"`
+
+	// OnionMsgPeerBurstBytes is the token bucket depth, in bytes, used
+	// by the per-peer onion message rate limiter. A value of zero,
+	// paired with a zero rate, disables the per-peer limiter.
+	OnionMsgPeerBurstBytes uint64 `long:"onion-msg-peer-burst-bytes" description:"token bucket burst for the per-peer onion message limiter, in bytes; set both this and onion-msg-peer-kbps to 0 to disable the per-peer limiter"`
+
+	// OnionMsgGlobalKbps is the maximum sustained onion message ingress
+	// bandwidth, in decimal kilobits per second, that will be accepted
+	// across all peers combined. Setting this to zero, together with a
+	// zero burst, disables the global onion message rate limiter.
+	OnionMsgGlobalKbps uint64 `long:"onion-msg-global-kbps" description:"max onion message ingress rate across all peers combined, in decimal kilobits per second; set both this and onion-msg-global-burst-bytes to 0 to disable the global limiter"`
+
+	// OnionMsgGlobalBurstBytes is the token bucket depth, in bytes, used
+	// by the global onion message rate limiter. A value of zero, paired
+	// with a zero rate, disables the global limiter.
+	OnionMsgGlobalBurstBytes uint64 `long:"onion-msg-global-burst-bytes" description:"token bucket burst for the global onion message limiter, in bytes; set both this and onion-msg-global-kbps to 0 to disable the global limiter"`
+
+	// OnionMsgRelayAll disables the channel-presence gate on the onion
+	// message ingress path. When false (the default), incoming onion
+	// messages from peers that do not have at least one fully open
+	// channel with us are dropped before the rate limiters are
+	// consulted: without a funded channel, a new peer identity is free
+	// and the global rate limiter alone is easy to saturate. Setting
+	// this to true admits onion messages from any peer into the
+	// limiter pipeline, at the cost of that Sybil-resistance property.
+	OnionMsgRelayAll bool `long:"onion-msg-relay-all" description:"accept incoming onion messages from peers with no fully open channel; by default only peers with at least one active channel are admitted to the onion message ingress path"`
+
+	// NoExperimentalAccountabilityOption disables experimental accountability.
+	NoExperimentalAccountabilityOption bool `long:"no-experimental-accountability" description:"do not forward experimental accountability signals"`
+
+	// NoExperimentalEndorsementOption is the deprecated name for
+	// NoExperimentalAccountabilityOption. It is hidden and will be removed
+	// in a future release.
+	NoExperimentalEndorsementOption bool `long:"no-experimental-endorsement" hidden:"true" description:"deprecated: use no-experimental-accountability instead"`
+
+	// NoQuiescenceOption disables quiescence for all channels.
+	NoQuiescenceOption bool `long:"no-quiescence" description:"do not allow or advertise quiescence for any channel"`
 
 	// CustomMessage allows the custom message APIs to handle messages with
 	// the provided protocol numbers, which fall outside the custom message
@@ -125,6 +176,24 @@ func (l *ProtocolOptions) NoAnySegwit() bool {
 // NoRouteBlinding returns true if forwarding of blinded payments is disabled.
 func (l *ProtocolOptions) NoRouteBlinding() bool {
 	return l.NoRouteBlindingOption
+}
+
+// NoOnionMessages returns true if onion messaging is disabled.
+func (l *ProtocolOptions) NoOnionMessages() bool {
+	return l.NoOnionMessagesOption
+}
+
+// NoExpAccountability returns true if experimental accountability should be
+// disabled. It also checks the deprecated NoExperimentalEndorsementOption for
+// backwards compatibility.
+func (l *ProtocolOptions) NoExpAccountability() bool {
+	return l.NoExperimentalAccountabilityOption ||
+		l.NoExperimentalEndorsementOption
+}
+
+// NoQuiescence returns true if quiescence is disabled.
+func (l *ProtocolOptions) NoQuiescence() bool {
+	return l.NoQuiescenceOption
 }
 
 // CustomMessageOverrides returns the set of protocol messages that we override

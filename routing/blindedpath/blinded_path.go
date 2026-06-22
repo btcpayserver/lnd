@@ -11,7 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -283,10 +283,11 @@ func buildBlindedPaymentPath(cfg *BuildBlindedPathCfg, path *candidatePath) (
 	}
 
 	// Encrypt the hop info.
-	blindedPath, err := sphinx.BuildBlindedPath(sessionKey, paymentPath)
+	blindedPathInfo, err := sphinx.BuildBlindedPath(sessionKey, paymentPath)
 	if err != nil {
 		return nil, err
 	}
+	blindedPath := blindedPathInfo.Path
 
 	if len(blindedPath.BlindedHops) < 1 {
 		return nil, fmt.Errorf("blinded path must have at least one " +
@@ -838,7 +839,7 @@ func calcBlindedPathPolicies(relayInfo []*record.PaymentRelayInfo,
 	)
 	// Use the algorithms defined in BOLT 4 to calculate the accumulated
 	// relay fees for the route:
-	//nolint:lll
+	//nolint:ll
 	// https://github.com/lightning/bolts/blob/db278ab9b2baa0b30cfe79fb3de39280595938d3/04-onion-routing.md?plain=1#L255
 	for i := len(relayInfo) - 1; i >= 0; i-- {
 		info := relayInfo[i]

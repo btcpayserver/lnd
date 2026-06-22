@@ -10,9 +10,8 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
@@ -20,6 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/types"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -240,12 +240,12 @@ type ChanCloser struct {
 	// localCloseOutput is the local output on the closing transaction that
 	// the local party should be paid to. This will only be populated if the
 	// local balance isn't dust.
-	localCloseOutput fn.Option[CloseOutput]
+	localCloseOutput fn.Option[types.CloseOutput]
 
 	// remoteCloseOutput is the remote output on the closing transaction
 	// that the remote party should be paid to. This will only be populated
 	// if the remote balance isn't dust.
-	remoteCloseOutput fn.Option[CloseOutput]
+	remoteCloseOutput fn.Option[types.CloseOutput]
 
 	// auxOutputs are the optional additional outputs that might be added to
 	// the closing transaction.
@@ -360,6 +360,9 @@ func (c *ChanCloser) initFeeBaseline() {
 		)
 	}
 
+	// TODO(ziggie): Make sure the ideal fee is not higher than the max fee.
+	// Either error out or cap the ideal fee at the max fee.
+
 	chancloserLog.Infof("Ideal fee for closure of ChannelPoint(%v) "+
 		"is: %v sat (max_fee=%v sat)", c.cfg.Channel.ChannelPoint(),
 		int64(c.idealFeeSat), int64(c.maxFee))
@@ -376,14 +379,17 @@ func (c *ChanCloser) initChanShutdown() (*lnwire.Shutdown, error) {
 	// At this point, we'll check to see if we have any custom records to
 	// add to the shutdown message.
 	err := fn.MapOptionZ(c.cfg.AuxCloser, func(a AuxChanCloser) error {
-		shutdownCustomRecords, err := a.ShutdownBlob(AuxShutdownReq{
-			ChanPoint:   c.chanPoint,
-			ShortChanID: c.cfg.Channel.ShortChanID(),
-			Initiator:   c.cfg.Channel.IsInitiator(),
-			InternalKey: c.localInternalKey,
-			CommitBlob:  c.cfg.Channel.LocalCommitmentBlob(),
-			FundingBlob: c.cfg.Channel.FundingBlob(),
-		})
+		channel := c.cfg.Channel
+		shutdownCustomRecords, err := a.ShutdownBlob(
+			types.AuxShutdownReq{
+				ChanPoint:   c.chanPoint,
+				ShortChanID: channel.ShortChanID(),
+				Initiator:   channel.IsInitiator(),
+				InternalKey: c.localInternalKey,
+				CommitBlob:  channel.LocalCommitmentBlob(),
+				FundingBlob: channel.FundingBlob(),
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -411,7 +417,7 @@ func (c *ChanCloser) initChanShutdown() (*lnwire.Shutdown, error) {
 		)
 
 		chancloserLog.Infof("Initiating shutdown w/ nonce: %v",
-			spew.Sdump(firstClosingNonce.PubNonce))
+			lnutils.SpewLogClosure(firstClosingNonce.PubNonce))
 	}
 
 	// Before closing, we'll attempt to send a disable update for the
@@ -440,7 +446,7 @@ func (c *ChanCloser) initChanShutdown() (*lnwire.Shutdown, error) {
 	// it might still carry value in custom channel terms.
 	_, dustAmt := c.cfg.Channel.LocalBalanceDust()
 	localBalance, _ := c.cfg.Channel.CommitBalances()
-	c.localCloseOutput = fn.Some(CloseOutput{
+	c.localCloseOutput = fn.Some(types.CloseOutput{
 		Amt:             localBalance,
 		DustLimit:       dustAmt,
 		PkScript:        c.localDeliveryScript,
@@ -517,12 +523,12 @@ func (c *ChanCloser) NegotiationHeight() uint32 {
 }
 
 // LocalCloseOutput returns the local close output.
-func (c *ChanCloser) LocalCloseOutput() fn.Option[CloseOutput] {
+func (c *ChanCloser) LocalCloseOutput() fn.Option[types.CloseOutput] {
 	return c.localCloseOutput
 }
 
 // RemoteCloseOutput returns the remote close output.
-func (c *ChanCloser) RemoteCloseOutput() fn.Option[CloseOutput] {
+func (c *ChanCloser) RemoteCloseOutput() fn.Option[types.CloseOutput] {
 	return c.remoteCloseOutput
 }
 
@@ -539,8 +545,8 @@ func (c *ChanCloser) AuxOutputs() fn.Option[AuxCloseOutputs] {
 // upfront script is set, we check whether it matches the script provided by
 // our peer. If they do not match, we use the disconnect function provided to
 // disconnect from the peer.
-func validateShutdownScript(disconnect func() error, upfrontScript,
-	peerScript lnwire.DeliveryAddress, netParams *chaincfg.Params) error {
+func validateShutdownScript(upfrontScript, peerScript lnwire.DeliveryAddress,
+	netParams *chaincfg.Params) error {
 
 	// Either way, we'll make sure that the script passed meets our
 	// standards. The upfrontScript should have already been checked at an
@@ -568,12 +574,6 @@ func validateShutdownScript(disconnect func() error, upfrontScript,
 		chancloserLog.Warnf("peer's script: %x does not match upfront "+
 			"shutdown script: %x", peerScript, upfrontScript)
 
-		// Disconnect from the peer because they have violated option upfront
-		// shutdown.
-		if err := disconnect(); err != nil {
-			return err
-		}
-
 		return ErrUpfrontShutdownScriptMismatch
 	}
 
@@ -594,7 +594,7 @@ func (c *ChanCloser) ReceiveShutdown(msg lnwire.Shutdown) (
 	// terms, it might still carry value in custom channel terms.
 	_, dustAmt := c.cfg.Channel.RemoteBalanceDust()
 	_, remoteBalance := c.cfg.Channel.CommitBalances()
-	c.remoteCloseOutput = fn.Some(CloseOutput{
+	c.remoteCloseOutput = fn.Some(types.CloseOutput{
 		Amt:             remoteBalance,
 		DustLimit:       dustAmt,
 		PkScript:        msg.Address,
@@ -630,7 +630,6 @@ func (c *ChanCloser) ReceiveShutdown(msg lnwire.Shutdown) (
 		// If the remote node opened the channel with option upfront
 		// shutdown script, check that the script they provided matches.
 		if err := validateShutdownScript(
-			c.cfg.Disconnect,
 			c.cfg.Channel.RemoteUpfrontShutdownScript(),
 			msg.Address, c.cfg.ChainParams,
 		); err != nil {
@@ -681,7 +680,6 @@ func (c *ChanCloser) ReceiveShutdown(msg lnwire.Shutdown) (
 		// If the remote node opened the channel with option upfront
 		// shutdown script, check that the script they provided matches.
 		if err := validateShutdownScript(
-			c.cfg.Disconnect,
 			c.cfg.Channel.RemoteUpfrontShutdownScript(),
 			msg.Address, c.cfg.ChainParams,
 		); err != nil {
@@ -917,7 +915,7 @@ func (c *ChanCloser) ReceiveClosingSigned( //nolint:funlen
 		)
 		matchingSig := c.priorFeeOffers[remoteProposedFee]
 		if c.cfg.Channel.ChanType().IsTaproot() {
-			localWireSig, err := matchingSig.PartialSig.UnwrapOrErrV( //nolint:lll
+			localWireSig, err := matchingSig.PartialSig.UnwrapOrErrV( //nolint:ll
 				fmt.Errorf("none local sig"),
 			)
 			if err != nil {
@@ -931,7 +929,7 @@ func (c *ChanCloser) ReceiveClosingSigned( //nolint:funlen
 			}
 
 			muSession := c.cfg.MusigSession
-			localSig, remoteSig, closeOpts, err = muSession.CombineClosingOpts( //nolint:lll
+			localSig, remoteSig, closeOpts, err = muSession.CombineClosingOpts( //nolint:ll
 				localWireSig, remoteWireSig,
 			)
 			if err != nil {
@@ -975,33 +973,6 @@ func (c *ChanCloser) ReceiveClosingSigned( //nolint:funlen
 			return noClosing, err
 		}
 		c.closingTx = closeTx
-
-		// If there's an aux chan closer, then we'll finalize with it
-		// before we write to disk.
-		err = fn.MapOptionZ(
-			c.cfg.AuxCloser, func(aux AuxChanCloser) error {
-				channel := c.cfg.Channel
-				//nolint:lll
-				req := AuxShutdownReq{
-					ChanPoint:   c.chanPoint,
-					ShortChanID: c.cfg.Channel.ShortChanID(),
-					InternalKey: c.localInternalKey,
-					Initiator:   channel.IsInitiator(),
-					CommitBlob:  channel.LocalCommitmentBlob(),
-					FundingBlob: channel.FundingBlob(),
-				}
-				desc := AuxCloseDesc{
-					AuxShutdownReq:    req,
-					LocalCloseOutput:  c.localCloseOutput,
-					RemoteCloseOutput: c.remoteCloseOutput,
-				}
-
-				return aux.FinalizeClose(desc, closeTx)
-			},
-		)
-		if err != nil {
-			return noClosing, err
-		}
 
 		// Before publishing the closing tx, we persist it to the
 		// database, such that it can be republished if something goes
@@ -1059,7 +1030,7 @@ func (c *ChanCloser) auxCloseOutputs(
 
 	var closeOuts fn.Option[AuxCloseOutputs]
 	err := fn.MapOptionZ(c.cfg.AuxCloser, func(aux AuxChanCloser) error {
-		req := AuxShutdownReq{
+		req := types.AuxShutdownReq{
 			ChanPoint:   c.chanPoint,
 			ShortChanID: c.cfg.Channel.ShortChanID(),
 			InternalKey: c.localInternalKey,
@@ -1067,7 +1038,7 @@ func (c *ChanCloser) auxCloseOutputs(
 			CommitBlob:  c.cfg.Channel.LocalCommitmentBlob(),
 			FundingBlob: c.cfg.Channel.FundingBlob(),
 		}
-		outs, err := aux.AuxCloseOutputs(AuxCloseDesc{
+		outs, err := aux.AuxCloseOutputs(types.AuxCloseDesc{
 			AuxShutdownReq:    req,
 			CloseFee:          closeFee,
 			CommitFee:         c.cfg.Channel.CommitFee(),

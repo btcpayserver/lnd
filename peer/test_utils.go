@@ -18,12 +18,14 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntest/channels"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -200,13 +202,7 @@ func createTestPeerWithChannel(t *testing.T, updateChan func(a,
 		return nil, err
 	}
 
-	dbBob, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbBob.Close())
-	})
+	dbBob := channeldb.OpenForTesting(t, t.TempDir())
 
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
@@ -340,7 +336,7 @@ func createTestPeerWithChannel(t *testing.T, updateChan func(a,
 	chanID := lnwire.NewChanIDFromOutPoint(channelAlice.ChannelPoint())
 	alicePeer.activeChannels.Store(chanID, channelAlice)
 
-	alicePeer.wg.Add(1)
+	alicePeer.cg.WgAdd(1)
 	go alicePeer.channelManager()
 
 	return &peerTestCtx{
@@ -477,6 +473,14 @@ func (m *mockUpdateHandler) OnCommitOnce(
 
 	hook()
 }
+func (m *mockUpdateHandler) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
+	// TODO(proofofkeags): Implement
+	c := make(chan fn.Result[lntypes.ChannelParty], 1)
+
+	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not yet implemented")
+
+	return c
+}
 
 func newMockConn(t *testing.T, expectedMessages int) *mockMessageConn {
 	return &mockMessageConn{
@@ -555,6 +559,20 @@ func (m *mockMessageConn) Close() error {
 	return nil
 }
 
+// mockBestBlockView is a mock implementation of chainntnfs.BestBlockView for
+// testing.
+type mockBestBlockView struct{}
+
+// BestHeight returns a dummy block height.
+func (m *mockBestBlockView) BestHeight() (uint32, error) {
+	return 0, nil
+}
+
+// BestBlockHeader returns a dummy block header.
+func (m *mockBestBlockView) BestBlockHeader() (*wire.BlockHeader, error) {
+	return &wire.BlockHeader{}, nil
+}
+
 // createTestPeer creates a new peer for testing and returns a context struct
 // containing necessary handles and mock objects for conducting tests on peer
 // functionalities.
@@ -598,11 +616,13 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 
 	const chanActiveTimeout = time.Minute
 
-	dbAlice, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
+	dbAliceGraph := graphdb.MakeTestGraph(t)
+	require.NoError(t, dbAliceGraph.Start())
 	t.Cleanup(func() {
-		require.NoError(t, dbAlice.Close())
+		require.NoError(t, dbAliceGraph.Stop())
 	})
+
+	dbAliceChannel := channeldb.OpenForTesting(t, t.TempDir())
 
 	nodeSignerAlice := netann.NewNodeSigner(aliceKeySigner)
 
@@ -611,15 +631,15 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 		ChanStatusSampleInterval: 30 * time.Second,
 		ChanEnableTimeout:        chanActiveTimeout,
 		ChanDisableTimeout:       2 * time.Minute,
-		DB:                       dbAlice.ChannelStateDB(),
-		Graph:                    dbAlice.ChannelGraph(),
+		DB:                       dbAliceChannel.ChannelStateDB(),
+		Graph:                    dbAliceGraph,
 		MessageSigner:            nodeSignerAlice,
 		OurPubKey:                aliceKeyPub,
 		OurKeyLoc:                testKeyLoc,
 		IsChannelActive: func(lnwire.ChannelID) bool {
 			return true
 		},
-		ApplyChannelUpdate: func(*lnwire.ChannelUpdate,
+		ApplyChannelUpdate: func(*lnwire.ChannelUpdate1,
 			*wire.OutPoint, bool) error {
 
 			return nil
@@ -654,7 +674,7 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 	mockSwitch := &mockMessageSwitch{}
 
 	// TODO(yy): change ChannelNotifier to be an interface.
-	channelNotifier := channelnotifier.New(dbAlice.ChannelStateDB())
+	channelNotifier := channelnotifier.New(dbAliceChannel.ChannelStateDB())
 	require.NoError(t, channelNotifier.Start())
 	t.Cleanup(func() {
 		require.NoError(t, channelNotifier.Stop(),
@@ -688,17 +708,25 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 	var pubKey [33]byte
 	copy(pubKey[:], aliceKeyPub.SerializeCompressed())
 
+	// We have to have a valid server key for brontide to start up properly.
+	serverKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	var serverKeyArr [33]byte
+	copy(serverKeyArr[:], serverKey.PubKey().SerializeCompressed())
+
 	estimator := chainfee.NewStaticEstimator(12500, 0)
 
 	cfg := &Config{
 		Addr:              cfgAddr,
 		PubKeyBytes:       pubKey,
+		ServerPubKey:      serverKeyArr,
 		ErrorBuffer:       errBuffer,
 		ChainIO:           chainIO,
 		Switch:            mockSwitch,
 		ChanActiveTimeout: chanActiveTimeout,
 		InterceptSwitch:   interceptableSwitch,
-		ChannelDB:         dbAlice.ChannelStateDB(),
+		ChannelDB:         dbAliceChannel.ChannelStateDB(),
 		FeeEstimator:      estimator,
 		Wallet:            wallet,
 		ChainNotifier:     notifier,
@@ -725,11 +753,12 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 
 			return nil
 		},
-		PongBuf: make([]byte, lnwire.MaxPongBytes),
+		PongBuf:       make([]byte, lnwire.MaxPongBytes),
+		BestBlockView: &mockBestBlockView{},
 		FetchLastChanUpdate: func(chanID lnwire.ShortChannelID,
-		) (*lnwire.ChannelUpdate, error) {
+		) (*lnwire.ChannelUpdate1, error) {
 
-			return &lnwire.ChannelUpdate{}, nil
+			return &lnwire.ChannelUpdate1{}, nil
 		},
 	}
 
@@ -740,7 +769,7 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 		mockSwitch:    mockSwitch,
 		peer:          alicePeer,
 		notifier:      notifier,
-		db:            dbAlice,
+		db:            dbAliceChannel,
 		privKey:       aliceKeyPriv,
 		mockConn:      mockConn,
 		customChan:    receivedCustomChan,

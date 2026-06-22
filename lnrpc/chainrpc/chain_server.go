@@ -18,6 +18,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 )
 
@@ -84,8 +86,8 @@ var (
 
 	// ErrChainNotifierServerNotActive indicates that the chain notifier hasn't
 	// finished the startup process.
-	ErrChainNotifierServerNotActive = errors.New("chain notifier RPC is " +
-		"still in the process of starting")
+	ErrChainNotifierServerNotActive = status.Error(codes.Unavailable,
+		"chain notifier RPC is still in the process of starting")
 )
 
 // ServerShell is a shell struct holding a reference to the actual sub-server.
@@ -207,12 +209,12 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// We make sure that we register it with the main gRPC server to ensure
 	// all our methods are routed properly.
 	RegisterChainNotifierServer(grpcServer, r)
-	log.Debug("ChainNotifier RPC server successfully register with root " +
-		"gRPC server")
+	log.Debug("ChainNotifier RPC server successfully registered with " +
+		"root gRPC server")
 
 	RegisterChainKitServer(grpcServer, r)
-	log.Debug("ChainKit RPC server successfully register with root gRPC " +
-		"server")
+	log.Debug("ChainKit RPC server successfully registered with root " +
+		"gRPC server")
 
 	return nil
 }
@@ -360,7 +362,7 @@ func (s *Server) GetBlockHash(_ context.Context,
 // particular transaction by its hash or for an output script by specifying a
 // zero hash.
 //
-// NOTE: This is part of the chainrpc.ChainNotifierService interface.
+// NOTE: This is part of the chainrpc.ChainNotifierServer interface.
 func (s *Server) RegisterConfirmationsNtfn(in *ConfRequest,
 	confStream ChainNotifier_RegisterConfirmationsNtfnServer) error {
 
@@ -483,7 +485,7 @@ func (s *Server) RegisterConfirmationsNtfn(in *ConfRequest,
 // A client can specify whether the spend request should be for a particular
 // outpoint  or for an output script by specifying a zero outpoint.
 //
-// NOTE: This is part of the chainrpc.ChainNotifierService interface.
+// NOTE: This is part of the chainrpc.ChainNotifierServer interface.
 func (s *Server) RegisterSpendNtfn(in *SpendRequest,
 	spendStream ChainNotifier_RegisterSpendNtfnServer) error {
 
@@ -597,7 +599,7 @@ func (s *Server) RegisterSpendNtfn(in *SpendRequest,
 // point. This allows clients to be idempotent by ensuring that they do not
 // missing processing a single block within the chain.
 //
-// NOTE: This is part of the chainrpc.ChainNotifierService interface.
+// NOTE: This is part of the chainrpc.ChainNotifierServer interface.
 func (s *Server) RegisterBlockEpochNtfn(in *BlockEpoch,
 	epochStream ChainNotifier_RegisterBlockEpochNtfnServer) error {
 

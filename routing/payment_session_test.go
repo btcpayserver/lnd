@@ -1,11 +1,12 @@
 package routing
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -89,8 +90,9 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 
 	// Create a minimal test node using the private key priv1.
 	pub := priv1.PubKey().SerializeCompressed()
-	testNode := &channeldb.LightningNode{}
-	copy(testNode.PubKeyBytes[:], pub)
+	var pubKey [33]byte
+	copy(pubKey[:], pub)
+	testNode := models.NewV1ShellNode(pubKey)
 
 	nodeID, err := testNode.PubKey()
 	require.NoError(t, err, "failed to get node id")
@@ -119,7 +121,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		newMockGraphSessionFactory(&sessionGraph{}),
+		&sessionGraph{},
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -147,7 +149,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 	)
 
 	// Create the channel update message and sign.
-	msg := &lnwire.ChannelUpdate{
+	msg := &lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(testChannelID),
 		Timestamp:      uint32(time.Now().Unix()),
 		BaseFee:        newFeeBaseMSat,
@@ -197,7 +199,7 @@ func TestRequestRoute(t *testing.T) {
 		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		newMockGraphSessionFactory(&sessionGraph{}),
+		&sessionGraph{},
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -257,4 +259,10 @@ type sessionGraph struct {
 
 func (g *sessionGraph) sourceNode() route.Vertex {
 	return route.Vertex{}
+}
+
+func (g *sessionGraph) GraphSession(_ context.Context,
+	cb func(graph graphdb.NodeTraverser) error, _ func()) error {
+
+	return cb(g)
 }

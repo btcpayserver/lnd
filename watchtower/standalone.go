@@ -3,6 +3,7 @@ package watchtower
 import (
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/lightningnetwork/lnd/brontide"
@@ -65,6 +66,9 @@ func New(cfg *Config) (*Standalone, error) {
 		DB:             cfg.DB,
 		EpochRegistrar: cfg.EpochRegistrar,
 		Punisher:       punisher,
+		MinBackoff:     time.Second,
+		MaxBackoff:     time.Minute,
+		MaxNumRetries:  5,
 	})
 
 	// Create a brontide listener on each of the provided listening
@@ -74,6 +78,7 @@ func New(cfg *Config) (*Standalone, error) {
 	for _, listenAddr := range cfg.ListenAddrs {
 		listener, err := brontide.NewListener(
 			cfg.NodeKeyECDH, listenAddr.String(),
+			brontide.DisabledBanClosure,
 		)
 		if err != nil {
 			return nil, err
@@ -153,8 +158,8 @@ func (w *Standalone) Stop() error {
 	return nil
 }
 
-// createNewHiddenService automatically sets up a v2 or v3 onion service in
-// order to listen for inbound connections over Tor.
+// createNewHiddenService automatically sets up a v3 onion service in order to
+// listen for inbound connections over Tor.
 func (w *Standalone) createNewHiddenService() error {
 	// Get all the ports the watchtower is listening on. These will be used to
 	// map the hidden service's virtual port.
@@ -179,7 +184,6 @@ func (w *Standalone) createNewHiddenService() error {
 			w.cfg.WatchtowerKeyPath, 0600, w.cfg.EncryptKey,
 			encrypter,
 		),
-		Type: w.cfg.Type,
 	}
 
 	addr, err := w.cfg.TorController.AddOnion(onionCfg)

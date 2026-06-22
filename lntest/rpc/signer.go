@@ -88,7 +88,7 @@ func (h *HarnessRPC) MuSig2CreateSessionErr(
 
 // MuSig2CombineKeys makes a RPC call to the node's SignerClient and asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) MuSig2CombineKeys(
 	req *signrpc.MuSig2CombineKeysRequest) *signrpc.MuSig2CombineKeysResponse {
 
@@ -117,7 +117,7 @@ func (h *HarnessRPC) MuSig2CombineKeysErr(
 
 // MuSig2RegisterNonces makes a RPC call to the node's SignerClient and asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) MuSig2RegisterNonces(
 	req *signrpc.MuSig2RegisterNoncesRequest) *signrpc.MuSig2RegisterNoncesResponse {
 
@@ -128,6 +128,80 @@ func (h *HarnessRPC) MuSig2RegisterNonces(
 	h.NoError(err, "MuSig2RegisterNonces")
 
 	return resp
+}
+
+// MuSig2RegisterNoncesErr makes a RPC call to the node's SignerClient and
+// asserts an error is returned.
+func (h *HarnessRPC) MuSig2RegisterNoncesErr(
+	req *signrpc.MuSig2RegisterNoncesRequest) error {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.Signer.MuSig2RegisterNonces(ctxt, req)
+	require.Error(h, err, "expected error from MuSig2RegisterNonces")
+
+	return err
+}
+
+// MuSig2RegisterCombinedNonce makes a RPC call to the node's SignerClient and
+// asserts.
+//
+//nolint:ll
+func (h *HarnessRPC) MuSig2RegisterCombinedNonce(
+	req *signrpc.MuSig2RegisterCombinedNonceRequest) *signrpc.MuSig2RegisterCombinedNonceResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.Signer.MuSig2RegisterCombinedNonce(ctxt, req)
+	h.NoError(err, "MuSig2RegisterCombinedNonce")
+
+	return resp
+}
+
+// MuSig2RegisterCombinedNonceErr makes a RPC call to the node's SignerClient
+// and asserts an error is returned.
+func (h *HarnessRPC) MuSig2RegisterCombinedNonceErr(
+	req *signrpc.MuSig2RegisterCombinedNonceRequest) error {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.Signer.MuSig2RegisterCombinedNonce(ctxt, req)
+	require.Error(h, err, "expected error from MuSig2RegisterCombinedNonce")
+
+	return err
+}
+
+// MuSig2GetCombinedNonce makes a RPC call to the node's SignerClient and
+// asserts.
+//
+//nolint:ll
+func (h *HarnessRPC) MuSig2GetCombinedNonce(
+	req *signrpc.MuSig2GetCombinedNonceRequest) *signrpc.MuSig2GetCombinedNonceResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.Signer.MuSig2GetCombinedNonce(ctxt, req)
+	h.NoError(err, "MuSig2GetCombinedNonce")
+
+	return resp
+}
+
+// MuSig2GetCombinedNonceErr makes a RPC call to the node's SignerClient and
+// asserts an error is returned.
+func (h *HarnessRPC) MuSig2GetCombinedNonceErr(
+	req *signrpc.MuSig2GetCombinedNonceRequest) error {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.Signer.MuSig2GetCombinedNonce(ctxt, req)
+	require.Error(h, err, "expected error from MuSig2GetCombinedNonce")
+
+	return err
 }
 
 // MuSig2Sign makes a RPC call to the node's SignerClient and asserts.

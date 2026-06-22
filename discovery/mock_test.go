@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -176,7 +177,9 @@ func newMockScidCloser(channelPeer bool) *mockScidCloser {
 	}
 }
 
-func (m *mockScidCloser) PutClosedScid(scid lnwire.ShortChannelID) error {
+func (m *mockScidCloser) PutClosedScid(_ context.Context,
+	scid lnwire.ShortChannelID) error {
+
 	m.Lock()
 	m.m[scid] = struct{}{}
 	m.Unlock()
@@ -184,8 +187,8 @@ func (m *mockScidCloser) PutClosedScid(scid lnwire.ShortChannelID) error {
 	return nil
 }
 
-func (m *mockScidCloser) IsClosedScid(scid lnwire.ShortChannelID) (bool,
-	error) {
+func (m *mockScidCloser) IsClosedScid(_ context.Context,
+	scid lnwire.ShortChannelID) (bool, error) {
 
 	m.Lock()
 	defer m.Unlock()

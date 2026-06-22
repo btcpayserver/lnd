@@ -1,7 +1,6 @@
 package routerrpc
 
 import (
-	"bytes"
 	"context"
 	crand "crypto/rand"
 	"errors"
@@ -15,13 +14,13 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightningnetwork/lnd/aliasmgr"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
+	paymentsdb "github.com/lightningnetwork/lnd/payments/db"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/zpay32"
@@ -40,6 +39,16 @@ const (
 	// routeFeeLimitSat is the maximum routing fee that we allow to occur
 	// when estimating a routing fee.
 	routeFeeLimitSat = 100_000_000
+
+	// DefaultPaymentTimeout is the default value of time we should spend
+	// when attempting to fulfill the payment.
+	DefaultPaymentTimeout int32 = 60
+
+	// MaxLspsToProbe is the maximum number of LSPs to probe when
+	// estimating fees for worst-case fee estimation. This is a
+	// precautionary measure to prevent the estimation from taking too
+	// long, and it is also a griefing protection.
+	MaxLspsToProbe = 3
 )
 
 var (
@@ -87,10 +96,6 @@ var (
 			Entity: "offchain",
 			Action: "write",
 		}},
-		"/routerrpc.Router/SendToRoute": {{
-			Entity: "offchain",
-			Action: "write",
-		}},
 		"/routerrpc.Router/TrackPaymentV2": {{
 			Entity: "offchain",
 			Action: "read",
@@ -135,14 +140,6 @@ var (
 			Entity: "offchain",
 			Action: "read",
 		}},
-		"/routerrpc.Router/SendPayment": {{
-			Entity: "offchain",
-			Action: "write",
-		}},
-		"/routerrpc.Router/TrackPayment": {{
-			Entity: "offchain",
-			Action: "read",
-		}},
 		"/routerrpc.Router/HtlcInterceptor": {{
 			Entity: "offchain",
 			Action: "write",
@@ -159,6 +156,10 @@ var (
 			Entity: "offchain",
 			Action: "write",
 		}},
+		"/routerrpc.Router/DeleteForwardingHistory": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
 	}
 
 	// DefaultRouterMacFilename is the default name of the router macaroon
@@ -166,6 +167,10 @@ var (
 	// configuration file in this package.
 	DefaultRouterMacFilename = "router.macaroon"
 )
+
+// HasNode returns true if the node exists in the graph (i.e., has public
+// channels), false otherwise.
+type HasNode func(nodePub route.Vertex) (bool, error)
 
 // ServerShell is a shell struct holding a reference to the actual sub-server.
 // It is used to register the gRPC sub-server with the root server before we
@@ -289,7 +294,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterRouterServer(grpcServer, r)
 
-	log.Debugf("Router RPC server successfully register with root gRPC " +
+	log.Debugf("Router RPC server successfully registered with root gRPC " +
 		"server")
 
 	return nil
@@ -344,6 +349,11 @@ func (r *ServerShell) CreateSubServer(configRegistry lnrpc.SubServerConfigDispat
 func (s *Server) SendPaymentV2(req *SendPaymentRequest,
 	stream Router_SendPaymentV2Server) error {
 
+	// Set payment request attempt timeout.
+	if req.TimeoutSeconds == 0 {
+		req.TimeoutSeconds = DefaultPaymentTimeout
+	}
+
 	payment, err := s.cfg.RouterBackend.extractIntentFromSendRequest(req)
 	if err != nil {
 		return err
@@ -359,9 +369,9 @@ func (s *Server) SendPaymentV2(req *SendPaymentRequest,
 			payment.Identifier(), err)
 
 		// Transform user errors to grpc code.
-		if errors.Is(err, channeldb.ErrPaymentExists) ||
-			errors.Is(err, channeldb.ErrPaymentInFlight) ||
-			errors.Is(err, channeldb.ErrAlreadyPaid) {
+		if errors.Is(err, paymentsdb.ErrPaymentExists) ||
+			errors.Is(err, paymentsdb.ErrPaymentInFlight) ||
+			errors.Is(err, paymentsdb.ErrAlreadyPaid) {
 
 			return status.Error(
 				codes.AlreadyExists, err.Error(),
@@ -495,8 +505,31 @@ func (s *Server) probeDestination(dest []byte, amtSat int64) (*RouteFeeResponse,
 // node. If the route hints don't indicate an LSP, they are passed as arguments
 // to the SendPayment_V2 method, which enable it to send probe payments to the
 // payment request destination.
+//
+// NOTE: Be aware that because of the special heuristic that is applied to
+// identify LSPs, the probe payment might use a different node id as the
+// final destination (the assumed LSP node id).
 func (s *Server) probePaymentRequest(ctx context.Context, paymentRequest string,
 	timeout uint32) (*RouteFeeResponse, error) {
+
+	return s.probePaymentRequestWithSender(
+		ctx, paymentRequest, timeout, s.sendProbePayment,
+	)
+}
+
+// probePaymentSender dispatches a probe payment request and returns the
+// resulting fee estimate. It exists as a test seam so tests can inject a stub
+// sender and inspect generated probe requests without running the payment
+// lifecycle.
+type probePaymentSender func(context.Context,
+	*SendPaymentRequest) (*RouteFeeResponse, error)
+
+// probePaymentRequestWithSender contains the implementation of
+// probePaymentRequest. The sender is injected so tests can inspect generated
+// probe requests without invoking the full payment lifecycle.
+func (s *Server) probePaymentRequestWithSender(ctx context.Context,
+	paymentRequest string, timeout uint32,
+	sendProbePayment probePaymentSender) (*RouteFeeResponse, error) {
 
 	payReq, err := zpay32.Decode(
 		paymentRequest, s.cfg.RouterBackend.ActiveNetParams,
@@ -505,7 +538,7 @@ func (s *Server) probePaymentRequest(ctx context.Context, paymentRequest string,
 		return nil, err
 	}
 
-	if *payReq.MilliSat <= 0 {
+	if payReq.MilliSat == nil || *payReq.MilliSat <= 0 {
 		return nil, errors.New("payment request amount must be " +
 			"greater than 0")
 	}
@@ -535,6 +568,7 @@ func (s *Server) probePaymentRequest(ctx context.Context, paymentRequest string,
 	// If the payment addresses is specified, then we'll also populate that
 	// now as well.
 	payReq.PaymentAddr.WhenSome(func(addr [32]byte) {
+		probeRequest.PaymentAddr = make([]byte, lntypes.HashSize)
 		copy(probeRequest.PaymentAddr, addr[:])
 	})
 
@@ -543,174 +577,366 @@ func (s *Server) probePaymentRequest(ctx context.Context, paymentRequest string,
 	// If the hints don't indicate an LSP then chances are that our probe
 	// payment won't be blocked along the route to the destination. We send
 	// a probe payment with unmodified route hints.
-	if !isLSP(hints) {
+	invoiceTargetCompressed := payReq.Destination.SerializeCompressed()
+	if !isLSP(hints, invoiceTargetCompressed, s.cfg.RouterBackend.HasNode) {
+		log.Infof("No LSP detected, probing destination %x",
+			probeRequest.Dest)
+
 		probeRequest.RouteHints = invoicesrpc.CreateRPCRouteHints(hints)
-		return s.sendProbePayment(ctx, probeRequest)
+
+		return sendProbePayment(ctx, probeRequest)
 	}
 
-	// If the heuristic indicates an LSP we modify the route hints to allow
-	// probing the LSP.
-	lspAdjustedRouteHints, lspHint, err := prepareLspRouteHints(
-		hints, *payReq.MilliSat,
+	// If the heuristic indicates an LSP, we filter and group route hints by
+	// public LSP nodes, then probe each unique LSP separately and return
+	// the route with the highest fee.
+	lspGroups, err := prepareLspRouteHints(
+		hints, *payReq.MilliSat, s.cfg.RouterBackend.HasNode,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	// The adjusted route hints serve the payment probe to find the last
-	// public hop to the LSP on the route.
-	probeRequest.Dest = lspHint.NodeID.SerializeCompressed()
-	if len(lspAdjustedRouteHints) > 0 {
-		probeRequest.RouteHints = invoicesrpc.CreateRPCRouteHints(
-			lspAdjustedRouteHints,
-		)
+	log.Infof("LSP detected, found %d unique public LSP node(s) to probe",
+		len(lspGroups))
+
+	// Probe up to MaxLspsToProbe LSPs and track the most expensive route
+	// for worst-case fee estimation.
+	if len(lspGroups) > MaxLspsToProbe {
+		log.Debugf("Limiting LSP probes from %d to %d for worst-case "+
+			"fee estimation", len(lspGroups), MaxLspsToProbe)
 	}
+	var (
+		worstCaseResp    *RouteFeeResponse
+		worstCaseLspDest route.Vertex
+		probeCount       int
+	)
 
-	// The payment probe will be able to calculate the fee up until the LSP
-	// node. The fee of the last hop has to be calculated manually. Since
-	// the last hop's fee amount has to be sent across the payment path we
-	// have to add it to the original payment amount. Only then will the
-	// payment probe be able to determine the correct fee to the last hop
-	// prior to the private destination. For example, if the user wants to
-	// send 1000 sats to a private destination and the last hop's fee is 10
-	// sats, then 1010 sats will have to arrive at the last hop. This means
-	// that the probe has to be dispatched with 1010 sats to correctly
-	// calculate the routing fee.
-	//
-	// Calculate the hop fee for the last hop manually.
-	hopFee := lspHint.HopFee(*payReq.MilliSat)
-	if err != nil {
-		return nil, err
-	}
+	for lspKey, group := range lspGroups {
+		if probeCount >= MaxLspsToProbe {
+			break
+		}
+		probeCount++
 
-	// Add the last hop's fee to the requested payment amount that we want
-	// to get an estimate for.
-	probeRequest.AmtMsat += int64(hopFee)
+		lspHint := group.LspHopHint
 
-	// Use the hop hint's cltv delta as the payment request's final cltv
-	// delta. The actual final cltv delta of the invoice will be added to
-	// the payment probe's cltv delta.
-	probeRequest.FinalCltvDelta = int32(lspHint.CLTVExpiryDelta)
+		// Each LSP probe must use a unique payment hash, otherwise the
+		// payment lifecycle will treat later probes as attempts on the
+		// first probe's payment and reuse its payment-level parameters.
+		var lspPaymentHash lntypes.Hash
+		_, err := crand.Read(lspPaymentHash[:])
+		if err != nil {
+			return nil, fmt.Errorf("cannot generate random probe "+
+				"preimage: %w", err)
+		}
 
-	// Dispatch the payment probe with adjusted fee amount.
-	resp, err := s.sendProbePayment(ctx, probeRequest)
-	if err != nil {
-		return nil, err
-	}
+		log.Infof("Probing LSP with destination: %v", lspKey)
 
-	// If the payment probe failed we only return the failure reason and
-	// leave the probe result params unaltered.
-	if resp.FailureReason != lnrpc.PaymentFailureReason_FAILURE_REASON_NONE { //nolint:lll
-		return resp, nil
-	}
+		// Create a new probe request for this LSP.
+		lspProbeRequest := &SendPaymentRequest{
+			TimeoutSeconds:   probeRequest.TimeoutSeconds,
+			Dest:             lspKey[:],
+			MaxParts:         probeRequest.MaxParts,
+			AllowSelfPayment: probeRequest.AllowSelfPayment,
+			AmtMsat:          amtMsat,
+			PaymentHash:      lspPaymentHash[:],
+			FeeLimitSat:      probeRequest.FeeLimitSat,
+			FinalCltvDelta:   int32(lspHint.CLTVExpiryDelta),
+			DestFeatures:     probeRequest.DestFeatures,
+		}
 
-	// The probe succeeded, so we can add the last hop's fee to fee the
-	// payment probe returned.
-	resp.RoutingFeeMsat += int64(hopFee)
+		// Copy the payment address if present.
+		if len(probeRequest.PaymentAddr) > 0 {
+			lspProbeRequest.PaymentAddr = make(
+				[]byte, lntypes.HashSize,
+			)
 
-	// Add the final cltv delta of the invoice to the payment probe's total
-	// cltv delta. This is the cltv delta for the hop behind the LSP.
-	resp.TimeLockDelay += int64(payReq.MinFinalCLTVExpiry())
+			copy(
+				lspProbeRequest.PaymentAddr,
+				probeRequest.PaymentAddr,
+			)
+		}
 
-	return resp, nil
-}
+		// Set the adjusted route hints for this LSP.
+		if len(group.AdjustedRouteHints) > 0 {
+			lspProbeRequest.RouteHints = invoicesrpc.
+				CreateRPCRouteHints(group.AdjustedRouteHints)
+		}
 
-// isLSP checks if the route hints indicate an LSP. An LSP is indicated with
-// true if the last node in each route hint has the same node id, false
-// otherwise.
-func isLSP(routeHints [][]zpay32.HopHint) bool {
-	if len(routeHints) == 0 || len(routeHints[0]) == 0 {
-		return false
-	}
+		// Calculate the hop fee for the last hop manually.
+		hopFee := lspHint.HopFee(*payReq.MilliSat)
 
-	refNodeID := routeHints[0][len(routeHints[0])-1].NodeID
-	for i := 1; i < len(routeHints); i++ {
-		// Skip empty route hints.
-		if len(routeHints[i]) == 0 {
+		// Add the last hop's fee to the probe amount.
+		lspProbeRequest.AmtMsat += int64(hopFee)
+
+		// Dispatch the payment probe for this LSP.
+		resp, err := sendProbePayment(ctx, lspProbeRequest)
+		if err != nil {
+			log.Warnf("Failed to probe LSP %v: %v", lspKey, err)
 			continue
 		}
 
-		lastHop := routeHints[i][len(routeHints[i])-1]
-		idMatchesRefNode := bytes.Equal(
-			lastHop.NodeID.SerializeCompressed(),
-			refNodeID.SerializeCompressed(),
-		)
-		if !idMatchesRefNode {
+		// If the probe failed, skip this LSP.
+		if resp.FailureReason !=
+			lnrpc.PaymentFailureReason_FAILURE_REASON_NONE {
+
+			log.Debugf("Probe to LSP %v failed with reason: %v",
+				lspKey, resp.FailureReason)
+
+			continue
+		}
+
+		// The probe succeeded, add the last hop's fee.
+		resp.RoutingFeeMsat += int64(hopFee)
+
+		// Add the final cltv delta of the invoice.
+		resp.TimeLockDelay += int64(payReq.MinFinalCLTVExpiry())
+
+		log.Infof("Probe to LSP %v succeeded with fee: %d msat",
+			lspKey, resp.RoutingFeeMsat)
+
+		// Track the most expensive route for worst-case estimation.
+		// We solely consider the routing fee for the worst-case
+		// estimation.
+		if worstCaseResp == nil ||
+			resp.RoutingFeeMsat > worstCaseResp.RoutingFeeMsat {
+
+			if worstCaseResp != nil {
+				log.Debugf("LSP %v has higher fee "+
+					"(%d msat) than current worst-case "+
+					"%v (%d msat), updating worst-case "+
+					"estimate", lspKey,
+					resp.RoutingFeeMsat, worstCaseLspDest,
+					worstCaseResp.RoutingFeeMsat)
+			}
+
+			worstCaseResp = resp
+			worstCaseLspDest = lspKey
+		} else {
+			log.Debugf("LSP %v fee (%d msat) is lower than "+
+				"current worst-case %v (%d msat), keeping "+
+				"worst-case estimate", lspKey,
+				resp.RoutingFeeMsat, worstCaseLspDest,
+				worstCaseResp.RoutingFeeMsat)
+		}
+	}
+
+	// If no LSP probe succeeded, return an error.
+	if worstCaseResp == nil {
+		return nil, fmt.Errorf("all LSP probe payments failed")
+	}
+
+	log.Infof("Returning worst-case route via LSP %v with fee: %d msat, "+
+		"timelock: %d", worstCaseLspDest, worstCaseResp.RoutingFeeMsat,
+		worstCaseResp.TimeLockDelay)
+
+	return worstCaseResp, nil
+}
+
+// isLSP checks if the route hints indicate an LSP setup. An LSP setup is
+// identified when the invoice destination is private but the final hop in the
+// route hints is a public node (the LSP). This function implements three rules:
+//
+//  1. If the invoice target is a public node (exists in graph) => isLsp = false
+//     We can route directly to the target, so no LSP is involved.
+//
+//  2. If at least one destination hop hint (last hop in route hint) is public
+//     => isLsp = true. The public destination hop is the LSP, and the actual
+//     invoice target is a private node behind it.
+//
+//  3. If all destination hop hints are private nodes => isLsp = false.
+//     We assume this is NOT an LSP setup. Instead, we expect the route hints
+//     contain public nodes earlier in the path (not the final hop) that our
+//     pathfinder can route to. For example:
+//     The pathfinder will route to PublicNode and use the hints from there.
+//     Note: If no public nodes exist anywhere in the route hints, the
+//     destination would be unreachable (malformed invoice), but we don't
+//     validate that here.
+func isLSP(routeHints [][]zpay32.HopHint, invoiceTarget []byte,
+	hasNode HasNode) bool {
+
+	if len(routeHints) == 0 || len(routeHints[0]) == 0 {
+		log.Debugf("No route hints provided, this is not an LSP setup")
+		return false
+	}
+
+	// Rule 1: If the invoice target is a public node (exists in the graph),
+	// we can route directly to it, so it's not an LSP setup.
+	if len(invoiceTarget) > 0 {
+		var targetVertex route.Vertex
+		copy(targetVertex[:], invoiceTarget)
+
+		isPublic, err := hasNode(targetVertex)
+		if err != nil {
+			log.Warnf("Failed to check if invoice target %x is "+
+				"public: %v", invoiceTarget, err)
+
+			return false
+		}
+		if isPublic {
+			log.Infof("Invoice target %x is a public node in the "+
+				"graph, this is NOT an LSP setup",
+				invoiceTarget)
+
 			return false
 		}
 	}
 
-	return true
+	for _, hopHints := range routeHints {
+		// Skip empty route hints.
+		if len(hopHints) == 0 {
+			continue
+		}
+
+		lastHop := hopHints[len(hopHints)-1]
+		lastHopNodeCompressed := lastHop.NodeID.SerializeCompressed()
+
+		// Check if this destination hop hint node is public.
+		// Rule 2: If we find a public node, we can exit early.
+		var lastHopVertex route.Vertex
+		copy(lastHopVertex[:], lastHopNodeCompressed)
+
+		isPublic, err := hasNode(lastHopVertex)
+		if err != nil {
+			log.Warnf("Failed to check if destination hop "+
+				"hint %x is public: %v", lastHopNodeCompressed,
+				err)
+
+			continue
+		}
+		if isPublic {
+			log.Infof("Destination hop hint %x is a public node, "+
+				"this is an LSP setup", lastHopNodeCompressed)
+
+			return true
+		}
+	}
+
+	// Rule 3: If all destination hop hints are private nodes (not in the
+	// graph), this is NOT an LSP setup. We assume the route hints contain
+	// public nodes earlier in the path that we can route through using
+	// standard pathfinding with the hints.
+	log.Infof("All destination hop hints are private, this is NOT an " +
+		"LSP setup")
+
+	return false
+}
+
+// LspRouteGroup represents a group of route hints that share the same public
+// LSP destination node. This is needed when probing LSPs separately to find
+// the route with the highest fee.
+type LspRouteGroup struct {
+	// LspHopHint is the hop hint for the LSP node with worst-case fees and
+	// CLTV delta.
+	LspHopHint *zpay32.HopHint
+
+	// AdjustedRouteHints are the route hints with the LSP hop stripped off.
+	AdjustedRouteHints [][]zpay32.HopHint
 }
 
 // prepareLspRouteHints assumes that the isLsp heuristic returned true for the
-// route hints passed in here. It constructs a modified list of route hints that
-// allows the caller to probe the LSP, which itself is returned as a separate
-// hop hint.
+// route hints passed in here. It filters route hints to only include those with
+// public destination nodes, groups them by unique LSP node, and returns a map
+// of LSP groups keyed by the LSP node's compressed public key.
 func prepareLspRouteHints(routeHints [][]zpay32.HopHint,
-	amt lnwire.MilliSatoshi) ([][]zpay32.HopHint, *zpay32.HopHint, error) {
+	amt lnwire.MilliSatoshi,
+	hasNode HasNode) (map[route.Vertex]*LspRouteGroup, error) {
 
+	// This should never happen, but we check for it for completeness.
+	// Because the isLSP heuristic already checked that the route hints are
+	// not empty.
 	if len(routeHints) == 0 {
-		return nil, nil, fmt.Errorf("no route hints provided")
+		return nil, fmt.Errorf("no route hints provided")
 	}
 
-	// Create the LSP hop hint. We are probing for the worst case fee and
-	// cltv delta. So we look for the max values amongst all LSP hop hints.
-	refHint := routeHints[0][len(routeHints[0])-1]
-	refHint.CLTVExpiryDelta = maxLspCltvDelta(routeHints)
-	refHint.FeeBaseMSat, refHint.FeeProportionalMillionths = maxLspFee(
-		routeHints, amt,
-	)
+	// Map to group route hints by LSP node pubkey.
+	lspGroups := make(map[route.Vertex]*LspRouteGroup)
 
-	// We construct a modified list of route hints that allows the caller to
-	// probe the LSP.
-	adjustedHints := make([][]zpay32.HopHint, 0, len(routeHints))
+	for _, routeHint := range routeHints {
+		// Skip empty route hints.
+		if len(routeHint) == 0 {
+			continue
+		}
 
-	// Strip off the LSP hop hint from all route hints.
-	for i := 0; i < len(routeHints); i++ {
-		hint := routeHints[i]
-		if len(hint) > 1 {
-			adjustedHints = append(
-				adjustedHints, hint[:len(hint)-1],
+		// Get the destination hop hint (last hop in the route).
+		destHop := routeHint[len(routeHint)-1]
+		destNodeCompressed := destHop.NodeID.SerializeCompressed()
+
+		// Check if this destination node is public.
+		var destVertex route.Vertex
+		copy(destVertex[:], destNodeCompressed)
+
+		isPublic, err := hasNode(destVertex)
+		if err != nil {
+			log.Warnf("Failed to check if dest hop hint %x is "+
+				"public: %v", destNodeCompressed, err)
+
+			continue
+		}
+
+		// Skip private destination nodes - we only probe public LSPs.
+		if !isPublic {
+			log.Debugf("Skipping route hint with private dest "+
+				"node %x", destNodeCompressed)
+
+			continue
+		}
+
+		// Use the compressed pubkey as the map key.
+		var lspKey route.Vertex
+		copy(lspKey[:], destNodeCompressed)
+
+		// Get or create the LSP group for this node.
+		group, exists := lspGroups[lspKey]
+		if !exists {
+			//nolint:ll
+			lspHop := zpay32.HopHint{
+				NodeID:                    destHop.NodeID,
+				ChannelID:                 destHop.ChannelID,
+				FeeBaseMSat:               destHop.FeeBaseMSat,
+				FeeProportionalMillionths: destHop.FeeProportionalMillionths,
+				CLTVExpiryDelta:           destHop.CLTVExpiryDelta,
+			}
+			group = &LspRouteGroup{
+				LspHopHint:         &lspHop,
+				AdjustedRouteHints: make([][]zpay32.HopHint, 0),
+			}
+			lspGroups[lspKey] = group
+		}
+
+		// Update the LSP hop hint with worst-case (max) fees and CLTV.
+		hopFee := destHop.HopFee(amt)
+		currentMaxFee := group.LspHopHint.HopFee(amt)
+		if hopFee > currentMaxFee {
+			group.LspHopHint.FeeBaseMSat = destHop.FeeBaseMSat
+			group.LspHopHint.FeeProportionalMillionths = destHop.
+				FeeProportionalMillionths
+		}
+
+		if destHop.CLTVExpiryDelta > group.LspHopHint.CLTVExpiryDelta {
+			group.LspHopHint.CLTVExpiryDelta = destHop.
+				CLTVExpiryDelta
+		}
+
+		// Add the route hint with the LSP hop stripped off (if there
+		// are hops before the LSP).
+		if len(routeHint) > 1 {
+			group.AdjustedRouteHints = append(
+				group.AdjustedRouteHints,
+				routeHint[:len(routeHint)-1],
 			)
 		}
 	}
 
-	return adjustedHints, &refHint, nil
-}
-
-// maxLspFee returns base fee and fee rate amongst all LSP route hints that
-// results in the overall highest fee for the given amount.
-func maxLspFee(routeHints [][]zpay32.HopHint, amt lnwire.MilliSatoshi) (uint32,
-	uint32) {
-
-	var maxFeePpm uint32
-	var maxBaseFee uint32
-	var maxTotalFee lnwire.MilliSatoshi
-	for _, rh := range routeHints {
-		lastHop := rh[len(rh)-1]
-		lastHopFee := lastHop.HopFee(amt)
-		if lastHopFee > maxTotalFee {
-			maxTotalFee = lastHopFee
-			maxBaseFee = lastHop.FeeBaseMSat
-			maxFeePpm = lastHop.FeeProportionalMillionths
-		}
+	if len(lspGroups) == 0 {
+		return nil, fmt.Errorf("no public LSP nodes found in " +
+			"route hints")
 	}
 
-	return maxBaseFee, maxFeePpm
-}
+	log.Infof("Found %d unique public LSP node(s) in route hints",
+		len(lspGroups))
 
-// maxLspCltvDelta returns the maximum cltv delta amongst all LSP route hints.
-func maxLspCltvDelta(routeHints [][]zpay32.HopHint) uint16 {
-	var maxCltvDelta uint16
-	for _, rh := range routeHints {
-		rhLastHop := rh[len(rh)-1]
-		if rhLastHop.CLTVExpiryDelta > maxCltvDelta {
-			maxCltvDelta = rhLastHop.CLTVExpiryDelta
-		}
-	}
-
-	return maxCltvDelta
+	return lspGroups, nil
 }
 
 // probePaymentStream is a custom implementation of the grpc.ServerStream
@@ -786,7 +1012,7 @@ func (s *Server) sendProbePayment(ctx context.Context,
 			case lnrpc.Payment_FAILED:
 				// Incorrect payment details point to a
 				// successful probe.
-				//nolint:lll
+				//nolint:ll
 				if payment.FailureReason == lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS {
 					return paymentDetails(payment)
 				}
@@ -874,7 +1100,7 @@ func (s *Server) SendToRouteV2(ctx context.Context,
 		return nil, err
 	}
 
-	var attempt *channeldb.HTLCAttempt
+	var attempt *paymentsdb.HTLCAttempt
 
 	// Pass route to the router. This call returns the full htlc attempt
 	// information as it is stored in the database. It is possible that both
@@ -884,11 +1110,11 @@ func (s *Server) SendToRouteV2(ctx context.Context,
 	// db.
 	if req.SkipTempErr {
 		attempt, err = s.cfg.Router.SendToRouteSkipTempErr(
-			hash, route, firstHopRecords,
+			ctx, hash, route, firstHopRecords,
 		)
 	} else {
 		attempt, err = s.cfg.Router.SendToRoute(
-			hash, route, firstHopRecords,
+			ctx, hash, route, firstHopRecords,
 		)
 	}
 	if attempt != nil {
@@ -903,13 +1129,13 @@ func (s *Server) SendToRouteV2(ctx context.Context,
 
 	// Transform user errors to grpc code.
 	switch {
-	case errors.Is(err, channeldb.ErrPaymentExists):
+	case errors.Is(err, paymentsdb.ErrPaymentExists):
 		fallthrough
 
-	case errors.Is(err, channeldb.ErrPaymentInFlight):
+	case errors.Is(err, paymentsdb.ErrPaymentInFlight):
 		fallthrough
 
-	case errors.Is(err, channeldb.ErrAlreadyPaid):
+	case errors.Is(err, paymentsdb.ErrAlreadyPaid):
 		return nil, status.Error(
 			codes.AlreadyExists, err.Error(),
 		)
@@ -1031,7 +1257,7 @@ func (s *Server) SetMissionControlConfig(ctx context.Context,
 					req.Config.HopProbability,
 				),
 				AprioriWeight:    float64(req.Config.Weight),
-				CapacityFraction: routing.DefaultCapacityFraction, //nolint:lll
+				CapacityFraction: routing.DefaultCapacityFraction, //nolint:ll
 			}
 		}
 
@@ -1316,7 +1542,7 @@ func (s *Server) subscribePayment(identifier lntypes.Hash) (
 	sub, err := router.Tower.SubscribePayment(identifier)
 
 	switch {
-	case errors.Is(err, channeldb.ErrPaymentNotInitiated):
+	case errors.Is(err, paymentsdb.ErrPaymentNotInitiated):
 		return nil, status.Error(codes.NotFound, err.Error())
 
 	case err != nil:
@@ -1334,12 +1560,17 @@ func (s *Server) trackPayment(subscription routing.ControlTowerSubscriber,
 	err := s.trackPaymentStream(
 		stream.Context(), subscription, noInflightUpdates, stream.Send,
 	)
+	switch {
+	case err == nil:
+		return nil
 
 	// If the context is canceled, we don't return an error.
-	if errors.Is(err, context.Canceled) {
+	case errors.Is(err, context.Canceled):
 		log.Infof("Payment stream %v canceled", identifier)
 
 		return nil
+
+	default:
 	}
 
 	// Otherwise, we will log and return the error as the stream has
@@ -1391,17 +1622,21 @@ func (s *Server) trackPaymentStream(context context.Context,
 				// No more payment updates.
 				return nil
 			}
-			result := item.(*channeldb.MPPayment)
+			result, ok := item.(*paymentsdb.MPPayment)
+			if !ok {
+				return fmt.Errorf("unexpected payment type: %T",
+					item)
+			}
 
 			log.Tracef("Payment %v updated to state %v",
 				result.Info.PaymentIdentifier, result.Status)
 
 			// Skip in-flight updates unless requested.
 			if noInflightUpdates {
-				if result.Status == channeldb.StatusInitiated {
+				if result.Status == paymentsdb.StatusInitiated {
 					continue
 				}
-				if result.Status == channeldb.StatusInFlight {
+				if result.Status == paymentsdb.StatusInFlight {
 					continue
 				}
 			}
@@ -1652,8 +1887,13 @@ func (s *Server) XAddLocalChanAliases(_ context.Context,
 					rpcAlias)
 			}
 
+			// We set the baseLookup flag as we want the alias
+			// manager to keep a mapping from the alias back to its
+			// base scid, in order to be able to provide it via the
+			// FindBaseLocalChanAlias RPC.
 			err = s.cfg.AliasMgr.AddLocalAlias(
 				aliasScid, baseScid, false, true,
+				aliasmgr.WithBaseLookup(),
 			)
 			if err != nil {
 				return nil, fmt.Errorf("error adding scid "+
@@ -1698,6 +1938,22 @@ func (s *Server) XDeleteLocalChanAliases(_ context.Context,
 	}, nil
 }
 
+// XFindBaseLocalChanAlias is an experimental API that looks up the base scid
+// for a local chan alias that was registered.
+func (s *Server) XFindBaseLocalChanAlias(_ context.Context,
+	in *FindBaseAliasRequest) (*FindBaseAliasResponse, error) {
+
+	aliasScid := lnwire.NewShortChanIDFromInt(in.Alias)
+	base, err := s.cfg.AliasMgr.FindBaseSCID(aliasScid)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FindBaseAliasResponse{
+		Base: base.ToUint64(),
+	}, nil
+}
+
 func extractOutPoint(req *UpdateChanStatusRequest) (*wire.OutPoint, error) {
 	chanPoint := req.GetChanPoint()
 	txid, err := lnrpc.GetChanPointFundingTxid(chanPoint)
@@ -1737,4 +1993,91 @@ func (s *Server) UpdateChanStatus(_ context.Context,
 		return nil, err
 	}
 	return &UpdateChanStatusResponse{}, nil
+}
+
+// DeleteForwardingHistory deletes forwarding history events with a timestamp
+// at or before a specified time. This method is useful for implementing data
+// retention policies for privacy purposes.
+func (s *Server) DeleteForwardingHistory(ctx context.Context,
+	req *DeleteForwardingHistoryRequest) (*DeleteForwardingHistoryResponse,
+	error) {
+
+	now := s.cfg.RouterBackend.Clock.Now()
+
+	// Determine the deletion cutoff time from the request.
+	var deleteBeforeTime time.Time
+	switch timeSpec := req.TimeSpec.(type) {
+	case *DeleteForwardingHistoryRequest_DeleteBeforeTime:
+		deleteBeforeTime = time.Unix(
+			int64(timeSpec.DeleteBeforeTime), 0,
+		)
+
+	case *DeleteForwardingHistoryRequest_DeleteBeforeDuration:
+		// Parse duration using hybrid approach: try standard library
+		// first, fall back to custom units (d, w, M, y) if needed.
+		duration, err := parseDuration(timeSpec.DeleteBeforeDuration)
+		if err != nil {
+			return nil, fmt.Errorf("invalid duration format: %w",
+				err)
+		}
+
+		// Calculate the absolute time by adding the (negative)
+		// duration to now.
+		deleteBeforeTime = now.Add(duration)
+
+	default:
+		return nil, fmt.Errorf("time specification required: either " +
+			"delete_before_time or delete_before_duration must " +
+			"be provided")
+	}
+
+	// Guard against pre-epoch timestamps. A very large negative duration
+	// (e.g. -100y) would push deleteBeforeTime before the Unix epoch,
+	// causing uint64(endTime.UnixNano()) in the DB layer to wrap to a
+	// near-max value and delete the entire bucket.
+	if deleteBeforeTime.Before(time.Unix(0, 0)) {
+		return nil, fmt.Errorf("delete_before_time must not be " +
+			"before the Unix epoch")
+	}
+
+	// Require the cutoff to be at least minAge in the past to prevent
+	// accidental deletion of recent data. The default is 1 hour;
+	// integration tests may lower this via the dev config flag.
+	minAge := s.cfg.RouterBackend.MinForwardingHistoryAge
+	if minAge == 0 {
+		minAge = time.Hour
+	}
+	if now.Sub(deleteBeforeTime) < minAge {
+		return nil, fmt.Errorf("delete_before_time must be at "+
+			"least %v in the past to prevent accidental deletion "+
+			"of recent data (requested: %v, now: %v)",
+			minAge, deleteBeforeTime, now)
+	}
+
+	batchSize := s.cfg.RouterBackend.FwdHistoryDeleteBatchSize
+
+	log.Infof("DeleteForwardingHistory: deleting events at or before %v "+
+		"with batch size %d", deleteBeforeTime, batchSize)
+
+	// Call the database deletion method, threading the request context
+	// through so the operation can be aborted between batches if the
+	// caller disconnects or times out. A batch size of 0 is fine — the
+	// DB layer applies the default.
+	stats, err := s.cfg.RouterBackend.ForwardingLog.DeleteForwardingEvents(
+		ctx, deleteBeforeTime, batchSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete forwarding events: %w",
+			err)
+	}
+
+	log.Infof("DeleteForwardingHistory: deleted %d events, total fees: "+
+		"%d msat", stats.NumEventsDeleted, stats.TotalFeeMsat)
+
+	return &DeleteForwardingHistoryResponse{
+		EventsDeleted: stats.NumEventsDeleted,
+		TotalFeeMsat:  stats.TotalFeeMsat,
+		Status: fmt.Sprintf("Successfully deleted %d forwarding events",
+			stats.NumEventsDeleted),
+	}, nil
 }

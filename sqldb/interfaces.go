@@ -22,7 +22,7 @@ const (
 	// DefaultNumTxRetries is the default number of times we'll retry a
 	// transaction if it fails with an error that permits transaction
 	// repetition.
-	DefaultNumTxRetries = 10
+	DefaultNumTxRetries = 20
 
 	// DefaultRetryDelay is the default delay between retries. This will be
 	// used to generate a random delay between 0 and this value.
@@ -37,6 +37,35 @@ const (
 type TxOptions interface {
 	// ReadOnly returns true if the transaction should be read only.
 	ReadOnly() bool
+}
+
+// txOptions is a concrete implementation of the TxOptions interface.
+type txOptions struct {
+	// readOnly indicates if the transaction should be read-only.
+	readOnly bool
+}
+
+// ReadOnly returns true if the transaction should be read only.
+//
+// NOTE: This is part of the TxOptions interface.
+func (t *txOptions) ReadOnly() bool {
+	return t.readOnly
+}
+
+// WriteTxOpt returns a TxOptions that indicates that the transaction
+// should be a write transaction.
+func WriteTxOpt() TxOptions {
+	return &txOptions{
+		readOnly: false,
+	}
+}
+
+// ReadTxOpt returns a TxOptions that indicates that the transaction
+// should be a read-only transaction.
+func ReadTxOpt() TxOptions {
+	return &txOptions{
+		readOnly: true,
+	}
 }
 
 // BatchedTx is a generic interface that represents the ability to execute
@@ -183,7 +212,7 @@ func randRetryDelay(initialRetryDelay, maxRetryDelay time.Duration,
 	// attempt. If we double something n times, that's the same as
 	// multiplying the value with 2^n. We limit the power to 32 to avoid
 	// overflows.
-	factor := time.Duration(math.Pow(2, math.Min(float64(attempt), 32)))
+	factor := time.Duration(math.Pow(2, min(float64(attempt), 32)))
 	actualDelay := initialDelay * factor
 
 	// Cap the delay at the maximum configured value.
@@ -247,6 +276,9 @@ func ExecuteSQLTransactionWithRetry(ctx context.Context, makeTx MakeTx,
 		tx, err := makeTx()
 		if err != nil {
 			dbErr := MapSQLError(err)
+			log.Tracef("Failed to makeTx: err=%v, dbErr=%v", err,
+				dbErr)
+
 			if IsSerializationError(dbErr) {
 				// Nothing to roll back here, since we haven't
 				// even get a transaction yet. We'll just wait
@@ -266,6 +298,8 @@ func ExecuteSQLTransactionWithRetry(ctx context.Context, makeTx MakeTx,
 		}()
 
 		if bodyErr := txBody(tx); bodyErr != nil {
+			log.Tracef("Error in txBody: %v", bodyErr)
+
 			// Roll back the transaction, then attempt a random
 			// backoff and try again if the error was a
 			// serialization error.
@@ -285,6 +319,8 @@ func ExecuteSQLTransactionWithRetry(ctx context.Context, makeTx MakeTx,
 
 		// Commit transaction.
 		if commitErr := tx.Commit(); commitErr != nil {
+			log.Tracef("Failed to commit tx: %v", commitErr)
+
 			// Roll back the transaction, then attempt a random
 			// backoff and try again if the error was a
 			// serialization error.
@@ -353,6 +389,18 @@ func (t *TransactionExecutor[Q]) ExecTx(ctx context.Context,
 		ctx, makeTx, rollbackTx, execTxBody, onBackoff,
 		t.opts.numRetries,
 	)
+}
+
+// DB is an interface that represents a generic SQL database. It provides
+// methods to apply migrations and access the underlying database connection.
+type DB interface {
+	// GetBaseDB returns the underlying BaseDB instance.
+	GetBaseDB() *BaseDB
+
+	// ApplyAllMigrations applies all migrations to the database including
+	// both sqlc and custom in-code migrations.
+	ApplyAllMigrations(ctx context.Context,
+		customMigrations []MigrationConfig) error
 }
 
 // BaseDB is the base database struct that each implementation can embed to

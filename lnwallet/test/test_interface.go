@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -34,7 +35,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chainntnfs/btcdnotify"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -199,7 +200,9 @@ func assertTxInWallet(t *testing.T, w *lnwallet.LightningWallet,
 	// We'll fetch all of our transaction and go through each one until
 	// finding the expected transaction with its expected confirmation
 	// status.
-	txs, err := w.ListTransactionDetails(0, btcwallet.UnconfirmedHeight, "")
+	txs, _, _, err := w.ListTransactionDetails(
+		0, btcwallet.UnconfirmedHeight, "", 0, 1000,
+	)
 	require.NoError(t, err, "unable to retrieve transactions")
 	for _, tx := range txs {
 		if tx.Hash != txHash {
@@ -309,16 +312,14 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 
 // createTestWallet creates a test LightningWallet will a total of 20BTC
 // available for funding channels.
-func createTestWallet(tempTestDir string, miningNode *rpctest.Harness,
-	netParams *chaincfg.Params, notifier chainntnfs.ChainNotifier,
-	wc lnwallet.WalletController, keyRing keychain.SecretKeyRing,
-	signer input.Signer, bio lnwallet.BlockChainIO) (*lnwallet.LightningWallet, error) {
+func createTestWallet(t *testing.T, tempTestDir string,
+	miningNode *rpctest.Harness, netParams *chaincfg.Params,
+	notifier chainntnfs.ChainNotifier, wc lnwallet.WalletController,
+	keyRing keychain.SecretKeyRing, signer input.Signer,
+	bio lnwallet.BlockChainIO) *lnwallet.LightningWallet {
 
 	dbDir := filepath.Join(tempTestDir, "cdb")
-	fullDB, err := channeldb.Open(dbDir)
-	if err != nil {
-		return nil, err
-	}
+	fullDB := channeldb.OpenForTesting(t, dbDir)
 
 	cfg := lnwallet.Config{
 		Database:              fullDB.ChannelStateDB(),
@@ -333,20 +334,18 @@ func createTestWallet(tempTestDir string, miningNode *rpctest.Harness,
 	}
 
 	wallet, err := lnwallet.NewLightningWallet(cfg)
-	if err != nil {
-		return nil, err
-	}
+	require.NoError(t, err)
 
-	if err := wallet.Startup(); err != nil {
-		return nil, err
-	}
+	require.NoError(t, wallet.Startup())
+
+	t.Cleanup(func() {
+		require.NoError(t, wallet.Shutdown())
+	})
 
 	// Load our test wallet with 20 outputs each holding 4BTC.
-	if err := loadTestCredits(miningNode, wallet, 20, 4); err != nil {
-		return nil, err
-	}
+	require.NoError(t, loadTestCredits(miningNode, wallet, 20, 4))
 
-	return wallet, nil
+	return wallet
 }
 
 func testGetRecoveryInfo(miner *rpctest.Harness,
@@ -1101,8 +1100,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// should be confirmed.
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
-	txDetails, err := alice.ListTransactionDetails(
-		startHeight, chainTip, "",
+	txDetails, _, _, err := alice.ListTransactionDetails(
+		startHeight, chainTip, "", 0, 1000,
 	)
 	require.NoError(t, err, "unable to fetch tx details")
 
@@ -1213,8 +1212,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// unconfirmed transactions. The transaction above should be included
 	// with a confirmation height of 0, indicating that it has not been
 	// mined yet.
-	txDetails, err = alice.ListTransactionDetails(
-		chainTip, btcwallet.UnconfirmedHeight, "",
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		chainTip, btcwallet.UnconfirmedHeight, "", 0, 1000,
 	)
 	require.NoError(t, err, "unable to fetch tx details")
 	var mempoolTxFound bool
@@ -1266,7 +1265,9 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// transactions from the last block.
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
-	txDetails, err = alice.ListTransactionDetails(chainTip, chainTip, "")
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		chainTip, chainTip, "", 0, 1000,
+	)
 	require.NoError(t, err, "unable to fetch tx details")
 	var burnTxFound bool
 	for _, txDetail := range txDetails {
@@ -1307,11 +1308,114 @@ func testListTransactionDetails(miner *rpctest.Harness,
 
 	// Query for transactions only in the latest block. We do not expect
 	// any transactions to be returned.
-	txDetails, err = alice.ListTransactionDetails(chainTip, chainTip, "")
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		chainTip, chainTip, "", 0, 1000,
+	)
 	require.NoError(t, err, "unexpected error")
 	if len(txDetails) != 0 {
 		t.Fatalf("expected 0 transactions, got: %v", len(txDetails))
 	}
+}
+
+func testListTransactionDetailsOffset(miner *rpctest.Harness,
+	alice, _ *lnwallet.LightningWallet, t *testing.T) {
+
+	// Create 5 new outputs spendable by the wallet.
+	const numTxns = 5
+	const outputAmt = btcutil.SatoshiPerBitcoin
+	isOurAddress := make(map[string]bool)
+	txids := make(map[chainhash.Hash]struct{})
+	for i := 0; i < numTxns; i++ {
+		addr, err := alice.NewAddress(
+			lnwallet.WitnessPubKey, false,
+			lnwallet.DefaultAccountName,
+		)
+		require.NoError(t, err)
+
+		isOurAddress[addr.EncodeAddress()] = true
+		script, err := txscript.PayToAddrScript(addr)
+		require.NoError(t, err)
+
+		output := &wire.TxOut{
+			Value:    outputAmt,
+			PkScript: script,
+		}
+		txid, err := miner.SendOutputs([]*wire.TxOut{output}, 2500)
+		require.NoError(t, err)
+		txids[*txid] = struct{}{}
+	}
+
+	// Get the miner's current best block height before we mine blocks.
+	_, startHeight, err := miner.Client.GetBestBlock()
+	require.NoError(t, err, "cannot get best block")
+
+	// Generate 10 blocks to mine all the transactions created above.
+	const numBlocksMined = 10
+	_, err = miner.Client.Generate(numBlocksMined)
+	require.NoError(t, err, "unable to mine blocks")
+
+	// Our new best block height should be our start height + the number of
+	// blocks we just mined.
+	chainTip := startHeight + numBlocksMined
+
+	err = waitForWalletSync(miner, alice)
+	require.NoError(t, err, "Couldn't sync Alice's wallet")
+
+	// Query for transactions, setting max_transactions to 5. We expect 5
+	// transactions to be returned.
+	txDetails, firstIdx, lastIdx, err := alice.ListTransactionDetails(
+		startHeight, chainTip, "", 0, 5,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 5)
+	require.EqualValues(t, 0, firstIdx)
+	require.EqualValues(t, 4, lastIdx)
+
+	// Query for transactions, setting max_transactions to less than the
+	// number of transactions we have (5).
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 0, 1,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 1)
+
+	// Query for transactions, setting indexOffset to 5 (equal to number
+	// of transactions we have) and max_transactions to 0.
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 5, 0,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 0)
+
+	// Query for transactions, setting indexOffset to 4 (edge offset) and
+	// max_transactions to 0.
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 4, 0,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 1)
+
+	// Query for transactions, setting max_transactions to 0.
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 0, 0,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 5)
+
+	// Query for transactions, more than we have in the wallet (5).
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 0, 10,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 5)
+
+	// Query for transactions where the offset is greater than the number
+	// of transactions available.
+	txDetails, _, _, err = alice.ListTransactionDetails(
+		startHeight, chainTip, "", 10, 100,
+	)
+	require.NoError(t, err)
+	require.Len(t, txDetails, 0)
 }
 
 func testTransactionSubscriptions(miner *rpctest.Harness,
@@ -2813,6 +2917,10 @@ var walletTests = []walletTestCase{
 		test: testListTransactionDetails,
 	},
 	{
+		name: "transaction details offset",
+		test: testListTransactionDetailsOffset,
+	},
+	{
 		name: "get transaction details",
 		test: testGetTransactionDetails,
 	},
@@ -2870,7 +2978,7 @@ func waitForMempoolTx(r *rpctest.Harness, txid *chainhash.Hash) error {
 		// Do a short wait
 		select {
 		case <-timeout:
-			return fmt.Errorf("timeout after 10s")
+			return errors.New("timeout after 30s")
 		default:
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -2901,12 +3009,12 @@ func waitForWalletSync(r *rpctest.Harness, w *lnwallet.LightningWallet) error {
 		bestHash, knownHash     *chainhash.Hash
 		bestHeight, knownHeight int32
 	)
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(30 * time.Second)
 	for !synced {
 		// Do a short wait
 		select {
 		case <-timeout:
-			return fmt.Errorf("timeout after 30s")
+			return errors.New("timeout after 30s")
 		case <-time.Tick(100 * time.Millisecond):
 		}
 
@@ -3095,9 +3203,7 @@ func TestLightningWallet(t *testing.T, targetBackEnd string) {
 
 	rpcConfig := miningNode.RPCConfig()
 
-	tempDir := t.TempDir()
-	db, err := channeldb.Open(tempDir)
-	require.NoError(t, err, "unable to create db")
+	db := channeldb.OpenForTesting(t, t.TempDir())
 	testCfg := channeldb.CacheConfig{
 		QueryDisable: false,
 	}
@@ -3189,8 +3295,9 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			// Start Alice - open a database, start a neutrino
 			// instance, and initialize a btcwallet driver for it.
 			aliceDB, err := walletdb.Create(
-				"bdb", tempTestDirAlice+"/neutrino.db", true,
-				kvdb.DefaultDBTimeout,
+				kvdb.BoltBackendName,
+				filepath.Join(tempTestDirAlice, "neutrino.db"),
+				true, kvdb.DefaultDBTimeout, false,
 			)
 			if err != nil {
 				t.Fatalf("unable to create DB: %v", err)
@@ -3209,7 +3316,9 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			if err != nil {
 				t.Fatalf("unable to make neutrino: %v", err)
 			}
-			aliceChain.Start()
+			if err := aliceChain.Start(t.Context()); err != nil {
+				t.Fatalf("unable to start neutrino: %v", err)
+			}
 			defer aliceChain.Stop()
 			aliceClient = chain.NewNeutrinoClient(
 				netParams, aliceChain,
@@ -3218,8 +3327,9 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			// Start Bob - open a database, start a neutrino
 			// instance, and initialize a btcwallet driver for it.
 			bobDB, err := walletdb.Create(
-				"bdb", tempTestDirBob+"/neutrino.db", true,
-				kvdb.DefaultDBTimeout,
+				kvdb.BoltBackendName,
+				filepath.Join(tempTestDirBob, "neutrino.db"),
+				true, kvdb.DefaultDBTimeout, false,
 			)
 			if err != nil {
 				t.Fatalf("unable to create DB: %v", err)
@@ -3238,7 +3348,9 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			if err != nil {
 				t.Fatalf("unable to make neutrino: %v", err)
 			}
-			bobChain.Start()
+			if err := bobChain.Start(t.Context()); err != nil {
+				t.Fatalf("unable to start neutrino: %v", err)
+			}
 			defer bobChain.Stop()
 			bobClient = chain.NewNeutrinoClient(
 				netParams, bobChain,
@@ -3247,8 +3359,7 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 		case "bitcoind":
 			// Start a bitcoind instance.
 			chainConn := unittest.NewBitcoindBackend(
-				t, unittest.NetParams, miningNode.P2PAddress(),
-				true, false,
+				t, unittest.NetParams, miningNode, true, false,
 			)
 
 			// Create a btcwallet bitcoind client for both Alice and
@@ -3259,8 +3370,7 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 		case "bitcoind-rpc-polling":
 			// Start a bitcoind instance.
 			chainConn := unittest.NewBitcoindBackend(
-				t, unittest.NetParams, miningNode.P2PAddress(),
-				true, true,
+				t, unittest.NetParams, miningNode, true, true,
 			)
 
 			// Create a btcwallet bitcoind client for both Alice and
@@ -3339,20 +3449,16 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 	}
 
 	// Funding via 20 outputs with 4BTC each.
-	alice, err := createTestWallet(
-		tempTestDirAlice, miningNode, netParams,
+	alice := createTestWallet(
+		t, tempTestDirAlice, miningNode, netParams,
 		chainNotifier, aliceWalletController, aliceKeyRing,
 		aliceSigner, bio,
 	)
-	require.NoError(t, err, "unable to create test ln wallet")
-	defer alice.Shutdown()
 
-	bob, err := createTestWallet(
-		tempTestDirBob, miningNode, netParams,
+	bob := createTestWallet(
+		t, tempTestDirBob, miningNode, netParams,
 		chainNotifier, bobWalletController, bobKeyRing, bobSigner, bio,
 	)
-	require.NoError(t, err, "unable to create test ln wallet")
-	defer bob.Shutdown()
 
 	// Both wallets should now have 80BTC available for
 	// spending.

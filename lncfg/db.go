@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/kvdb/postgres"
@@ -25,6 +25,7 @@ const (
 	TowerClientDBName = "wtclient.db"
 	TowerServerDBName = "watchtower.db"
 	WalletDBName      = "wallet.db"
+	NeutrinoDBName    = "neutrino.db"
 
 	SqliteChannelDBName  = "channel.sqlite"
 	SqliteChainDBName    = "chain.sqlite"
@@ -39,9 +40,6 @@ const (
 	DefaultBatchCommitInterval = 500 * time.Millisecond
 
 	defaultPostgresMaxConnections = 50
-	defaultSqliteMaxConnections   = 2
-
-	defaultSqliteBusyTimeout = 5 * time.Second
 
 	// NSChannelDB is the namespace name that we use for the combined graph
 	// and channel state DB.
@@ -71,7 +69,7 @@ const (
 
 // DB holds database configuration for LND.
 //
-//nolint:lll
+//nolint:ll
 type DB struct {
 	Backend string `long:"backend" description:"The selected database backend."`
 
@@ -85,13 +83,19 @@ type DB struct {
 
 	Sqlite *sqldb.SqliteConfig `group:"sqlite" namespace:"sqlite" description:"Sqlite settings."`
 
-	UseNativeSQL bool `long:"use-native-sql" description:"Use native SQL for tables that already support it."`
+	UseNativeSQL bool `long:"use-native-sql" description:"If set to true, native SQL will be used instead of KV emulation for tables that support it. Subsystems which support native SQL tables: Invoices, Graph."`
+
+	SkipNativeSQLMigration bool `long:"skip-native-sql-migration" description:"If set to true, the KV to native SQL migration will be skipped. Note that this option is intended for users who experience non-resolvable migration errors. Enabling after there is a non-resolvable migration error that resulted in an incomplete migration will cause that partial migration to be abandoned and ignored and an empty database will be used instead. Since invoices are currently the only native SQL database used, our channels will still work but the invoice history will be forgotten. This option has no effect if native SQL is not in use (db.use-native-sql=false)."`
 
 	NoGraphCache bool `long:"no-graph-cache" description:"Don't use the in-memory graph cache for path finding. Much slower but uses less RAM. Can only be used with a bolt database backend."`
+
+	SyncGraphCacheLoad bool `long:"sync-graph-cache-load" description:"Force synchronous loading of the graph cache. This will block the startup until the graph cache is fully loaded into memory. This is useful if any bugs appear with the new async loading feature of the graph cache."`
 
 	PruneRevocation bool `long:"prune-revocation" description:"Run the optional migration that prunes the revocation logs to save disk space."`
 
 	NoRevLogAmtData bool `long:"no-rev-log-amt-data" description:"If set, the to-local and to-remote output amounts of revoked commitment transactions will not be stored in the revocation log. Note that once this data is lost, a watchtower client will not be able to back up the revoked state."`
+
+	NoGcDecayedLog bool `long:"no-gc-decayed-log" description:"Do not run the optional migration that garbage collects the decayed log to save disk space."`
 }
 
 // DefaultDB creates and returns a new default DB config.
@@ -110,12 +114,23 @@ func DefaultDB() *DB {
 		},
 		Postgres: &sqldb.PostgresConfig{
 			MaxConnections: defaultPostgresMaxConnections,
+			// Normally we don't use a global lock for channeldb
+			// access, but if a user encounters huge concurrency
+			// issues, they can enable this to use a global lock.
+			ChannelDBWithGlobalLock: false,
+			// Default to true to maintain safe single-writer
+			// behavior until the wallet subsystem is upgraded to
+			// a native sql schema.
+			WalletDBWithGlobalLock: true,
+			QueryConfig:            *sqldb.DefaultPostgresConfig(),
 		},
 		Sqlite: &sqldb.SqliteConfig{
-			MaxConnections: defaultSqliteMaxConnections,
-			BusyTimeout:    defaultSqliteBusyTimeout,
+			MaxConnections: sqldb.DefaultSqliteMaxConns,
+			BusyTimeout:    sqldb.DefaultSqliteBusyTimeout,
+			QueryConfig:    *sqldb.DefaultSQLiteConfig(),
 		},
-		UseNativeSQL: false,
+		UseNativeSQL:           false,
+		SkipNativeSQLMigration: false,
 	}
 }
 
@@ -129,6 +144,9 @@ func (db *DB) Validate() error {
 		}
 
 	case SqliteBackend:
+		if err := db.Sqlite.Validate(); err != nil {
+			return err
+		}
 	case PostgresBackend:
 		if err := db.Postgres.Validate(); err != nil {
 			return err
@@ -188,7 +206,7 @@ func (db *DB) Init(ctx context.Context, dbPath string) error {
 		sqlbase.Init(db.Postgres.MaxConnections)
 
 	case db.Backend == SqliteBackend:
-		sqlbase.Init(db.Sqlite.MaxConnections)
+		sqlbase.Init(db.Sqlite.MaxConns())
 	}
 
 	return nil
@@ -231,10 +249,10 @@ type DatabaseBackends struct {
 	// the underlying wallet database from.
 	WalletDB btcwallet.LoaderOption
 
-	// NativeSQLStore is a pointer to a native SQL store that can be used
-	// for native SQL queries for tables that already support it. This may
-	// be nil if the use-native-sql flag was not set.
-	NativeSQLStore *sqldb.BaseDB
+	// NativeSQLStore holds a reference to the native SQL store that can
+	// be used for native SQL queries for tables that already support it.
+	// This may be nil if the use-native-sql flag was not set.
+	NativeSQLStore sqldb.DB
 
 	// Remote indicates whether the database backends are remote, possibly
 	// replicated instances or local bbolt or sqlite backed databases.
@@ -389,9 +407,15 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		// users to native SQL.
 		postgresConfig := GetPostgresConfigKVDB(db.Postgres)
 
+		// Create a separate config for channeldb with the global lock
+		// setting if configured.
+		postgresConfigChannelDB := GetPostgresConfigKVDB(db.Postgres)
+		postgresConfigChannelDB.WithGlobalLock = db.Postgres.
+			ChannelDBWithGlobalLock
+
 		postgresBackend, err := kvdb.Open(
 			kvdb.PostgresBackendName, ctx,
-			postgresConfig, NSChannelDB,
+			postgresConfigChannelDB, NSChannelDB,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error opening postgres graph "+
@@ -439,17 +463,23 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		}
 		closeFuncs[NSTowerServerDB] = postgresTowerServerBackend.Close
 
+		// Create a separate config for wallet with the global lock
+		// setting if configured.
+		postgresConfigWalletDB := GetPostgresConfigKVDB(db.Postgres)
+		postgresConfigWalletDB.WithGlobalLock = db.Postgres.
+			WalletDBWithGlobalLock
+
 		postgresWalletBackend, err := kvdb.Open(
 			kvdb.PostgresBackendName, ctx,
-			postgresConfig, NSWalletDB,
+			postgresConfigWalletDB, NSWalletDB,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("error opening postgres macaroon "+
+			return nil, fmt.Errorf("error opening postgres wallet "+
 				"DB: %v", err)
 		}
 		closeFuncs[NSWalletDB] = postgresWalletBackend.Close
 
-		var nativeSQLStore *sqldb.BaseDB
+		var nativeSQLStore sqldb.DB
 		if db.UseNativeSQL {
 			nativePostgresStore, err := sqldb.NewPostgresStore(
 				db.Postgres,
@@ -459,7 +489,7 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 					"native postgres store: %v", err)
 			}
 
-			nativeSQLStore = nativePostgresStore.BaseDB
+			nativeSQLStore = nativePostgresStore
 			closeFuncs[PostgresBackend] = nativePostgresStore.Close
 		}
 
@@ -571,7 +601,7 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		}
 		closeFuncs[NSWalletDB] = sqliteWalletBackend.Close
 
-		var nativeSQLStore *sqldb.BaseDB
+		var nativeSQLStore sqldb.DB
 		if db.UseNativeSQL {
 			nativeSQLiteStore, err := sqldb.NewSqliteStore(
 				db.Sqlite,
@@ -582,7 +612,7 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 					"native SQLite store: %v", err)
 			}
 
-			nativeSQLStore = nativeSQLiteStore.BaseDB
+			nativeSQLStore = nativeSQLiteStore
 			closeFuncs[SqliteBackend] = nativeSQLiteStore.Close
 		}
 

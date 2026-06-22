@@ -2,14 +2,14 @@ package htlcswitch
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
-	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
@@ -715,9 +715,12 @@ func (f *interceptedForward) ResumeModified(
 			htlc.Amount = amount
 		})
 
-		if len(validatedRecords) > 0 {
-			htlc.CustomRecords = validatedRecords
-		}
+		// Merge custom records with any validated records that were
+		// added in the modify request, overwriting any existing values
+		// with those supplied in the modifier API.
+		htlc.CustomRecords = htlc.CustomRecords.MergedCopy(
+			validatedRecords,
+		)
 
 	case *lnwire.UpdateFulfillHTLC:
 		if len(validatedRecords) > 0 {

@@ -1,7 +1,6 @@
 package lntest
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -115,14 +114,13 @@ func (f *FeeService) Start() error {
 // handleRequest handles a client request for fee estimates.
 func (f *FeeService) handleRequest(w http.ResponseWriter, _ *http.Request) {
 	f.lock.Lock()
-	defer f.lock.Unlock()
-
 	bytes, err := json.Marshal(
 		chainfee.WebAPIResponse{
 			FeeByBlockTarget: f.feeRateMap,
 			MinRelayFeerate:  f.minRelayFeerate,
 		},
 	)
+	f.lock.Unlock()
 	require.NoErrorf(f, err, "cannot serialize estimates")
 
 	_, err = io.WriteString(w, string(bytes))
@@ -131,7 +129,7 @@ func (f *FeeService) handleRequest(w http.ResponseWriter, _ *http.Request) {
 
 // Stop stops the web server.
 func (f *FeeService) Stop() error {
-	err := f.srv.Shutdown(context.Background())
+	err := f.srv.Shutdown(f.Context())
 	require.NoError(f, err, "cannot stop fee api")
 
 	f.wg.Wait()
@@ -159,6 +157,7 @@ func (f *FeeService) SetMinRelayFeerate(fee chainfee.SatPerKVByte) {
 func (f *FeeService) Reset() {
 	f.lock.Lock()
 	f.feeRateMap = make(map[uint32]uint32)
+	f.minRelayFeerate = chainfee.FeePerKwFloor.FeePerKVByte()
 	f.lock.Unlock()
 
 	// Initialize default fee estimate.

@@ -2,7 +2,6 @@ package itest
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -25,7 +24,9 @@ import (
 // the node's pubkey and a customized public key to check the validity of the
 // result.
 func testDeriveSharedKey(ht *lntest.HarnessTest) {
-	runDeriveSharedKey(ht, ht.Alice)
+	alice := ht.NewNode("Alice", nil)
+
+	runDeriveSharedKey(ht, alice)
 }
 
 // runDeriveSharedKey checks the ECDH performed by the endpoint
@@ -197,7 +198,9 @@ func runDeriveSharedKey(ht *lntest.HarnessTest, alice *node.HarnessNode) {
 // testSignOutputRaw makes sure that the SignOutputRaw RPC can be used with all
 // custom ways of specifying the signing key in the key descriptor/locator.
 func testSignOutputRaw(ht *lntest.HarnessTest) {
-	runSignOutputRaw(ht, ht.Alice)
+	alice := ht.NewNodeWithCoins("Alice", nil)
+
+	runSignOutputRaw(ht, alice)
 }
 
 // runSignOutputRaw makes sure that the SignOutputRaw RPC can be used with all
@@ -377,7 +380,9 @@ func assertSignOutputRaw(ht *lntest.HarnessTest,
 // all custom flags by verifying with VerifyMessage. Tests both ECDSA and
 // Schnorr signatures.
 func testSignVerifyMessage(ht *lntest.HarnessTest) {
-	runSignVerifyMessage(ht, ht.Alice)
+	alice := ht.NewNode("Alice", nil)
+
+	runSignVerifyMessage(ht, alice)
 }
 
 // runSignVerifyMessage makes sure that the SignMessage RPC can be used with
@@ -494,7 +499,7 @@ func runSignVerifyMessage(ht *lntest.HarnessTest, alice *node.HarnessNode) {
 
 	expectedErr := "tag can only be used when the Schnorr signature " +
 		"option is set"
-	ctxt := context.Background()
+	ctxt := ht.Context()
 	_, err := alice.RPC.Signer.SignMessage(ctxt, signMsgReq)
 	require.ErrorContains(ht, err, expectedErr)
 

@@ -16,10 +16,11 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
@@ -40,6 +41,10 @@ var (
 			Entity: "offchain",
 			Action: "write",
 		}},
+		"/devrpc.Dev/Quiesce": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
 	}
 )
 
@@ -56,6 +61,7 @@ type ServerShell struct {
 type Server struct {
 	started  int32 // To be used atomically.
 	shutdown int32 // To be used atomically.
+	quit     chan struct{}
 
 	// Required by the grpc-gateway/v2 library for forward compatibility.
 	// Must be after the atomically used variables to not break struct
@@ -78,7 +84,8 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 	// We don't create any new macaroons for this subserver, instead reuse
 	// existing onchain/offchain permissions.
 	server := &Server{
-		cfg: cfg,
+		quit: make(chan struct{}),
+		cfg:  cfg,
 	}
 
 	return server, macPermissions, nil
@@ -103,6 +110,8 @@ func (s *Server) Stop() error {
 		return nil
 	}
 
+	close(s.quit)
+
 	return nil
 }
 
@@ -125,7 +134,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterDevServer(grpcServer, r)
 
-	log.Debugf("DEV RPC server successfully register with root the " +
+	log.Debugf("DEV RPC server successfully registered with root the " +
 		"gRPC server")
 
 	return nil
@@ -215,17 +224,8 @@ func (s *Server) ImportGraph(ctx context.Context,
 	// Obtain the pointer to the global singleton channel graph.
 	graphDB := s.cfg.GraphDB
 
-	var err error
 	for _, rpcNode := range graph.Nodes {
-		node := &channeldb.LightningNode{
-			HaveNodeAnnouncement: true,
-			LastUpdate: time.Unix(
-				int64(rpcNode.LastUpdate), 0,
-			),
-			Alias: rpcNode.Alias,
-		}
-
-		node.PubKeyBytes, err = parsePubKey(rpcNode.PubKey)
+		pubKeyBytes, err := parsePubKey(rpcNode.PubKey)
 		if err != nil {
 			return nil, err
 		}
@@ -242,16 +242,26 @@ func (s *Server) ImportGraph(ctx context.Context,
 		}
 
 		featureVector := lnwire.NewRawFeatureVector(featureBits...)
-		node.Features = lnwire.NewFeatureVector(
-			featureVector, featureNames,
-		)
 
-		node.Color, err = lncfg.ParseHexColor(rpcNode.Color)
+		nodeColor, err := lncfg.ParseHexColor(rpcNode.Color)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := graphDB.AddLightningNode(node); err != nil {
+		node := models.NewV1Node(pubKeyBytes, &models.NodeV1Fields{
+			LastUpdate: time.Unix(
+				int64(rpcNode.LastUpdate), 0,
+			),
+			Alias:    rpcNode.Alias,
+			Features: featureVector,
+			Color:    nodeColor,
+			// NOTE: this is a workaround to ensure that
+			// HaveAnnouncement() returns true so that the other
+			// fields are properly persisted.
+			AuthSigBytes: []byte{0},
+		})
+
+		if err := graphDB.AddNode(ctx, node); err != nil {
 			return nil, fmt.Errorf("unable to add node %v: %w",
 				rpcNode.PubKey, err)
 		}
@@ -262,18 +272,12 @@ func (s *Server) ImportGraph(ctx context.Context,
 	for _, rpcEdge := range graph.Edges {
 		rpcEdge := rpcEdge
 
-		edge := &models.ChannelEdgeInfo{
-			ChannelID: rpcEdge.ChannelId,
-			ChainHash: *s.cfg.ActiveNetParams.GenesisHash,
-			Capacity:  btcutil.Amount(rpcEdge.Capacity),
-		}
-
-		edge.NodeKey1Bytes, err = parsePubKey(rpcEdge.Node1Pub)
+		node1, err := parsePubKey(rpcEdge.Node1Pub)
 		if err != nil {
 			return nil, err
 		}
 
-		edge.NodeKey2Bytes, err = parsePubKey(rpcEdge.Node2Pub)
+		node2, err := parsePubKey(rpcEdge.Node2Pub)
 		if err != nil {
 			return nil, err
 		}
@@ -282,15 +286,25 @@ func (s *Server) ImportGraph(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
-		edge.ChannelPoint = *channelPoint
 
-		if err := graphDB.AddChannelEdge(edge); err != nil {
+		edge, err := models.NewV1Channel(
+			rpcEdge.ChannelId, *s.cfg.ActiveNetParams.GenesisHash,
+			node1, node2, &models.ChannelV1Fields{},
+			models.WithCapacity(btcutil.Amount(rpcEdge.Capacity)),
+			models.WithChannelPoint(*channelPoint),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := graphDB.AddChannelEdge(ctx, edge); err != nil {
 			return nil, fmt.Errorf("unable to add edge %v: %w",
 				rpcEdge.ChanPoint, err)
 		}
 
-		makePolicy := func(rpcPolicy *lnrpc.RoutingPolicy) *models.ChannelEdgePolicy { //nolint:lll
+		makePolicy := func(rpcPolicy *lnrpc.RoutingPolicy) *models.ChannelEdgePolicy { //nolint:ll
 			policy := &models.ChannelEdgePolicy{
+				Version:   lnwire.GossipVersion1,
 				ChannelID: rpcEdge.ChannelId,
 				LastUpdate: time.Unix(
 					int64(rpcPolicy.LastUpdate), 0,
@@ -322,7 +336,8 @@ func (s *Server) ImportGraph(ctx context.Context,
 		if rpcEdge.Node1Policy != nil {
 			policy := makePolicy(rpcEdge.Node1Policy)
 			policy.ChannelFlags = 0
-			if err := graphDB.UpdateEdgePolicy(policy); err != nil {
+			err := graphDB.UpdateEdgePolicy(ctx, policy)
+			if err != nil {
 				return nil, fmt.Errorf(
 					"unable to update policy: %v", err)
 			}
@@ -331,7 +346,8 @@ func (s *Server) ImportGraph(ctx context.Context,
 		if rpcEdge.Node2Policy != nil {
 			policy := makePolicy(rpcEdge.Node2Policy)
 			policy.ChannelFlags = 1
-			if err := graphDB.UpdateEdgePolicy(policy); err != nil {
+			err := graphDB.UpdateEdgePolicy(ctx, policy)
+			if err != nil {
 				return nil, fmt.Errorf(
 					"unable to update policy: %v", err)
 			}
@@ -341,4 +357,34 @@ func (s *Server) ImportGraph(ctx context.Context,
 	}
 
 	return &ImportGraphResponse{}, nil
+}
+
+// Quiesce initiates the quiescence process for the channel with the given
+// channel ID. This method will block until the channel is fully quiesced.
+func (s *Server) Quiesce(_ context.Context, in *QuiescenceRequest) (
+	*QuiescenceResponse, error) {
+
+	txid, err := lnrpc.GetChanPointFundingTxid(in.ChanId)
+	if err != nil {
+		return nil, err
+	}
+
+	op := wire.NewOutPoint(txid, in.ChanId.OutputIndex)
+	cid := lnwire.NewChanIDFromOutPoint(*op)
+	ln, err := s.cfg.Switch.GetLink(cid)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case result := <-ln.InitStfu():
+		mkResp := func(b lntypes.ChannelParty) *QuiescenceResponse {
+			return &QuiescenceResponse{Initiator: b.IsLocal()}
+		}
+
+		return fn.MapOk(mkResp)(result).Unpack()
+
+	case <-s.quit:
+		return nil, fmt.Errorf("server shutting down")
+	}
 }

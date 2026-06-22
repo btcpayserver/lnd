@@ -185,7 +185,7 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 				cfg.MinConfs, lnwallet.DefaultAccountName,
 			)
 		},
-		Graph:       autopilot.ChannelGraphFromDatabase(svr.graphDB),
+		Graph:       autopilot.ChannelGraphFromDatabase(svr.v1Graph),
 		Constraints: atplConstraints,
 		ConnectToPeer: func(target *btcec.PublicKey, addrs []net.Addr) (bool, error) {
 			// First, we'll check if we're already connected to the
@@ -194,6 +194,11 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 			if _, err := svr.FindPeer(target); err == nil {
 				return true, nil
 			}
+
+			// Strip persisted Tor v2 .onion entries: Tor stopped
+			// serving them in 2021 and the dial would never
+			// succeed. Covered by TestWithoutV2Onion.
+			addrs = withoutV2Onion(addrs)
 
 			// We can't establish a channel if no addresses were
 			// provided for the peer.
@@ -282,7 +287,7 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 		ChannelInfo: func(chanPoint wire.OutPoint) (
 			*autopilot.LocalChannel, error) {
 
-			channel, err := svr.chanStateDB.FetchChannel(nil, chanPoint)
+			channel, err := svr.chanStateDB.FetchChannel(chanPoint)
 			if err != nil {
 				return nil, err
 			}
@@ -295,6 +300,6 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 			}, nil
 		},
 		SubscribeTransactions: svr.cc.Wallet.SubscribeTransactions,
-		SubscribeTopology:     svr.graphBuilder.SubscribeTopology,
+		SubscribeTopology:     svr.graphDB.SubscribeTopology,
 	}, nil
 }

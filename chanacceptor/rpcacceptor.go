@@ -249,7 +249,7 @@ func (r *RPCAcceptor) sendAcceptRequests(errChan chan error,
 	acceptRequests := make(map[[32]byte]*chanAcceptInfo)
 
 	for {
-		//nolint:lll
+		//nolint:ll
 		select {
 		// Consume requests passed to us from our Accept() function and
 		// send them into our stream.
@@ -355,6 +355,30 @@ func (r *RPCAcceptor) sendAcceptRequests(errChan chan error,
 					lnwire.SimpleTaprootChannelsRequiredStaging,
 				):
 					commitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT
+
+				case channelFeatures.OnlyContains(
+					lnwire.SimpleTaprootChannelsRequiredFinal,
+					lnwire.ZeroConfRequired,
+					lnwire.ScidAliasRequired,
+				):
+					commitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+
+				case channelFeatures.OnlyContains(
+					lnwire.SimpleTaprootChannelsRequiredFinal,
+					lnwire.ZeroConfRequired,
+				):
+					commitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+
+				case channelFeatures.OnlyContains(
+					lnwire.SimpleTaprootChannelsRequiredFinal,
+					lnwire.ScidAliasRequired,
+				):
+					commitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+
+				case channelFeatures.OnlyContains(
+					lnwire.SimpleTaprootChannelsRequiredFinal,
+				):
+					commitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
 
 				case channelFeatures.OnlyContains(
 					lnwire.SimpleTaprootOverlayChansRequired,
@@ -548,7 +572,7 @@ func (r *RPCAcceptor) validateAcceptorResponse(dustLimit btcutil.Amount,
 
 	// If we reject the channel, and have a custom error, then we use it.
 	case haveCustomError:
-		return false, fmt.Errorf(req.Error), nil, nil
+		return false, fmt.Errorf("%s", req.Error), nil, nil
 
 	// Otherwise, we have rejected the channel with no custom error, so we
 	// just use a generic error to fail the channel.

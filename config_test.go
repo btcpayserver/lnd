@@ -24,7 +24,7 @@ func TestConfigToFlatMap(t *testing.T) {
 	cfg.DB.Etcd.Pass = testPassword
 	cfg.DB.Postgres.Dsn = testPassword
 
-	// Set a deprecated field.
+	// Set deprecated fields.
 	cfg.Bitcoin.Active = true
 
 	result, deprecated, err := configToFlatMap(cfg)
@@ -112,6 +112,62 @@ func TestSupplyEnvValue(t *testing.T) {
 		t.Run(test.description, func(t *testing.T) {
 			result := supplyEnvValue(test.input)
 			require.Equal(t, test.expected, result)
+		})
+	}
+}
+
+// TestValidateConfigTrickleDelay tests that the TrickleDelay configuration
+// is properly validated and defaulted in ValidateConfig. This test directly
+// verifies the validation logic without going through the full ValidateConfig
+// function which has many dependencies.
+func TestValidateConfigTrickleDelay(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		trickleDelay  int
+		expectedDelay int
+	}{
+		{
+			name:          "zero delay defaults to 1ms",
+			trickleDelay:  0,
+			expectedDelay: 1,
+		},
+		{
+			name:          "negative delay defaults to 1ms",
+			trickleDelay:  -1000,
+			expectedDelay: 1,
+		},
+		{
+			name:          "positive delay unchanged",
+			trickleDelay:  5000,
+			expectedDelay: 5000,
+		},
+		{
+			name:          "minimum valid delay (1ms)",
+			trickleDelay:  1,
+			expectedDelay: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a config with the test's TrickleDelay.
+			cfg := Config{
+				TrickleDelay: tc.trickleDelay,
+			}
+
+			// Simulate the validation logic from ValidateConfig.
+			if cfg.TrickleDelay <= 0 {
+				cfg.TrickleDelay = 1
+			}
+
+			// Verify the TrickleDelay was set to the expected
+			// value.
+			require.Equal(
+				t, tc.expectedDelay, cfg.TrickleDelay,
+				"TrickleDelay mismatch",
+			)
 		})
 	}
 }

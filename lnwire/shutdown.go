@@ -9,6 +9,8 @@ import (
 
 type (
 	// ShutdownNonceType is the type of the shutdown nonce TLV record.
+	// This nonce represents the sender's "closee nonce" - the nonce they'll
+	// use when signing the other party's closing transaction.
 	ShutdownNonceType = tlv.TlvType8
 
 	// ShutdownNonceTLV is the TLV record that contains the shutdown nonce.
@@ -34,8 +36,10 @@ type Shutdown struct {
 	// Address is the script to which the channel funds will be paid.
 	Address DeliveryAddress
 
-	// ShutdownNonce is the nonce the sender will use to sign the first
-	// co-op sign offer.
+	// ShutdownNonce is the musig2 nonce the sender will use when acting as
+	// the closee (signing the other party's closing transaction). For
+	// taproot channels with RBF support, subsequent nonces are sent using
+	// the JIT (just-in-time) pattern alongside signatures.
 	ShutdownNonce ShutdownNonceTLV
 
 	// CustomRecords maps TLV types to byte slices, storing arbitrary data
@@ -60,6 +64,10 @@ func NewShutdown(cid ChannelID, addr DeliveryAddress) *Shutdown {
 // A compile-time check to ensure Shutdown implements the lnwire.Message
 // interface.
 var _ Message = (*Shutdown)(nil)
+
+// A compile-time check to ensure Shutdown implements the lnwire.SizeableMessage
+// interface.
+var _ SizeableMessage = (*Shutdown)(nil)
 
 // Decode deserializes a serialized Shutdown from the passed io.Reader,
 // observing the specified protocol version.
@@ -132,4 +140,11 @@ func (s *Shutdown) Encode(w *bytes.Buffer, pver uint32) error {
 // This is part of the lnwire.Message interface.
 func (s *Shutdown) MsgType() MessageType {
 	return MsgShutdown
+}
+
+// SerializedSize returns the serialized size of the message in bytes.
+//
+// This is part of the lnwire.SizeableMessage interface.
+func (s *Shutdown) SerializedSize() (uint32, error) {
+	return MessageSerializedSize(s)
 }

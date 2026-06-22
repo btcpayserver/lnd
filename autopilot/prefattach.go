@@ -1,6 +1,7 @@
 package autopilot
 
 import (
+	"context"
 	prand "math/rand"
 	"time"
 
@@ -78,9 +79,9 @@ func (p *PrefAttachment) Name() string {
 // given to nodes already having high connectivity in the graph.
 //
 // NOTE: This is a part of the AttachmentHeuristic interface.
-func (p *PrefAttachment) NodeScores(g ChannelGraph, chans []LocalChannel,
-	chanSize btcutil.Amount, nodes map[NodeID]struct{}) (
-	map[NodeID]*NodeScore, error) {
+func (p *PrefAttachment) NodeScores(ctx context.Context, g ChannelGraph,
+	chans []LocalChannel, chanSize btcutil.Amount,
+	nodes map[NodeID]struct{}) (map[NodeID]*NodeScore, error) {
 
 	// We first run though the graph once in order to find the median
 	// channel size.
@@ -88,21 +89,26 @@ func (p *PrefAttachment) NodeScores(g ChannelGraph, chans []LocalChannel,
 		allChans  []btcutil.Amount
 		seenChans = make(map[uint64]struct{})
 	)
-	if err := g.ForEachNode(func(n Node) error {
-		err := n.ForEachChannel(func(e ChannelEdge) error {
-			if _, ok := seenChans[e.ChanID.ToUint64()]; ok {
-				return nil
-			}
-			seenChans[e.ChanID.ToUint64()] = struct{}{}
-			allChans = append(allChans, e.Capacity)
-			return nil
-		})
-		if err != nil {
-			return err
-		}
+	err := g.ForEachNodesChannels(
+		ctx, func(_ context.Context, node Node,
+			channels []*ChannelEdge) error {
 
-		return nil
-	}); err != nil {
+			for _, e := range channels {
+				if _, ok := seenChans[e.ChanID.ToUint64()]; ok {
+					continue
+				}
+				seenChans[e.ChanID.ToUint64()] = struct{}{}
+				allChans = append(allChans, e.Capacity)
+			}
+
+			return nil
+		},
+		func() {
+			allChans = nil
+			clear(seenChans)
+		},
+	)
+	if err != nil {
 		return nil, err
 	}
 
@@ -114,48 +120,59 @@ func (p *PrefAttachment) NodeScores(g ChannelGraph, chans []LocalChannel,
 	// the graph.
 	var maxChans int
 	nodeChanNum := make(map[NodeID]int)
-	if err := g.ForEachNode(func(n Node) error {
-		var nodeChans int
-		err := n.ForEachChannel(func(e ChannelEdge) error {
-			// Since connecting to nodes with a lot of small
-			// channels actually worsens our connectivity in the
-			// graph (we will potentially waste time trying to use
-			// these useless channels in path finding), we decrease
-			// the counter for such channels.
-			if e.Capacity < medianChanSize/minMedianChanSizeFraction {
-				nodeChans--
+	err = g.ForEachNodesChannels(
+		ctx, func(ctx context.Context, node Node,
+			edges []*ChannelEdge) error {
+
+			var nodeChans int
+			for _, e := range edges {
+				// Since connecting to nodes with a lot of small
+				// channels actually worsens our connectivity in
+				// the graph (we will potentially waste time
+				// trying to use these useless channels in path
+				// finding), we decrease the counter for such
+				// channels.
+				//
+				//nolint:ll
+				if e.Capacity <
+					medianChanSize/minMedianChanSizeFraction {
+
+					nodeChans--
+
+					continue
+				}
+
+				// Larger channels we count.
+				nodeChans++
+			}
+
+			// We keep track of the highest-degree node we've seen,
+			// as this will be given the max score.
+			if nodeChans > maxChans {
+				maxChans = nodeChans
+			}
+
+			// If this node is not among our nodes to score, we can
+			// return early.
+			nID := NodeID(node.PubKey())
+			if _, ok := nodes[nID]; !ok {
+				log.Tracef("Node %x not among nodes to score, "+
+					"ignoring", nID[:])
 				return nil
 			}
 
-			// Larger channels we count.
-			nodeChans++
+			// Otherwise we'll record the number of channels.
+			nodeChanNum[nID] = nodeChans
+			log.Tracef("Counted %v channels for node %x", nodeChans,
+				nID[:])
+
 			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		// We keep track of the highest-degree node we've seen, as this
-		// will be given the max score.
-		if nodeChans > maxChans {
-			maxChans = nodeChans
-		}
-
-		// If this node is not among our nodes to score, we can return
-		// early.
-		nID := NodeID(n.PubKey())
-		if _, ok := nodes[nID]; !ok {
-			log.Tracef("Node %x not among nodes to score, "+
-				"ignoring", nID[:])
-			return nil
-		}
-
-		// Otherwise we'll record the number of channels.
-		nodeChanNum[nID] = nodeChans
-		log.Tracef("Counted %v channels for node %x", nodeChans, nID[:])
-
-		return nil
-	}); err != nil {
+		}, func() {
+			maxChans = 0
+			clear(nodeChanNum)
+		},
+	)
+	if err != nil {
 		return nil, err
 	}
 

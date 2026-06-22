@@ -9,6 +9,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +20,7 @@ var (
 	probeAmt       = int64(probeAmount) * 1_000
 
 	failureReasonNone    = lnrpc.PaymentFailureReason_FAILURE_REASON_NONE
-	failureReasonNoRoute = lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE //nolint:lll
+	failureReasonNoRoute = lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE //nolint:ll
 )
 
 const (
@@ -58,18 +59,38 @@ type estimateRouteFeeTestCase struct {
 }
 
 // testEstimateRouteFee tests the estimation of routing fees using either graph
-// data or sending out a probe payment.
+// data or sending out a probe payment. This test validates graph-based fee
+// estimation, probe-based fee estimation with single LSP, probe-based fee
+// estimation with multiple route hints to same LSP (worst-case fee selection),
+// probe-based fee estimation with multiple different public LSPs (worst-case
+// fee selection across LSPs, up to MaxLspsToProbe), and non-LSP probing (all
+// private destination hops).
+//
+// Note: We test with exactly MaxLspsToProbe (3) LSPs. Testing with more LSPs
+// is not feasible because the LSP selection uses map iteration, which has
+// non-deterministic order in Go, making it impossible to predict which LSPs
+// will be probed.
 func testEstimateRouteFee(ht *lntest.HarnessTest) {
+	// Ensure MaxLspsToProbe is set to 3 as expected by this test. The test
+	// uses exactly 3 LSPs in the multi-LSP test case. If MaxLspsToProbe
+	// changes, this assertion will fail as a reminder to update the test.
+	require.Equal(ht, 3, routerrpc.MaxLspsToProbe,
+		"MaxLspsToProbe should be 3")
+
 	mts := newMppTestScenario(ht)
 
-	// We extend the regular mpp test scenario with a new node Paula. Paula
-	// is connected to Bob and Eve through private channels.
+	// We extend the regular mpp test scenario with two new nodes:
+	// - Paula: connected to Bob and Eve through private channels
+	// - Frank: connected to Dave through a private channel
+	//
 	//                  /-------------\
 	//              _ Eve _  (private) \
 	//             /       \            \
 	// Alice -- Carol ---- Bob --------- Paula
 	//      \              /   (private)
 	//       \__ Dave ____/
+	//             \
+	//              \__ Frank (private)
 	//
 	req := &mppOpenChannelRequest{
 		amtAliceCarol: 200_000,
@@ -87,29 +108,33 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 	probeInitiator = mts.alice
 
 	paula := ht.NewNode("Paula", nil)
+	frank := ht.NewNode("Frank", nil)
 
 	// The channel from Bob to Paula actually doesn't have enough liquidity
 	// to carry out the probe. We assume in normal operation that hop hints
 	// added to the invoice always have enough liquidity, but here we check
 	// that the prober uses the more expensive route.
 	ht.EnsureConnected(mts.bob, paula)
-	channelPointBobPaula := ht.OpenChannel(
-		mts.bob, paula, lntest.OpenChannelParams{
-			Private: true,
-			Amt:     90_000,
-			PushAmt: 69_000,
-		},
-	)
+	ht.OpenChannel(mts.bob, paula, lntest.OpenChannelParams{
+		Private: true,
+		Amt:     90_000,
+		PushAmt: 69_000,
+	})
 
 	ht.EnsureConnected(mts.eve, paula)
-	channelPointEvePaula := ht.OpenChannel(
-		mts.eve, paula, lntest.OpenChannelParams{
-			Private: true,
-			Amt:     1_000_000,
-		},
-	)
+	ht.OpenChannel(mts.eve, paula, lntest.OpenChannelParams{
+		Private: true,
+		Amt:     1_000_000,
+	})
 
-	bobsPrivChannels := ht.Bob.RPC.ListChannels(&lnrpc.ListChannelsRequest{
+	// Frank is a private node connected to Dave (public LSP).
+	ht.EnsureConnected(mts.dave, frank)
+	ht.OpenChannel(mts.dave, frank, lntest.OpenChannelParams{
+		Private: true,
+		Amt:     1_000_000,
+	})
+
+	bobsPrivChannels := mts.bob.RPC.ListChannels(&lnrpc.ListChannelsRequest{
 		PrivateOnly: true,
 	})
 	require.Len(ht, bobsPrivChannels.Channels, 1)
@@ -120,6 +145,14 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 	})
 	require.Len(ht, evesPrivChannels.Channels, 1)
 	evePaulaChanID := evesPrivChannels.Channels[0].ChanId
+
+	davesPrivChannels := mts.dave.RPC.ListChannels(
+		&lnrpc.ListChannelsRequest{
+			PrivateOnly: true,
+		},
+	)
+	require.Len(ht, davesPrivChannels.Channels, 1)
+	daveFrankChanID := davesPrivChannels.Channels[0].ChanId
 
 	// Let's disable the paths from Alice to Bob through Dave and Eve with
 	// high fees. This ensures that the path estimates are based on Carol's
@@ -199,6 +232,33 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 				},
 			},
 		}
+
+		daveHopHint = &lnrpc.HopHint{
+			NodeId:                    mts.dave.PubKeyStr,
+			FeeBaseMsat:               3_000,
+			FeeProportionalMillionths: 3_000,
+			CltvExpiryDelta:           120,
+			ChanId:                    daveFrankChanID,
+		}
+
+		// Multiple different public LSPs (Bob, Eve, Dave).
+		multipleLspsRouteHints = []*lnrpc.RouteHint{
+			{
+				HopHints: []*lnrpc.HopHint{
+					bobHopHint,
+				},
+			},
+			{
+				HopHints: []*lnrpc.HopHint{
+					eveHopHint,
+				},
+			},
+			{
+				HopHints: []*lnrpc.HopHint{
+					daveHopHint,
+				},
+			},
+		}
 	)
 
 	defaultTimelock := int64(chainreg.DefaultBitcoinTimeLockDelta)
@@ -234,6 +294,14 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 	feeACEP := feeEP + feeCE
 	deltaACEP := deltaCE + deltaEP
 
+	// For multiple LSPs test, the route with the highest fee should be
+	// selected (Eve). Note that we return both fee and CLTV delta from
+	// the same route (the highest-fee route), not the max fee and max
+	// delta independently. This ensures the returned values represent an
+	// actual viable route.
+	highestFeeRouteFee := feeACEP
+	highestFeeRouteDelta := deltaACEP
+
 	initialBlockHeight := int64(mts.alice.RPC.GetInfo().BlockHeight)
 
 	// Locktime is always composed of the initial block height and the
@@ -241,6 +309,8 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 	// accounting for block height variance.
 	locktime := initialBlockHeight + defaultTimelock +
 		int64(routing.BlockPadding)
+
+	noChanNode := ht.NewNode("ImWithoutChannels", nil)
 
 	var testCases = []*estimateRouteFeeTestCase{
 		// Single hop payment is free.
@@ -268,6 +338,19 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 			probing:                 true,
 			destination:             mts.bob,
 			routeHints:              []*lnrpc.RouteHint{},
+			expectedRoutingFeesMsat: feeStandardSingleHop,
+			expectedCltvDelta:       locktime + deltaCB,
+			expectedFailureReason:   failureReasonNone,
+		},
+		// Rule 1: Invoice target is public (Bob), even with public
+		// destination hop hints. Should route directly to Bob, NOT
+		// treat as LSP.
+		{
+			name: "probe based estimate, public " +
+				"target with public hop hints",
+			probing:                 true,
+			destination:             mts.bob,
+			routeHints:              singleRouteHint,
 			expectedRoutingFeesMsat: feeStandardSingleHop,
 			expectedCltvDelta:       locktime + deltaCB,
 			expectedFailureReason:   failureReasonNone,
@@ -303,10 +386,8 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 		{
 			name: "single hop hint, destination " +
 				"without channels",
-			probing: true,
-			destination: ht.NewNode(
-				"ImWithoutChannels", nil,
-			),
+			probing:                 true,
+			destination:             noChanNode,
 			routeHints:              singleRouteHint,
 			expectedRoutingFeesMsat: feeACBP,
 			expectedCltvDelta:       locktime + deltaACBP,
@@ -343,6 +424,23 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 			expectedCltvDelta:       0,
 			expectedFailureReason:   failureReasonNoRoute,
 		},
+		// Test multiple different public LSPs. The worst-case (most
+		// expensive) route should be returned. Eve has the highest
+		// fees among the 3 LSPs tested. Note: We don't test with more
+		// than MaxLspsToProbe LSPs because map iteration order in Go
+		// is non-deterministic, making it impossible to predict which
+		// LSPs will be selected for probing.
+		{
+			name: "probe based estimate, " +
+				"multiple different public LSPs",
+			probing:                 true,
+			destination:             frank,
+			routeHints:              multipleLspsRouteHints,
+			expectedRoutingFeesMsat: highestFeeRouteFee,
+			expectedCltvDelta: locktime +
+				highestFeeRouteDelta,
+			expectedFailureReason: failureReasonNone,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -356,12 +454,6 @@ func testEstimateRouteFee(ht *lntest.HarnessTest) {
 			break
 		}
 	}
-
-	mts.ht.CloseChannelAssertPending(mts.bob, channelPointBobPaula, false)
-	mts.ht.CloseChannelAssertPending(mts.eve, channelPointEvePaula, false)
-	ht.MineBlocksAndAssertNumTxes(1, 2)
-
-	mts.closeChannels()
 }
 
 // runTestCase runs a single test case asserting that test conditions are met.
@@ -376,7 +468,7 @@ func runFeeEstimationTestCase(ht *lntest.HarnessTest,
 		)
 		feeReq = &routerrpc.RouteFeeRequest{
 			PaymentRequest: payReqs[0],
-			Timeout:        10,
+			Timeout:        uint32(wait.PaymentTimeout.Seconds()),
 		}
 	} else {
 		feeReq = &routerrpc.RouteFeeRequest{

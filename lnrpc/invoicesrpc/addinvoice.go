@@ -18,7 +18,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
@@ -74,8 +74,9 @@ type AddInvoiceConfig struct {
 	// channel graph.
 	ChanDB *channeldb.ChannelStateDB
 
-	// Graph holds a reference to the ChannelGraph database.
-	Graph *channeldb.ChannelGraph
+	// Graph gives the invoice server access to various graph related
+	// queries.
+	Graph GraphSource
 
 	// GenInvoiceFeatures returns a feature containing feature bits that
 	// should be advertised on freshly generated invoices.
@@ -518,11 +519,19 @@ func AddInvoice(ctx context.Context, cfg *AddInvoiceConfig,
 		finalCLTVDelta := uint32(cltvExpiryDelta)
 		finalCLTVDelta += uint32(routing.BlockPadding)
 
-		//nolint:lll
+		//nolint:ll
 		paths, err := blindedpath.BuildBlindedPaymentPaths(
 			&blindedpath.BuildBlindedPathCfg{
-				FindRoutes:              cfg.QueryBlindedRoutes,
-				FetchChannelEdgesByID:   cfg.Graph.FetchChannelEdgesByID,
+				FindRoutes: cfg.QueryBlindedRoutes,
+				FetchChannelEdgesByID: func(chanID uint64) (
+					*models.ChannelEdgeInfo,
+					*models.ChannelEdgePolicy,
+					*models.ChannelEdgePolicy, error) {
+
+					return cfg.Graph.FetchChannelEdgesByID(
+						context.TODO(), chanID,
+					)
+				},
 				FetchOurOpenChannels:    cfg.ChanDB.FetchAllOpenChannels,
 				PathID:                  paymentAddr[:],
 				ValueMsat:               invoice.Value,
@@ -533,7 +542,7 @@ func AddInvoice(ctx context.Context, cfg *AddInvoiceConfig,
 					p *blindedpath.BlindedHopPolicy) (
 					*blindedpath.BlindedHopPolicy, error) {
 
-					//nolint:lll
+					//nolint:ll
 					return blindedpath.AddPolicyBuffer(
 						p, blindCfg.RoutePolicyIncrMultiplier,
 						blindCfg.RoutePolicyDecrMultiplier,
@@ -786,12 +795,23 @@ func newSelectHopHintsCfg(invoicesCfg *AddInvoiceConfig,
 	maxHopHints int) *SelectHopHintsCfg {
 
 	return &SelectHopHintsCfg{
-		FetchAllChannels:      invoicesCfg.ChanDB.FetchAllChannels,
-		IsChannelActive:       invoicesCfg.IsChannelActive,
-		IsPublicNode:          invoicesCfg.Graph.IsPublicNode,
-		FetchChannelEdgesByID: invoicesCfg.Graph.FetchChannelEdgesByID,
-		GetAlias:              invoicesCfg.GetAlias,
-		MaxHopHints:           maxHopHints,
+		FetchAllChannels: invoicesCfg.ChanDB.FetchAllChannels,
+		IsChannelActive:  invoicesCfg.IsChannelActive,
+		IsPublicNode: func(pubKey [33]byte) (bool, error) {
+			return invoicesCfg.Graph.IsPublicNode(
+				context.TODO(), pubKey,
+			)
+		},
+		FetchChannelEdgesByID: func(chanID uint64) (
+			*models.ChannelEdgeInfo, *models.ChannelEdgePolicy,
+			*models.ChannelEdgePolicy, error) {
+
+			return invoicesCfg.Graph.FetchChannelEdgesByID(
+				context.TODO(), chanID,
+			)
+		},
+		GetAlias:    invoicesCfg.GetAlias,
+		MaxHopHints: maxHopHints,
 	}
 }
 

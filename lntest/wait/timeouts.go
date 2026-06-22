@@ -1,5 +1,5 @@
-//go:build !darwin && !kvdb_etcd && !kvdb_postgres
-// +build !darwin,!kvdb_etcd,!kvdb_postgres
+//go:build !darwin && !windows && !kvdb_etcd && !kvdb_postgres
+// +build !darwin,!windows,!kvdb_etcd,!kvdb_postgres
 
 package wait
 

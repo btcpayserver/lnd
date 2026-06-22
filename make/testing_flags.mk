@@ -6,10 +6,12 @@ ITEST_FLAGS =
 ITEST_COVERAGE =
 COLLECT_ITEST_COVERAGE =
 EXEC_SUFFIX =
-COVER_PKG = $$(go list -deps -tags="$(DEV_TAGS)" ./... | grep '$(PKG)' | grep -v lnrpc)
+COVER_PKG = $$($(GOCC) list -deps -tags="$(DEV_TAGS)" ./... | grep '$(PKG)')
+COVER_FLAGS = -coverprofile=coverage.txt -covermode=atomic -coverpkg=$(PKG)/...
 NUM_ITEST_TRANCHES = 4
 ITEST_PARALLELISM = $(NUM_ITEST_TRANCHES)
 POSTGRES_START_DELAY = 5
+SHUFFLE_SEED = 0
 
 # If rpc option is set also add all extra RPC tags to DEV_TAGS
 ifneq ($(with-rpc),)
@@ -25,6 +27,16 @@ endif
 # Give the ability to run the same tranche multiple times at the same time.
 ifneq ($(parallel),)
 ITEST_PARALLELISM = $(parallel)
+endif
+
+# Set the seed for shuffling the test cases.
+ifneq ($(shuffleseed),)
+SHUFFLE_SEED = $(shuffleseed)
+endif
+
+# Set the base dir if specified.
+ifneq ($(basedir),)
+ITEST_FLAGS += -basedir=$(basedir)
 endif
 
 # Windows needs to append a .exe suffix to all executable files, otherwise it
@@ -57,6 +69,11 @@ ifneq ($(dbbackend),)
 ITEST_FLAGS += -dbbackend=$(dbbackend)
 endif
 
+# Select miner backend independently from chain backend. Defaults to btcd.
+ifneq ($(minerbackend),)
+ITEST_FLAGS += -minerbackend=$(minerbackend)
+endif
+
 ifeq ($(dbbackend),etcd)
 DEV_TAGS += kvdb_etcd
 endif
@@ -82,7 +99,7 @@ endif
 # Enable integration test coverage (requires Go >= 1.20.0).
 ifneq ($(cover),)
 ITEST_COVERAGE = -cover
-COLLECT_ITEST_COVERAGE = go tool covdata textfmt -i=itest/cover -o coverage.txt
+COLLECT_ITEST_COVERAGE = $(GOCC) tool covdata textfmt -i=itest/cover -o coverage.txt
 endif
 
 # Define the log tags that will be applied only when running unit tests. If none
@@ -109,8 +126,13 @@ ifneq ($(nocache),)
 TEST_FLAGS += -test.count=1
 endif
 
-GOLIST := go list -tags="$(DEV_TAGS)" -deps $(PKG)/... | grep '$(PKG)'| grep -v '/vendor/'
-GOLISTCOVER := $(shell go list -tags="$(DEV_TAGS)" -deps -f '{{.ImportPath}}' ./... | grep '$(PKG)' | sed -e 's/^$(ESCPKG)/./')
+# If the short flag is added, then any unit tests marked with "testing.Short()"
+# will be skipped.
+ifneq ($(short),)
+TEST_FLAGS += -short
+endif
+
+GOLIST := $(GOCC) list -tags="$(DEV_TAGS)" -deps $(PKG)/... | grep '$(PKG)'| grep -v '/vendor/'
 
 # UNIT_TARGTED is undefined iff a specific package and/or unit test case is
 # not being targeted.
@@ -144,4 +166,4 @@ endif
 ITEST_TAGS := $(DEV_TAGS) $(RPC_TAGS) integration $(backend)
 
 # Construct the coverage test command with the added build flags.
-GOACC := $(GOACC_BIN) $(COVER_PKG) -- -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS)
+UNIT_COVER := $(GOTEST) $(COVER_FLAGS) -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) $(COVER_PKG)

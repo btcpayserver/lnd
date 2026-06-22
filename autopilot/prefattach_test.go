@@ -2,13 +2,21 @@ package autopilot
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	prand "math/rand"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
+	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,22 +31,29 @@ type testGraph interface {
 	addRandNode() (*btcec.PublicKey, error)
 }
 
+type testDBGraph struct {
+	db *graphdb.VersionedGraph
+	databaseChannelGraph
+}
+
 func newDiskChanGraph(t *testing.T) (testGraph, error) {
-	// Next, create channeldb for the first time.
-	cdb, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, err
-	}
+	graphDB := graphdb.NewVersionedGraph(
+		graphdb.MakeTestGraph(t), lnwire.GossipVersion1,
+	)
+	require.NoError(t, graphDB.Start())
 	t.Cleanup(func() {
-		require.NoError(t, cdb.Close())
+		require.NoError(t, graphDB.Stop())
 	})
 
-	return &databaseChannelGraph{
-		db: cdb.ChannelGraph(),
+	return &testDBGraph{
+		db: graphDB,
+		databaseChannelGraph: databaseChannelGraph{
+			db: graphDB,
+		},
 	}, nil
 }
 
-var _ testGraph = (*databaseChannelGraph)(nil)
+var _ testGraph = (*testDBGraph)(nil)
 
 func newMemChanGraph(_ *testing.T) (testGraph, error) {
 	return newMemChannelGraph(), nil
@@ -63,6 +78,8 @@ var chanGraphs = []struct {
 // TestPrefAttachmentSelectEmptyGraph ensures that when passed an
 // empty graph, the NodeSores function always returns a score of 0.
 func TestPrefAttachmentSelectEmptyGraph(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
 	prefAttach := NewPrefAttachment()
 
 	// Create a random public key, which we will query to get a score for.
@@ -83,7 +100,7 @@ func TestPrefAttachmentSelectEmptyGraph(t *testing.T) {
 			// attempt to get the score for this one node.
 			const walletFunds = btcutil.SatoshiPerBitcoin
 			scores, err := prefAttach.NodeScores(
-				graph, nil, walletFunds, nodes,
+				ctx, graph, nil, walletFunds, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -102,6 +119,7 @@ func TestPrefAttachmentSelectEmptyGraph(t *testing.T) {
 // and the funds are appropriately allocated across each peer.
 func TestPrefAttachmentSelectTwoVertexes(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	prand.Seed(time.Now().Unix())
 
@@ -132,10 +150,15 @@ func TestPrefAttachmentSelectTwoVertexes(t *testing.T) {
 			// Get the score for all nodes found in the graph at
 			// this point.
 			nodes := make(map[NodeID]struct{})
-			err = graph.ForEachNode(func(n Node) error {
-				nodes[n.PubKey()] = struct{}{}
-				return nil
-			})
+			err = graph.ForEachNode(
+				ctx,
+				func(_ context.Context, n Node) error {
+					nodes[n.PubKey()] = struct{}{}
+					return nil
+				}, func() {
+					clear(nodes)
+				},
+			)
 			require.NoError(t1, err)
 
 			require.Len(t1, nodes, 3)
@@ -144,7 +167,7 @@ func TestPrefAttachmentSelectTwoVertexes(t *testing.T) {
 			// attempt to get our candidates channel score given
 			// the current state of the graph.
 			candidates, err := prefAttach.NodeScores(
-				graph, nil, maxChanSize, nodes,
+				ctx, graph, nil, maxChanSize, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -155,8 +178,8 @@ func TestPrefAttachmentSelectTwoVertexes(t *testing.T) {
 			// The candidates should be amongst the two edges
 			// created above.
 			for nodeID, candidate := range candidates {
-				edge1Pub := edge1.Peer.PubKey()
-				edge2Pub := edge2.Peer.PubKey()
+				edge1Pub := edge1.Peer
+				edge2Pub := edge2.Peer
 
 				switch {
 				case bytes.Equal(nodeID[:], edge1Pub[:]):
@@ -183,6 +206,7 @@ func TestPrefAttachmentSelectTwoVertexes(t *testing.T) {
 // allocate all funds to each vertex (up to the max channel size).
 func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	prand.Seed(time.Now().Unix())
 
@@ -207,7 +231,7 @@ func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 			)
 			require.NoError(t1, err)
 
-			peerPubBytes := edge1.Peer.PubKey()
+			peerPubBytes := edge1.Peer
 			peerPub, err := btcec.ParsePubKey(peerPubBytes[:])
 			require.NoError(t1, err)
 
@@ -221,22 +245,28 @@ func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 			numNodes := 0
 			twoChans := false
 			nodes := make(map[NodeID]struct{})
-			err = graph.ForEachNode(func(n Node) error {
-				numNodes++
-				nodes[n.PubKey()] = struct{}{}
-				numChans := 0
-				err := n.ForEachChannel(func(c ChannelEdge) error {
-					numChans++
+			err = graph.ForEachNodesChannels(
+				ctx, func(_ context.Context, node Node,
+					edges []*ChannelEdge) error {
+
+					numNodes++
+					nodes[node.PubKey()] = struct{}{}
+					numChans := 0
+
+					for range edges {
+						numChans++
+					}
+
+					twoChans = twoChans || (numChans == 2)
+
 					return nil
-				})
-				if err != nil {
-					return err
-				}
-
-				twoChans = twoChans || (numChans == 2)
-
-				return nil
-			})
+				},
+				func() {
+					numNodes = 0
+					twoChans = false
+					clear(nodes)
+				},
+			)
 			require.NoError(t1, err)
 
 			require.EqualValues(t1, 3, numNodes)
@@ -248,7 +278,7 @@ func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 			// result, the heuristic should try to greedily
 			// allocate funds to channels.
 			scores, err := prefAttach.NodeScores(
-				graph, nil, maxChanSize, nodes,
+				ctx, graph, nil, maxChanSize, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -266,7 +296,7 @@ func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 			// candidates of that size.
 			const remBalance = btcutil.SatoshiPerBitcoin * 0.5
 			scores, err = prefAttach.NodeScores(
-				graph, nil, remBalance, nodes,
+				ctx, graph, nil, remBalance, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -289,6 +319,7 @@ func TestPrefAttachmentSelectGreedyAllocation(t *testing.T) {
 // of zero during scoring.
 func TestPrefAttachmentSelectSkipNodes(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	prand.Seed(time.Now().Unix())
 
@@ -311,10 +342,13 @@ func TestPrefAttachmentSelectSkipNodes(t *testing.T) {
 			require.NoError(t1, err)
 
 			nodes := make(map[NodeID]struct{})
-			err = graph.ForEachNode(func(n Node) error {
-				nodes[n.PubKey()] = struct{}{}
-				return nil
-			})
+			err = graph.ForEachNode(
+				ctx, func(_ context.Context, n Node) error {
+					nodes[n.PubKey()] = struct{}{}
+
+					return nil
+				}, func() {},
+			)
 			require.NoError(t1, err)
 
 			require.Len(t1, nodes, 2)
@@ -322,7 +356,7 @@ func TestPrefAttachmentSelectSkipNodes(t *testing.T) {
 			// With our graph created, we'll now get the scores for
 			// all nodes in the graph.
 			scores, err := prefAttach.NodeScores(
-				graph, nil, maxChanSize, nodes,
+				ctx, graph, nil, maxChanSize, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -350,7 +384,7 @@ func TestPrefAttachmentSelectSkipNodes(t *testing.T) {
 			// then all nodes should have a score of zero, since we
 			// already got channels to them.
 			scores, err = prefAttach.NodeScores(
-				graph, chans, maxChanSize, nodes,
+				ctx, graph, chans, maxChanSize, nodes,
 			)
 			require.NoError(t1, err)
 
@@ -362,4 +396,363 @@ func TestPrefAttachmentSelectSkipNodes(t *testing.T) {
 			break
 		}
 	}
+}
+
+// addRandChannel creates a new channel two target nodes. This function is
+// meant to aide in the generation of random graphs for use within test cases
+// the exercise the autopilot package.
+func (d *testDBGraph) addRandChannel(node1, node2 *btcec.PublicKey,
+	capacity btcutil.Amount) (*ChannelEdge, *ChannelEdge, error) {
+
+	ctx := context.Background()
+
+	fetchNode := func(pub *btcec.PublicKey) (*models.Node, error) {
+		if pub != nil {
+			vertex, err := route.NewVertexFromBytes(
+				pub.SerializeCompressed(),
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			dbNode, err := d.db.FetchNode(ctx, vertex)
+			switch {
+			case errors.Is(err, graphdb.ErrGraphNodeNotFound):
+				fallthrough
+			case errors.Is(err, graphdb.ErrGraphNotFound):
+				//nolint:ll
+				graphNode := models.NewV1Node(
+					route.NewVertex(pub),
+					&models.NodeV1Fields{
+						Addresses: []net.Addr{&net.TCPAddr{
+							IP: bytes.Repeat(
+								[]byte("a"), 16,
+							),
+						}},
+						Features: lnwire.NewFeatureVector(
+							nil, lnwire.Features,
+						).RawFeatureVector,
+						AuthSigBytes: testSig.Serialize(),
+					},
+				)
+				err := d.db.AddNode(
+					context.Background(), graphNode,
+				)
+				if err != nil {
+					return nil, err
+				}
+			case err != nil:
+				return nil, err
+			}
+
+			return dbNode, nil
+		}
+
+		nodeKey, err := randKey()
+		if err != nil {
+			return nil, err
+		}
+
+		dbNode := models.NewV1Node(
+			route.NewVertex(nodeKey), &models.NodeV1Fields{
+				Addresses: []net.Addr{&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				}},
+				Features: lnwire.NewFeatureVector(
+					nil, lnwire.Features,
+				).RawFeatureVector,
+				AuthSigBytes: testSig.Serialize(),
+			},
+		)
+		if err := d.db.AddNode(
+			context.Background(), dbNode,
+		); err != nil {
+			return nil, err
+		}
+
+		return dbNode, nil
+	}
+
+	vertex1, err := fetchNode(node1)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	vertex2, err := fetchNode(node2)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var lnNode1, lnNode2 *btcec.PublicKey
+	if bytes.Compare(vertex1.PubKeyBytes[:], vertex2.PubKeyBytes[:]) == -1 {
+		lnNode1, _ = vertex1.PubKey()
+		lnNode2, _ = vertex2.PubKey()
+	} else {
+		lnNode1, _ = vertex2.PubKey()
+		lnNode2, _ = vertex1.PubKey()
+	}
+
+	chanID := randChanID()
+	nodeKey1 := route.NewVertex(lnNode1)
+	nodeKey2 := route.NewVertex(lnNode2)
+	btcKey1 := route.NewVertex(lnNode1)
+	btcKey2 := route.NewVertex(lnNode2)
+	edge, err := models.NewV1Channel(
+		chanID.ToUint64(), chainhash.Hash{}, nodeKey1, nodeKey2,
+		&models.ChannelV1Fields{
+			BitcoinKey1Bytes: btcKey1,
+			BitcoinKey2Bytes: btcKey2,
+		}, models.WithCapacity(capacity),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := d.db.AddChannelEdge(ctx, edge); err != nil {
+		return nil, nil, err
+	}
+	edgePolicy := &models.ChannelEdgePolicy{
+		Version:                   lnwire.GossipVersion1,
+		SigBytes:                  testSig.Serialize(),
+		ChannelID:                 chanID.ToUint64(),
+		LastUpdate:                time.Now(),
+		TimeLockDelta:             10,
+		MinHTLC:                   1,
+		MaxHTLC:                   lnwire.NewMSatFromSatoshis(capacity),
+		FeeBaseMSat:               10,
+		FeeProportionalMillionths: 10000,
+		MessageFlags:              1,
+		ChannelFlags:              0,
+	}
+
+	if err := d.db.UpdateEdgePolicy(ctx, edgePolicy); err != nil {
+		return nil, nil, err
+	}
+	edgePolicy = &models.ChannelEdgePolicy{
+		Version:                   lnwire.GossipVersion1,
+		SigBytes:                  testSig.Serialize(),
+		ChannelID:                 chanID.ToUint64(),
+		LastUpdate:                time.Now(),
+		TimeLockDelta:             10,
+		MinHTLC:                   1,
+		MaxHTLC:                   lnwire.NewMSatFromSatoshis(capacity),
+		FeeBaseMSat:               10,
+		FeeProportionalMillionths: 10000,
+		MessageFlags:              1,
+		ChannelFlags:              1,
+	}
+	if err := d.db.UpdateEdgePolicy(ctx, edgePolicy); err != nil {
+		return nil, nil, err
+	}
+
+	return &ChannelEdge{
+			ChanID:   chanID,
+			Capacity: capacity,
+			Peer:     vertex1.PubKeyBytes,
+		},
+		&ChannelEdge{
+			ChanID:   chanID,
+			Capacity: capacity,
+			Peer:     vertex2.PubKeyBytes,
+		},
+		nil
+}
+
+func (d *testDBGraph) addRandNode() (*btcec.PublicKey, error) {
+	nodeKey, err := randKey()
+	if err != nil {
+		return nil, err
+	}
+	dbNode := models.NewV1Node(
+		route.NewVertex(nodeKey), &models.NodeV1Fields{
+			Addresses: []net.Addr{
+				&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				},
+			},
+			Features: lnwire.NewFeatureVector(
+				nil, lnwire.Features,
+			).RawFeatureVector,
+			AuthSigBytes: testSig.Serialize(),
+		},
+	)
+	err = d.db.AddNode(context.Background(), dbNode)
+	if err != nil {
+		return nil, err
+	}
+
+	return nodeKey, nil
+}
+
+// memChannelGraph is an implementation of the autopilot.ChannelGraph backed by
+// an in-memory graph.
+type memChannelGraph struct {
+	graph map[NodeID]*memNode
+}
+
+// A compile time assertion to ensure memChannelGraph meets the
+// autopilot.ChannelGraph interface.
+var _ ChannelGraph = (*memChannelGraph)(nil)
+
+// newMemChannelGraph creates a new blank in-memory channel graph
+// implementation.
+func newMemChannelGraph() *memChannelGraph {
+	return &memChannelGraph{
+		graph: make(map[NodeID]*memNode),
+	}
+}
+
+// ForEachNode is a higher-order function that should be called once for each
+// connected node within the channel graph. If the passed callback returns an
+// error, then execution should be terminated.
+//
+// NOTE: Part of the autopilot.ChannelGraph interface.
+func (m *memChannelGraph) ForEachNode(ctx context.Context,
+	cb func(context.Context, Node) error, _ func()) error {
+
+	for _, node := range m.graph {
+		if err := cb(ctx, node); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ForEachNodesChannels iterates through all connected nodes, and for each node,
+// all the channels that connect to it. The passed callback will be called with
+// the context, the Node itself, and a slice of ChannelEdge that connect to the
+// node.
+//
+// NOTE: Part of the autopilot.ChannelGraph interface.
+func (m *memChannelGraph) ForEachNodesChannels(ctx context.Context,
+	cb func(context.Context, Node, []*ChannelEdge) error, _ func()) error {
+
+	for _, node := range m.graph {
+		edges := make([]*ChannelEdge, 0, len(node.chans))
+		for i := range node.chans {
+			edges = append(edges, &node.chans[i])
+		}
+
+		if err := cb(ctx, node, edges); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// randChanID generates a new random channel ID.
+func randChanID() lnwire.ShortChannelID {
+	id := atomic.AddUint64(&chanIDCounter, 1)
+	return lnwire.NewShortChanIDFromInt(id)
+}
+
+// randKey returns a random public key.
+func randKey() (*btcec.PublicKey, error) {
+	priv, err := btcec.NewPrivateKey()
+	if err != nil {
+		return nil, err
+	}
+
+	return priv.PubKey(), nil
+}
+
+// addRandChannel creates a new channel two target nodes. This function is
+// meant to aide in the generation of random graphs for use within test cases
+// the exercise the autopilot package.
+func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
+	capacity btcutil.Amount) (*ChannelEdge, *ChannelEdge, error) {
+
+	var (
+		vertex1, vertex2 *memNode
+		ok               bool
+	)
+
+	if node1 != nil {
+		vertex1, ok = m.graph[NewNodeID(node1)]
+		if !ok {
+			vertex1 = &memNode{
+				pub: node1,
+				addrs: []net.Addr{&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				}},
+			}
+		}
+	} else {
+		newPub, err := randKey()
+		if err != nil {
+			return nil, nil, err
+		}
+		vertex1 = &memNode{
+			pub: newPub,
+			addrs: []net.Addr{
+				&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				},
+			},
+		}
+	}
+
+	if node2 != nil {
+		vertex2, ok = m.graph[NewNodeID(node2)]
+		if !ok {
+			vertex2 = &memNode{
+				pub: node2,
+				addrs: []net.Addr{&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				}},
+			}
+		}
+	} else {
+		newPub, err := randKey()
+		if err != nil {
+			return nil, nil, err
+		}
+		vertex2 = &memNode{
+			pub: newPub,
+			addrs: []net.Addr{
+				&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				},
+			},
+		}
+	}
+
+	edge1 := ChannelEdge{
+		ChanID:   randChanID(),
+		Capacity: capacity,
+		Peer:     vertex2.PubKey(),
+	}
+	vertex1.chans = append(vertex1.chans, edge1)
+
+	edge2 := ChannelEdge{
+		ChanID:   randChanID(),
+		Capacity: capacity,
+		Peer:     vertex1.PubKey(),
+	}
+	vertex2.chans = append(vertex2.chans, edge2)
+
+	m.graph[NewNodeID(vertex1.pub)] = vertex1
+	m.graph[NewNodeID(vertex2.pub)] = vertex2
+
+	return &edge1, &edge2, nil
+}
+
+func (m *memChannelGraph) addRandNode() (*btcec.PublicKey, error) {
+	newPub, err := randKey()
+	if err != nil {
+		return nil, err
+	}
+	vertex := &memNode{
+		pub: newPub,
+		addrs: []net.Addr{
+			&net.TCPAddr{
+				IP: bytes.Repeat([]byte("a"), 16),
+			},
+		},
+	}
+	m.graph[NewNodeID(newPub)] = vertex
+
+	return newPub, nil
 }

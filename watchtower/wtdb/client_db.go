@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -2964,7 +2964,7 @@ func getRealChannelID(chanIDIndexBkt kvdb.RBucket,
 	}
 
 	chanIDBytes := chanIDIndexBkt.Get(dbIDBytes)
-	if len(chanIDBytes) != 32 { //nolint:gomnd
+	if len(chanIDBytes) != 32 {
 		return nil, fmt.Errorf("channel ID not found")
 	}
 

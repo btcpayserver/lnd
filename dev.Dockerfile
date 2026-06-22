@@ -1,9 +1,6 @@
-# If you change this value, please change it in the following files as well:
-# /Dockerfile
-# /make/builder.Dockerfile
-# /.github/workflows/main.yml
-# /.github/workflows/release.yml
-FROM golang:1.22.6-alpine as builder
+# If you change this please also update GO_VERSION in Makefile (then run
+# `make lint` to see where else it needs to be updated as well).
+FROM golang:1.26.3-alpine AS builder
 
 LABEL maintainer="Olaoluwa Osuntokun <laolu@lightning.engineering>"
 
@@ -22,11 +19,11 @@ COPY . /go/src/github.com/lightningnetwork/lnd
 
 #  Install/build lnd.
 RUN cd /go/src/github.com/lightningnetwork/lnd \
-&&  make \
-&&  make install-all tags="signrpc walletrpc chainrpc invoicesrpc peersrpc"
+    &&  make \
+    &&  make install-all tags="signrpc walletrpc chainrpc invoicesrpc peersrpc kvdb_sqlite"
 
 # Start a new, final image to reduce size.
-FROM alpine as final
+FROM alpine AS final
 
 # Expose lnd ports (server, rpc).
 EXPOSE 9735 10009

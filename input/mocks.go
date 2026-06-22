@@ -8,7 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -24,7 +24,7 @@ type MockInput struct {
 // Compile time assertion that MockInput implements Input.
 var _ Input = (*MockInput)(nil)
 
-// Outpoint returns the reference to the output being spent, used to construct
+// OutPoint returns the reference to the output being spent, used to construct
 // the corresponding transaction input.
 func (m *MockInput) OutPoint() wire.OutPoint {
 	args := m.Called()
@@ -256,6 +256,29 @@ func (m *MockInputSigner) MuSig2RegisterNonces(versio MuSig2SessionID,
 	}
 
 	return args.Bool(0), args.Error(1)
+}
+
+// MuSig2RegisterCombinedNonce registers a pre-aggregated combined nonce for a
+// session identified by its ID.
+func (m *MockInputSigner) MuSig2RegisterCombinedNonce(sessionID MuSig2SessionID,
+	combinedNonce [musig2.PubNonceSize]byte) error {
+
+	args := m.Called(sessionID, combinedNonce)
+
+	return args.Error(0)
+}
+
+// MuSig2GetCombinedNonce retrieves the combined nonce for a session identified
+// by its ID.
+func (m *MockInputSigner) MuSig2GetCombinedNonce(sessionID MuSig2SessionID) (
+	[musig2.PubNonceSize]byte, error) {
+
+	args := m.Called(sessionID)
+	if args.Get(0) == nil {
+		return [musig2.PubNonceSize]byte{}, args.Error(1)
+	}
+
+	return args.Get(0).([musig2.PubNonceSize]byte), args.Error(1)
 }
 
 // MuSig2Sign creates a partial signature using the local signing key that was

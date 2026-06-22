@@ -2,7 +2,7 @@ package lncfg
 
 // Tor holds the configuration options for the daemon's connection to tor.
 //
-//nolint:lll
+//nolint:ll
 type Tor struct {
 	Active                      bool   `long:"active" description:"Allow outbound and inbound connections to be routed through Tor"`
 	SOCKS                       string `long:"socks" description:"The host:port that Tor's exposed SOCKS5 proxy is listening on"`
@@ -12,7 +12,6 @@ type Tor struct {
 	Control                     string `long:"control" description:"The host:port that Tor is listening on for Tor control connections"`
 	TargetIPAddress             string `long:"targetipaddress" description:"IP address that Tor should use as the target of the hidden service"`
 	Password                    string `long:"password" description:"The password used to arrive at the HashedControlPassword for the control port. If provided, the HASHEDPASSWORD authentication method will be used instead of the SAFECOOKIE one."`
-	V2                          bool   `long:"v2" description:"Automatically set up a v2 onion service to listen for inbound connections"`
 	V3                          bool   `long:"v3" description:"Automatically set up a v3 onion service to listen for inbound connections"`
 	PrivateKeyPath              string `long:"privatekeypath" description:"The path to the private key of the onion service being created"`
 	EncryptKey                  bool   `long:"encryptkey" description:"Encrypts the Tor private key file on disk"`

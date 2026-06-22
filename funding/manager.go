@@ -2,7 +2,9 @@ package funding
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -17,18 +19,18 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/go-errors/errors"
+	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/discovery"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnutils"
@@ -101,15 +103,10 @@ const (
 
 	msgBufferSize = 50
 
-	// MaxWaitNumBlocksFundingConf is the maximum number of blocks to wait
-	// for the funding transaction to be confirmed before forgetting
-	// channels that aren't initiated by us. 2016 blocks is ~2 weeks.
-	MaxWaitNumBlocksFundingConf = 2016
-
 	// pendingChansLimit is the maximum number of pending channels that we
 	// can have. After this point, pending channel opens will start to be
 	// rejected.
-	pendingChansLimit = 1_000
+	pendingChansLimit = 50
 )
 
 var (
@@ -339,6 +336,11 @@ type DevConfig struct {
 	// remote node's channel ready message once the channel as been marked
 	// as `channelReadySent`.
 	ProcessChannelReadyWait time.Duration
+
+	// MaxWaitNumBlocksFundingConf is the maximum number of blocks to wait
+	// for the funding transaction to be confirmed before forgetting
+	// channels that aren't initiated by us.
+	MaxWaitNumBlocksFundingConf uint32
 }
 
 // Config defines the configuration for the FundingManager. All elements
@@ -398,7 +400,7 @@ type Config struct {
 	// CurrentNodeAnnouncement should return the latest, fully signed node
 	// announcement from the backing Lightning Network node with a fresh
 	// timestamp.
-	CurrentNodeAnnouncement func() (lnwire.NodeAnnouncement, error)
+	CurrentNodeAnnouncement func() (lnwire.NodeAnnouncement1, error)
 
 	// SendAnnouncement is used by the FundingManager to send announcement
 	// messages to the Gossiper to possibly broadcast to the greater
@@ -406,7 +408,8 @@ type Config struct {
 	// any information within the graph that is not included in the gossip
 	// message.
 	SendAnnouncement func(msg lnwire.Message,
-		optionalFields ...discovery.OptionalMsgField) chan error
+		optionalFields ...discovery.OptionalMsgField,
+	) actor.Future[error]
 
 	// NotifyWhenOnline allows the FundingManager to register with a
 	// subsystem that will notify it when the peer comes online. This is
@@ -510,7 +513,7 @@ type Config struct {
 
 	// NotifyOpenChannelEvent informs the ChannelNotifier when channels
 	// transition from pending open to open.
-	NotifyOpenChannelEvent func(wire.OutPoint)
+	NotifyOpenChannelEvent func(wire.OutPoint, *btcec.PublicKey)
 
 	// OpenChannelPredicate is a predicate on the lnwire.OpenChannel message
 	// and on the requesting node's public key that returns a bool which
@@ -520,7 +523,13 @@ type Config struct {
 	// NotifyPendingOpenChannelEvent informs the ChannelNotifier when
 	// channels enter a pending state.
 	NotifyPendingOpenChannelEvent func(wire.OutPoint,
-		*channeldb.OpenChannel)
+		*channeldb.OpenChannel, *btcec.PublicKey)
+
+	// NotifyFundingTimeout informs the ChannelNotifier when a pending-open
+	// channel times out because the funding transaction hasn't confirmed.
+	// This is only called for the fundee and only if the channel is
+	// zero-conf.
+	NotifyFundingTimeout func(wire.OutPoint, *btcec.PublicKey)
 
 	// EnableUpfrontShutdown specifies whether the upfront shutdown script
 	// is enabled.
@@ -562,6 +571,15 @@ type Config struct {
 	// AuxResolver is an optional interface that can be used to modify the
 	// way contracts are resolved.
 	AuxResolver fn.Option[lnwallet.AuxContractResolver]
+
+	// AuxChannelNegotiator is an optional interface that allows aux channel
+	// implementations to inject and process custom records over channel
+	// related wire messages.
+	AuxChannelNegotiator fn.Option[lnwallet.AuxChannelNegotiator]
+
+	// ShutdownScript is an optional upfront-shutdown script to which our
+	// funds should be paid on a cooperative close.
+	ShutdownScript fn.Option[lnwire.DeliveryAddress]
 }
 
 // Manager acts as an orchestrator/bridge between the wallet's
@@ -985,7 +1003,9 @@ func (f *Manager) failFundingFlow(peer lnpeer.Peer, cid *chanIdentifier,
 	}
 
 	log.Debugf("Sending funding error to peer (%x): %v",
-		peer.IdentityKey().SerializeCompressed(), spew.Sdump(errMsg))
+		peer.IdentityKey().SerializeCompressed(),
+		lnutils.SpewLogClosure(errMsg))
+
 	if err := peer.SendMessage(false, errMsg); err != nil {
 		log.Errorf("unable to send error message to peer %v", err)
 	}
@@ -1005,7 +1025,7 @@ func (f *Manager) sendWarning(peer lnpeer.Peer, cid *chanIdentifier,
 
 	log.Debugf("Sending funding warning to peer (%x): %v",
 		peer.IdentityKey().SerializeCompressed(),
-		spew.Sdump(errMsg),
+		lnutils.SpewLogClosure(errMsg),
 	)
 
 	if err := peer.SendMessage(false, errMsg); err != nil {
@@ -1040,8 +1060,7 @@ func (f *Manager) reservationCoordinator() {
 				f.funderProcessFundingSigned(fmsg.peer, msg)
 
 			case *lnwire.ChannelReady:
-				f.wg.Add(1)
-				go f.handleChannelReady(fmsg.peer, msg)
+				f.handleChannelReady(fmsg.peer, msg)
 
 			case *lnwire.Warning:
 				f.handleWarningMsg(fmsg.peer, msg)
@@ -1312,7 +1331,9 @@ func (f *Manager) advancePendingChannelState(channel *channeldb.OpenChannel,
 
 		// Inform the ChannelNotifier that the channel has transitioned
 		// from pending open to open.
-		f.cfg.NotifyOpenChannelEvent(channel.FundingOutpoint)
+		f.cfg.NotifyOpenChannelEvent(
+			channel.FundingOutpoint, channel.IdentityPub,
+		)
 
 		// Find and close the discoverySignal for this channel such
 		// that ChannelReady messages will be processed.
@@ -1346,7 +1367,7 @@ func (f *Manager) advancePendingChannelState(channel *channeldb.OpenChannel,
 		}
 
 		txid := &channel.FundingOutpoint.Hash
-		fundingScript, err := makeFundingScript(channel)
+		fundingScript, err := MakeFundingScript(channel)
 		if err != nil {
 			log.Errorf("unable to create funding script for "+
 				"ChannelPoint(%v): %v",
@@ -1745,12 +1766,24 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		return
 	}
 
+	// If the fundee didn't provide an upfront-shutdown address via
+	// the channel acceptor, fall back to the configured shutdown
+	// script (if any).
+	shutdownScript := acceptorResp.UpfrontShutdown
+	if len(shutdownScript) == 0 {
+		f.cfg.ShutdownScript.WhenSome(
+			func(script lnwire.DeliveryAddress) {
+				shutdownScript = script
+			},
+		)
+	}
+
 	// Check whether the peer supports upfront shutdown, and get a new
 	// wallet address if our node is configured to set shutdown addresses by
 	// default. We use the upfront shutdown script provided by our channel
 	// acceptor (if any) in lieu of user input.
 	shutdown, err := getUpfrontShutdownScript(
-		f.cfg.EnableUpfrontShutdown, peer, acceptorResp.UpfrontShutdown,
+		f.cfg.EnableUpfrontShutdown, peer, shutdownScript,
 		f.selectShutdownScript,
 	)
 	if err != nil {
@@ -2653,7 +2686,9 @@ func (f *Manager) fundeeProcessFundingCreated(peer lnpeer.Peer,
 
 	// Inform the ChannelNotifier that the channel has entered
 	// pending open state.
-	f.cfg.NotifyPendingOpenChannelEvent(fundingOut, completeChan)
+	f.cfg.NotifyPendingOpenChannelEvent(
+		fundingOut, completeChan, completeChan.IdentityPub,
+	)
 
 	// At this point we have sent our last funding message to the
 	// initiating peer before the funding transaction will be broadcast.
@@ -2873,7 +2908,10 @@ func (f *Manager) funderProcessFundingSigned(peer lnpeer.Peer,
 	case resCtx.updates <- upd:
 		// Inform the ChannelNotifier that the channel has entered
 		// pending open state.
-		f.cfg.NotifyPendingOpenChannelEvent(*fundingPoint, completeChan)
+		f.cfg.NotifyPendingOpenChannelEvent(
+			*fundingPoint, completeChan, completeChan.IdentityPub,
+		)
+
 	case <-f.quit:
 		return
 	}
@@ -2928,6 +2966,9 @@ func (f *Manager) fundingTimeout(c *channeldb.OpenChannel,
 		return fmt.Errorf("failed closing channel %v: %w",
 			c.FundingOutpoint, err)
 	}
+
+	// Notify other subsystems about the funding timeout.
+	f.cfg.NotifyFundingTimeout(c.FundingOutpoint, c.IdentityPub)
 
 	timeoutErr := fmt.Errorf("timeout waiting for funding tx (%v) to "+
 		"confirm", c.FundingOutpoint)
@@ -3014,9 +3055,9 @@ func (f *Manager) waitForFundingWithTimeout(
 	}
 }
 
-// makeFundingScript re-creates the funding script for the funding transaction
+// MakeFundingScript re-creates the funding script for the funding transaction
 // of the target channel.
-func makeFundingScript(channel *channeldb.OpenChannel) ([]byte, error) {
+func MakeFundingScript(channel *channeldb.OpenChannel) ([]byte, error) {
 	localKey := channel.LocalChanCfg.MultiSigKey.PubKey
 	remoteKey := channel.RemoteChanCfg.MultiSigKey.PubKey
 
@@ -3047,7 +3088,8 @@ func makeFundingScript(channel *channeldb.OpenChannel) ([]byte, error) {
 // process once the funding transaction has been broadcast. The primary
 // function of waitForFundingConfirmation is to wait for blockchain
 // confirmation, and then to notify the other systems that must be notified
-// when a channel has become active for lightning transactions.
+// when a channel has become active for lightning transactions. It also updates
+// the channel’s opening transaction block height in the database.
 // The wait can be canceled by closing the cancelChan. In case of success,
 // a *lnwire.ShortChannelID will be passed to confChan.
 //
@@ -3062,7 +3104,7 @@ func (f *Manager) waitForFundingConfirmation(
 	// Register with the ChainNotifier for a notification once the funding
 	// transaction reaches `numConfs` confirmations.
 	txid := completeChan.FundingOutpoint.Hash
-	fundingScript, err := makeFundingScript(completeChan)
+	fundingScript, err := MakeFundingScript(completeChan)
 	if err != nil {
 		log.Errorf("unable to create funding script for "+
 			"ChannelPoint(%v): %v", completeChan.FundingOutpoint,
@@ -3091,34 +3133,135 @@ func (f *Manager) waitForFundingConfirmation(
 	log.Infof("Waiting for funding tx (%v) to reach %v confirmations",
 		txid, numConfs)
 
-	var confDetails *chainntnfs.TxConfirmation
-	var ok bool
-
 	// Wait until the specified number of confirmations has been reached,
 	// we get a cancel signal, or the wallet signals a shutdown.
-	select {
-	case confDetails, ok = <-confNtfn.Confirmed:
-		// fallthrough
+	for {
+		select {
+		case updDetails, ok := <-confNtfn.Updates:
+			if !ok {
+				log.Warnf("ChainNotifier shutting down, "+
+					"cannot process updates for "+
+					"ChannelPoint(%v)",
+					completeChan.FundingOutpoint)
 
-	case <-cancelChan:
-		log.Warnf("canceled waiting for funding confirmation, "+
-			"stopping funding flow for ChannelPoint(%v)",
-			completeChan.FundingOutpoint)
-		return
+				return
+			}
 
-	case <-f.quit:
-		log.Warnf("fundingManager shutting down, stopping funding "+
-			"flow for ChannelPoint(%v)",
-			completeChan.FundingOutpoint)
-		return
+			log.Debugf("funding tx %s received confirmation in "+
+				"block %d, %d confirmations left", txid,
+				updDetails.BlockHeight, updDetails.NumConfsLeft)
+
+			// Only update the ConfirmationHeight the first time a
+			// confirmation is received, since on subsequent
+			// confirmations the block height will remain the same.
+			if completeChan.ConfirmationHeight == 0 {
+				err := completeChan.MarkConfirmationHeight(
+					updDetails.BlockHeight,
+				)
+				if err != nil {
+					log.Errorf("failed to update "+
+						"confirmed state for "+
+						"ChannelPoint(%v): %v",
+						completeChan.FundingOutpoint,
+						err)
+
+					return
+				}
+			}
+
+		case _, ok := <-confNtfn.NegativeConf:
+			if !ok {
+				log.Warnf("ChainNotifier shutting down, "+
+					"cannot track negative confirmations "+
+					"for ChannelPoint(%v)",
+					completeChan.FundingOutpoint)
+
+				return
+			}
+
+			log.Warnf("funding tx %s was reorged out; channel "+
+				"point: %s", txid, completeChan.FundingOutpoint)
+
+			// Reset the confirmation height to 0 because the
+			// funding transaction was reorged out.
+			err := completeChan.MarkConfirmationHeight(uint32(0))
+			if err != nil {
+				log.Errorf("failed to update state for "+
+					"ChannelPoint(%v): %v",
+					completeChan.FundingOutpoint, err)
+
+				return
+			}
+
+		case confDetails, ok := <-confNtfn.Confirmed:
+			if !ok {
+				log.Warnf("ChainNotifier shutting down, "+
+					"cannot complete funding flow for "+
+					"ChannelPoint(%v)",
+					completeChan.FundingOutpoint)
+
+				return
+			}
+
+			log.Debugf("funding tx %s for ChannelPoint(%v) "+
+				"confirmed in block %d", txid,
+				completeChan.FundingOutpoint,
+				confDetails.BlockHeight)
+
+			// In the case of requiring a single confirmation, it
+			// can happen that the `Confirmed` channel is read
+			// from first, in which case the confirmation height
+			// will not be set. If this happens, we take the
+			// confirmation height from the `Confirmed` channel.
+			if completeChan.ConfirmationHeight == 0 {
+				err := completeChan.MarkConfirmationHeight(
+					confDetails.BlockHeight,
+				)
+				if err != nil {
+					log.Errorf("failed to update "+
+						"confirmed state for "+
+						"ChannelPoint(%v): %v",
+						completeChan.FundingOutpoint,
+						err)
+
+					return
+				}
+			}
+
+			err := f.handleConfirmation(
+				confDetails, completeChan, confChan,
+			)
+			if err != nil {
+				log.Errorf("Error handling confirmation for "+
+					"ChannelPoint(%v), txid=%v: %v",
+					completeChan.FundingOutpoint, txid, err)
+			}
+
+			return
+
+		case <-cancelChan:
+			log.Warnf("canceled waiting for funding confirmation, "+
+				"stopping funding flow for ChannelPoint(%v)",
+				completeChan.FundingOutpoint)
+
+			return
+
+		case <-f.quit:
+			log.Warnf("fundingManager shutting down, stopping "+
+				"funding flow for ChannelPoint(%v)",
+				completeChan.FundingOutpoint)
+
+			return
+		}
 	}
+}
 
-	if !ok {
-		log.Warnf("ChainNotifier shutting down, cannot complete "+
-			"funding flow for ChannelPoint(%v)",
-			completeChan.FundingOutpoint)
-		return
-	}
+// handleConfirmation is a helper function that constructs a ShortChannelID
+// based on the confirmation details and sends this information, along with the
+// funding transaction, to the provided confirmation channel.
+func (f *Manager) handleConfirmation(confDetails *chainntnfs.TxConfirmation,
+	completeChan *channeldb.OpenChannel,
+	confChan chan<- *confirmedChannel) error {
 
 	fundingPoint := completeChan.FundingOutpoint
 	log.Infof("ChannelPoint(%v) is now active: ChannelID(%v)",
@@ -3139,8 +3282,10 @@ func (f *Manager) waitForFundingConfirmation(
 		fundingTx:   confDetails.Tx,
 	}:
 	case <-f.quit:
-		return
+		return fmt.Errorf("manager shutting down")
 	}
+
+	return nil
 }
 
 // waitForTimeout will close the timeout channel if MaxWaitNumBlocksFundingConf
@@ -3164,9 +3309,21 @@ func (f *Manager) waitForTimeout(completeChan *channeldb.OpenChannel,
 
 	defer epochClient.Cancel()
 
+	// The value of waitBlocksForFundingConf is adjusted in a development
+	// environment to enhance test capabilities. Otherwise, it is set to
+	// DefaultMaxWaitNumBlocksFundingConf.
+	waitBlocksForFundingConf := uint32(
+		lncfg.DefaultMaxWaitNumBlocksFundingConf,
+	)
+
+	if lncfg.IsDevBuild() {
+		waitBlocksForFundingConf =
+			f.cfg.Dev.MaxWaitNumBlocksFundingConf
+	}
+
 	// On block maxHeight we will cancel the funding confirmation wait.
 	broadcastHeight := completeChan.BroadcastHeight()
-	maxHeight := broadcastHeight + MaxWaitNumBlocksFundingConf
+	maxHeight := broadcastHeight + waitBlocksForFundingConf
 	for {
 		select {
 		case epoch, ok := <-epochClient.Epochs:
@@ -3182,7 +3339,7 @@ func (f *Manager) waitForTimeout(completeChan *channeldb.OpenChannel,
 				log.Warnf("Waited for %v blocks without "+
 					"seeing funding transaction confirmed,"+
 					" cancelling.",
-					MaxWaitNumBlocksFundingConf)
+					waitBlocksForFundingConf)
 
 				// Notify the caller of the timeout.
 				close(timeoutChan)
@@ -3297,7 +3454,9 @@ func (f *Manager) handleFundingConfirmation(
 
 	// Inform the ChannelNotifier that the channel has transitioned from
 	// pending open to open.
-	f.cfg.NotifyOpenChannelEvent(completeChan.FundingOutpoint)
+	f.cfg.NotifyOpenChannelEvent(
+		completeChan.FundingOutpoint, completeChan.IdentityPub,
+	)
 
 	// Close the discoverySignal channel, indicating to a separate
 	// goroutine that the channel now is marked as open in the database
@@ -3493,7 +3652,7 @@ func (f *Manager) receivedChannelReady(node *btcec.PublicKey,
 	}
 
 	// Finally, the barrier signal is removed once we finish
-	// `handleChannelReady`. If we can still find the signal, we haven't
+	// `processChannelReady`. If we can still find the signal, we haven't
 	// finished processing it yet.
 	_, loaded := f.handleChannelReadyBarriers.Load(chanID)
 
@@ -3530,6 +3689,30 @@ func (f *Manager) extractAnnounceParams(c *channeldb.OpenChannel) (
 	return fwdMinHTLC, fwdMaxHTLC
 }
 
+// mapGossipError inspects a gossip result error and translates shutdown
+// signals into ErrFundingManagerShuttingDown. Graph-rejected errors (outdated,
+// ignored) are logged at debug level and treated as non-fatal (nil is
+// returned). All other non-nil errors are returned as-is for the caller to
+// handle.
+func mapGossipError(err error, msgType string) error {
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, discovery.ErrGossiperShuttingDown) {
+
+		return ErrFundingManagerShuttingDown
+	}
+
+	if graph.IsError(err, graph.ErrOutdated, graph.ErrIgnored) {
+		log.Debugf("Graph rejected %s: %v", msgType, err)
+		return nil
+	}
+
+	return err
+}
+
 // addToGraph sends a ChannelAnnouncement and a ChannelUpdate to the
 // gossiper so that the channel is added to the graph builder's internal graph.
 // These announcement messages are NOT broadcasted to the greater network,
@@ -3559,48 +3742,34 @@ func (f *Manager) addToGraph(completeChan *channeldb.OpenChannel,
 			"announcement: %v", err)
 	}
 
+	// Create a context tied to the manager's quit channel so that both
+	// gossip awaits below respect shutdown.
+	ctx, cancel := lnutils.ContextFromQuit(f.quit)
+	defer cancel()
+
 	// Send ChannelAnnouncement and ChannelUpdate to the gossiper to add
 	// to the Router's topology.
-	errChan := f.cfg.SendAnnouncement(
-		ann.chanAnn, discovery.ChannelCapacity(completeChan.Capacity),
-		discovery.ChannelPoint(completeChan.FundingOutpoint),
-		discovery.TapscriptRoot(completeChan.TapscriptRoot),
-	)
-	select {
-	case err := <-errChan:
-		if err != nil {
-			if graph.IsError(err, graph.ErrOutdated,
-				graph.ErrIgnored) {
-
-				log.Debugf("Graph rejected "+
-					"ChannelAnnouncement: %v", err)
-			} else {
-				return fmt.Errorf("error sending channel "+
-					"announcement: %v", err)
-			}
-		}
-	case <-f.quit:
-		return ErrFundingManagerShuttingDown
+	err = mapGossipError(discovery.AwaitGossipResult(ctx,
+		f.cfg.SendAnnouncement(
+			ann.chanAnn,
+			discovery.ChannelCapacity(completeChan.Capacity),
+			discovery.ChannelPoint(completeChan.FundingOutpoint),
+			discovery.TapscriptRoot(completeChan.TapscriptRoot),
+		),
+	), "ChannelAnnouncement")
+	if err != nil {
+		return fmt.Errorf("error sending channel announcement: %w",
+			err)
 	}
 
-	errChan = f.cfg.SendAnnouncement(
-		ann.chanUpdateAnn, discovery.RemoteAlias(peerAlias),
-	)
-	select {
-	case err := <-errChan:
-		if err != nil {
-			if graph.IsError(err, graph.ErrOutdated,
-				graph.ErrIgnored) {
-
-				log.Debugf("Graph rejected "+
-					"ChannelUpdate: %v", err)
-			} else {
-				return fmt.Errorf("error sending channel "+
-					"update: %v", err)
-			}
-		}
-	case <-f.quit:
-		return ErrFundingManagerShuttingDown
+	err = mapGossipError(discovery.AwaitGossipResult(ctx,
+		f.cfg.SendAnnouncement(
+			ann.chanUpdateAnn,
+			discovery.RemoteAlias(peerAlias),
+		),
+	), "ChannelUpdate")
+	if err != nil {
+		return fmt.Errorf("error sending channel update: %w", err)
 	}
 
 	return nil
@@ -3616,8 +3785,8 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 	shortChanID *lnwire.ShortChannelID) error {
 
 	// If this channel is not meant to be announced to the greater network,
-	// we'll only send our NodeAnnouncement to our counterparty to ensure we
-	// don't leak any of our information.
+	// we'll only send our NodeAnnouncement1 to our counterparty to ensure
+	// we don't leak any of our information.
 	announceChan := completeChan.ChannelFlags&lnwire.FFAnnounceChannel != 0
 	if !announceChan {
 		log.Debugf("Will not announce private channel %v.",
@@ -3638,7 +3807,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 			completeChan.FundingOutpoint,
 		)
 		pubKey := peer.PubKey()
-		log.Debugf("Sending our NodeAnnouncement for "+
+		log.Debugf("Sending our NodeAnnouncement1 for "+
 			"ChannelID(%v) to %x", chanID, pubKey)
 
 		// TODO(halseth): make reliable. If the peer is not online this
@@ -3661,7 +3830,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 			shortChanID.ToUint64(), completeChan.FundingOutpoint,
 			numConfs)
 
-		fundingScript, err := makeFundingScript(completeChan)
+		fundingScript, err := MakeFundingScript(completeChan)
 		if err != nil {
 			return fmt.Errorf("unable to create funding script "+
 				"for ChannelPoint(%v): %v",
@@ -3800,6 +3969,22 @@ func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel) error {
 
 	// Six confirmations have been reached. If this channel is public,
 	// we'll delete some of the alias mappings the gossiper uses.
+	//
+	// Tell the Switch to refresh the relevant ChannelLink so that forwards
+	// under the confirmed SCID are possible. We do this BEFORE updating the
+	// graph to avoid a race where other nodes learn about the confirmed
+	// SCID from gossip before our switch is ready to handle forwards using
+	// it. This is especially important for integration tests.
+	err = f.cfg.ReportShortChanID(c.FundingOutpoint)
+	if err != nil {
+		// This should only fail if the link is not found in the
+		// Switch's linkIndex map. If this is the case, then the peer
+		// has gone offline and the next time the link is loaded, it
+		// will have a refreshed state. Just log an error here.
+		log.Errorf("unable to report scid for zero-conf channel "+
+			"channel: %v", err)
+	}
+
 	isPublic := c.ChannelFlags&lnwire.FFAnnounceChannel != 0
 	if isPublic {
 		err = f.cfg.AliasManager.DeleteSixConfs(c.ShortChannelID)
@@ -3826,19 +4011,6 @@ func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel) error {
 			return fmt.Errorf("failed adding confirmed zero-conf "+
 				"SCID to graph: %v", err)
 		}
-	}
-
-	// Since we have now marked down the confirmed SCID, we'll also need to
-	// tell the Switch to refresh the relevant ChannelLink so that forwards
-	// under the confirmed SCID are possible if this is a public channel.
-	err = f.cfg.ReportShortChanID(c.FundingOutpoint)
-	if err != nil {
-		// This should only fail if the link is not found in the
-		// Switch's linkIndex map. If this is the case, then the peer
-		// has gone offline and the next time the link is loaded, it
-		// will have a refreshed state. Just log an error here.
-		log.Errorf("unable to report scid for zero-conf channel "+
-			"channel: %v", err)
 	}
 
 	// Update the confirmed transaction's label.
@@ -3878,10 +4050,128 @@ func genFirstStateMusigNonce(channel *channeldb.OpenChannel,
 
 // handleChannelReady finalizes the channel funding process and enables the
 // channel to enter normal operating mode.
-func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
+func (f *Manager) handleChannelReady(peer lnpeer.Peer,
 	msg *lnwire.ChannelReady) {
 
-	defer f.wg.Done()
+	// Notify the aux hook that the specified peer just established a
+	// channel with us, identified by the given channel ID.
+	f.cfg.AuxChannelNegotiator.WhenSome(
+		func(acn lnwallet.AuxChannelNegotiator) {
+			acn.ProcessChannelReady(msg.ChanID, peer.PubKey())
+		},
+	)
+
+	log.Debugf("Received ChannelReady for ChannelID(%v) from "+
+		"peer %x", msg.ChanID,
+		peer.IdentityKey().SerializeCompressed())
+
+	// We now load or create a new channel barrier for this channel. If
+	// we are currently in the process of handling a channel_ready message
+	// for this channel, ignore the duplicate.
+	_, loaded := f.handleChannelReadyBarriers.LoadOrStore(
+		msg.ChanID, struct{}{},
+	)
+	if loaded {
+		log.Infof("Already handling channelReady for "+
+			"ChannelID(%v), ignoring.", msg.ChanID)
+		return
+	}
+
+	// Check whether we need to wait for the local funding confirmation flow
+	// to finish before we can proceed with this message. The
+	// localDiscoverySignal is only present for channels that we are
+	// actively funding and is bounded by the maximum number of pending
+	// channels.
+	localDiscoverySignal, ok := f.localDiscoverySignals.Load(msg.ChanID)
+	if ok {
+		f.wg.Add(1)
+		go func() {
+			defer f.wg.Done()
+			defer f.handleChannelReadyBarriers.Delete(
+				msg.ChanID,
+			)
+
+			// Wait for the local waitForFundingConfirmation
+			// goroutine to signal that it has the necessary state
+			// in place. Otherwise, we may be missing critical
+			// information required to handle forwarded HTLC's.
+			select {
+			case <-localDiscoverySignal:
+			case <-f.quit:
+				return
+			}
+
+			f.localDiscoverySignals.Delete(msg.ChanID)
+			f.processChannelReady(peer, msg)
+		}()
+
+		return
+	}
+
+	// No signal wait needed. Perform a lightweight channel lookup inline
+	// to short-circuit bogus or already-established channels without
+	// blocking the coordinator on heavier processing.
+	chanID := msg.ChanID
+	channel, err := f.cfg.FindChannel(peer.IdentityKey(), chanID)
+	if err != nil {
+		f.handleChannelReadyBarriers.Delete(msg.ChanID)
+
+		log.Errorf("Unable to locate ChannelID(%v), cannot "+
+			"complete funding", chanID)
+
+		return
+	}
+
+	// If the RemoteNextRevocation is non-nil, then the channel has
+	// already been fully established and we've processed channel_ready
+	// for it at least once. We short-circuit inline to avoid redoing the
+	// heavy work in processChannelReady (DB writes, nonce generation,
+	// AddNewChannel) on every duplicate channel_ready the peer sends.
+	// Note that the happy path where the channel is actively being
+	// funded goes through the localDiscoverySignal branch above.
+	if channel.RemoteNextRevocation != nil {
+		// Even though we're ignoring the rest of the message, we
+		// still need to refresh the peer's alias if they negotiated
+		// the option_scid_alias feature and sent a (possibly updated)
+		// AliasScid. The peer may resend channel_ready to rotate or
+		// update their alias for invoice route hints.
+		if channel.NegotiatedAliasFeature() && msg.AliasScid != nil {
+			err := f.cfg.AliasManager.PutPeerAlias(
+				chanID, *msg.AliasScid,
+			)
+			if err != nil {
+				log.Errorf("unable to store peer's alias: "+
+					"%v", err)
+			}
+		}
+
+		f.handleChannelReadyBarriers.Delete(msg.ChanID)
+
+		log.Infof("Received duplicate channelReady for "+
+			"ChannelID(%v), ignoring.", chanID)
+
+		return
+	}
+
+	// Channel exists and hasn't been fully established yet — this is a
+	// legitimate first channel_ready. Dispatch the remaining work (DB
+	// writes, nonce generation, AddNewChannel) in a goroutine to avoid
+	// blocking the coordinator.
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		defer f.handleChannelReadyBarriers.Delete(msg.ChanID)
+
+		f.processChannelReady(peer, msg)
+	}()
+}
+
+// processChannelReady completes the channel_ready handling after any required
+// signal waits. It looks up the channel in the database and finalizes the
+// funding flow by inserting the remote party's next revocation point and
+// handing the channel off to the peer for normal operation.
+func (f *Manager) processChannelReady(peer lnpeer.Peer,
+	msg *lnwire.ChannelReady) {
 
 	// If we are in development mode, we'll wait for specified duration
 	// before processing the channel ready message.
@@ -3900,51 +4190,10 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 		}
 	}
 
-	log.Debugf("Received ChannelReady for ChannelID(%v) from "+
-		"peer %x", msg.ChanID,
-		peer.IdentityKey().SerializeCompressed())
-
-	// We now load or create a new channel barrier for this channel.
-	_, loaded := f.handleChannelReadyBarriers.LoadOrStore(
-		msg.ChanID, struct{}{},
-	)
-
-	// If we are currently in the process of handling a channel_ready
-	// message for this channel, ignore.
-	if loaded {
-		log.Infof("Already handling channelReady for "+
-			"ChannelID(%v), ignoring.", msg.ChanID)
-		return
-	}
-
-	// If not already handling channelReady for this channel, then the
-	// `LoadOrStore` has set up a barrier, and it will be removed once this
-	// function exits.
-	defer f.handleChannelReadyBarriers.Delete(msg.ChanID)
-
-	localDiscoverySignal, ok := f.localDiscoverySignals.Load(msg.ChanID)
-	if ok {
-		// Before we proceed with processing the channel_ready
-		// message, we'll wait for the local waitForFundingConfirmation
-		// goroutine to signal that it has the necessary state in
-		// place. Otherwise, we may be missing critical information
-		// required to handle forwarded HTLC's.
-		select {
-		case <-localDiscoverySignal:
-			// Fallthrough
-		case <-f.quit:
-			return
-		}
-
-		// With the signal received, we can now safely delete the entry
-		// from the map.
-		f.localDiscoverySignals.Delete(msg.ChanID)
-	}
-
-	// First, we'll attempt to locate the channel whose funding workflow is
-	// being finalized by this message. We go to the database rather than
-	// our reservation map as we may have restarted, mid funding flow. Also
-	// provide the node's public key to make the search faster.
+	// We'll attempt to locate the channel whose funding workflow is being
+	// finalized by this message. We go to the database rather than our
+	// reservation map as we may have restarted mid funding flow. The
+	// node's public key is provided to scope the search.
 	chanID := msg.ChanID
 	channel, err := f.cfg.FindChannel(peer.IdentityKey(), chanID)
 	if err != nil {
@@ -3969,7 +4218,7 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 	// during invoice creation. In the zero-conf case, it is also used to
 	// provide a ChannelUpdate to the remote peer. This is done before the
 	// call to InsertNextRevocation in case the call to PutPeerAlias fails.
-	// If it were to fail on the first call to handleChannelReady, we
+	// If it were to fail on the first call to processChannelReady, we
 	// wouldn't want the channel to be usable yet.
 	if channel.NegotiatedAliasFeature() {
 		// If the AliasScid field is nil, we must fail out. We will
@@ -4028,7 +4277,7 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 			channelReadyMsg.AliasScid = &alias
 
 			if firstVerNonce != nil {
-				channelReadyMsg.NextLocalNonce = lnwire.SomeMusig2Nonce( //nolint:lll
+				channelReadyMsg.NextLocalNonce = lnwire.SomeMusig2Nonce( //nolint:ll
 					firstVerNonce.PubNonce,
 				)
 			}
@@ -4291,9 +4540,9 @@ func (f *Manager) ensureInitialForwardingPolicy(chanID lnwire.ChannelID,
 // chanAnnouncement encapsulates the two authenticated announcements that we
 // send out to the network after a new channel has been created locally.
 type chanAnnouncement struct {
-	chanAnn       *lnwire.ChannelAnnouncement
-	chanUpdateAnn *lnwire.ChannelUpdate
-	chanProof     *lnwire.AnnounceSignatures
+	chanAnn       *lnwire.ChannelAnnouncement1
+	chanUpdateAnn *lnwire.ChannelUpdate1
+	chanProof     *lnwire.AnnounceSignatures1
 }
 
 // newChanAnnouncement creates the authenticated channel announcement messages
@@ -4316,7 +4565,7 @@ func (f *Manager) newChanAnnouncement(localPubKey,
 	// The unconditional section of the announcement is the ShortChannelID
 	// itself which compactly encodes the location of the funding output
 	// within the blockchain.
-	chanAnn := &lnwire.ChannelAnnouncement{
+	chanAnn := &lnwire.ChannelAnnouncement1{
 		ShortChannelID: shortChanID,
 		Features:       lnwire.NewRawFeatureVector(),
 		ChainHash:      chainHash,
@@ -4386,7 +4635,7 @@ func (f *Manager) newChanAnnouncement(localPubKey,
 
 	// We announce the channel with the default values. Some of
 	// these values can later be changed by crafting a new ChannelUpdate.
-	chanUpdateAnn := &lnwire.ChannelUpdate{
+	chanUpdateAnn := &lnwire.ChannelUpdate1{
 		ShortChannelID: shortChanID,
 		ChainHash:      chainHash,
 		Timestamp:      uint32(time.Now().Unix()),
@@ -4405,8 +4654,8 @@ func (f *Manager) newChanAnnouncement(localPubKey,
 	// channel announcement.
 	storedFwdingPolicy, err := f.getInitialForwardingPolicy(chanID)
 	if err != nil && !errors.Is(err, channeldb.ErrChannelNotFound) {
-		return nil, errors.Errorf("unable to generate channel "+
-			"update announcement: %v", err)
+		return nil, fmt.Errorf("unable to generate channel "+
+			"update announcement: %w", err)
 	}
 
 	switch {
@@ -4449,13 +4698,13 @@ func (f *Manager) newChanAnnouncement(localPubKey,
 	}
 	sig, err := f.cfg.SignMessage(f.cfg.IDKeyLoc, chanUpdateMsg, true)
 	if err != nil {
-		return nil, errors.Errorf("unable to generate channel "+
-			"update announcement signature: %v", err)
+		return nil, fmt.Errorf("unable to generate channel "+
+			"update announcement signature: %w", err)
 	}
 	chanUpdateAnn.Signature, err = lnwire.NewSigFromSignature(sig)
 	if err != nil {
-		return nil, errors.Errorf("unable to generate channel "+
-			"update announcement signature: %v", err)
+		return nil, fmt.Errorf("unable to generate channel "+
+			"update announcement signature: %w", err)
 	}
 
 	// The channel existence proofs itself is currently announced in
@@ -4471,21 +4720,21 @@ func (f *Manager) newChanAnnouncement(localPubKey,
 	}
 	nodeSig, err := f.cfg.SignMessage(f.cfg.IDKeyLoc, chanAnnMsg, true)
 	if err != nil {
-		return nil, errors.Errorf("unable to generate node "+
-			"signature for channel announcement: %v", err)
+		return nil, fmt.Errorf("unable to generate node "+
+			"signature for channel announcement: %w", err)
 	}
 	bitcoinSig, err := f.cfg.SignMessage(
 		localFundingKey.KeyLocator, chanAnnMsg, true,
 	)
 	if err != nil {
-		return nil, errors.Errorf("unable to generate bitcoin "+
-			"signature for node public key: %v", err)
+		return nil, fmt.Errorf("unable to generate bitcoin "+
+			"signature for node public key: %w", err)
 	}
 
 	// Finally, we'll generate the announcement proof which we'll use to
 	// provide the other side with the necessary signatures required to
 	// allow them to reconstruct the full channel announcement.
-	proof := &lnwire.AnnounceSignatures{
+	proof := &lnwire.AnnounceSignatures1{
 		ChannelID:      chanID,
 		ShortChannelID: shortChanID,
 	}
@@ -4533,28 +4782,21 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 		return err
 	}
 
+	// Create a context tied to the manager's quit channel so that both
+	// gossip awaits below respect shutdown.
+	ctx, cancel := lnutils.ContextFromQuit(f.quit)
+	defer cancel()
+
 	// We only send the channel proof announcement and the node announcement
 	// because addToGraph previously sent the ChannelAnnouncement and
 	// the ChannelUpdate announcement messages. The channel proof and node
 	// announcements are broadcast to the greater network.
-	errChan := f.cfg.SendAnnouncement(ann.chanProof)
-	select {
-	case err := <-errChan:
-		if err != nil {
-			if graph.IsError(err, graph.ErrOutdated,
-				graph.ErrIgnored) {
-
-				log.Debugf("Graph rejected "+
-					"AnnounceSignatures: %v", err)
-			} else {
-				log.Errorf("Unable to send channel "+
-					"proof: %v", err)
-				return err
-			}
-		}
-
-	case <-f.quit:
-		return ErrFundingManagerShuttingDown
+	err = mapGossipError(discovery.AwaitGossipResult(
+		ctx, f.cfg.SendAnnouncement(ann.chanProof),
+	), "AnnounceSignatures")
+	if err != nil {
+		log.Errorf("Unable to send channel proof: %v", err)
+		return err
 	}
 
 	// Now that the channel is announced to the network, we will also
@@ -4567,24 +4809,12 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 		return err
 	}
 
-	errChan = f.cfg.SendAnnouncement(&nodeAnn)
-	select {
-	case err := <-errChan:
-		if err != nil {
-			if graph.IsError(err, graph.ErrOutdated,
-				graph.ErrIgnored) {
-
-				log.Debugf("Graph rejected "+
-					"NodeAnnouncement: %v", err)
-			} else {
-				log.Errorf("Unable to send node "+
-					"announcement: %v", err)
-				return err
-			}
-		}
-
-	case <-f.quit:
-		return ErrFundingManagerShuttingDown
+	err = mapGossipError(discovery.AwaitGossipResult(
+		ctx, f.cfg.SendAnnouncement(&nodeAnn),
+	), "NodeAnnouncement")
+	if err != nil {
+		log.Errorf("Unable to send node announcement: %v", err)
+		return err
 	}
 
 	return nil
@@ -4700,12 +4930,23 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 		}
 	}
 
+	// If the funder did not provide an upfront-shutdown address, fall back
+	// to the configured shutdown script (if any).
+	shutdownScript := msg.ShutdownScript
+	if len(shutdownScript) == 0 {
+		f.cfg.ShutdownScript.WhenSome(
+			func(script lnwire.DeliveryAddress) {
+				shutdownScript = script
+			},
+		)
+	}
+
 	// Check whether the peer supports upfront shutdown, and get an address
 	// which should be used (either a user specified address or a new
 	// address from the wallet if our node is configured to set shutdown
 	// address by default).
 	shutdown, err := getUpfrontShutdownScript(
-		f.cfg.EnableUpfrontShutdown, msg.Peer, msg.ShutdownScript,
+		f.cfg.EnableUpfrontShutdown, msg.Peer, shutdownScript,
 		f.selectShutdownScript,
 	)
 	if err != nil {
@@ -4752,6 +4993,16 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 
 			return
 		}
+	}
+
+	// The current variant of taproot channels can only be used with
+	// unadvertised channels for now.
+	if commitType.IsTaproot() && !msg.Private {
+		err = fmt.Errorf("taproot channel type for public channel")
+		log.Error(err)
+		msg.Err <- err
+
+		return
 	}
 
 	// First, we'll query the fee estimator for a fee that should get the
@@ -5141,13 +5392,13 @@ func (f *Manager) cancelReservationCtx(peerKey *btcec.PublicKey,
 	nodeReservations, ok := f.activeReservations[peerIDKey]
 	if !ok {
 		// No reservations for this node.
-		return nil, errors.Errorf("no active reservations for peer(%x)",
+		return nil, fmt.Errorf("no active reservations for peer(%x)",
 			peerIDKey[:])
 	}
 
 	ctx, ok := nodeReservations[pendingChanID]
 	if !ok {
-		return nil, errors.Errorf("unknown channel (id: %x) for "+
+		return nil, fmt.Errorf("unknown channel (id: %x) for "+
 			"peer(%x)", pendingChanID[:], peerIDKey[:])
 	}
 
@@ -5160,8 +5411,7 @@ func (f *Manager) cancelReservationCtx(peerKey *btcec.PublicKey,
 	}
 
 	if err := ctx.reservation.Cancel(); err != nil {
-		return nil, errors.Errorf("unable to cancel reservation: %v",
-			err)
+		return nil, fmt.Errorf("unable to cancel reservation: %w", err)
 	}
 
 	delete(nodeReservations, pendingChanID)
@@ -5208,7 +5458,7 @@ func (f *Manager) getReservationCtx(peerKey *btcec.PublicKey,
 	f.resMtx.RUnlock()
 
 	if !ok {
-		return nil, errors.Errorf("unknown channel (id: %x) for "+
+		return nil, fmt.Errorf("unknown channel (id: %x) for "+
 			"peer(%x)", pendingChanID[:], peerIDKey[:])
 	}
 

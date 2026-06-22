@@ -12,6 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +30,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 		newAddrReq = &lnrpc.NewAddressRequest{
 			Type: AddrTypeWitnessPubkeyHash,
 		}
-		testNode   = ht.Alice
+		testNode   = ht.NewNode("Alice", nil)
 		testClient = testNode.RPC.LN
 	)
 
@@ -37,9 +38,8 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 		name string
 		run  func(ctxt context.Context, t *testing.T)
 	}{{
-		// First test: Make sure we get an error if we use no macaroons
-		// but try to connect to a node that has macaroon authentication
-		// enabled.
+		// Make sure we get an error if we use no macaroons but try to
+		// connect to a node that has macaroon authentication enabled.
 		name: "no macaroon",
 		run: func(ctxt context.Context, t *testing.T) {
 			conn, err := testNode.ConnectRPCWithMacaroon(nil)
@@ -51,8 +51,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "expected 1 macaroon")
 		},
 	}, {
-		// Second test: Ensure that an invalid macaroon also triggers an
-		// error.
+		// Ensure that an invalid macaroon also triggers an error.
 		name: "invalid macaroon",
 		run: func(ctxt context.Context, t *testing.T) {
 			invalidMac, _ := macaroon.New(
@@ -68,8 +67,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "invalid ID")
 		},
 	}, {
-		// Third test: Try to access a write method with read-only
-		// macaroon.
+		// Try to access a write method with read-only macaroon.
 		name: "read only macaroon",
 		run: func(ctxt context.Context, t *testing.T) {
 			readonlyMac, err := testNode.ReadMacaroon(
@@ -85,8 +83,8 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "permission denied")
 		},
 	}, {
-		// Fourth test: Check first-party caveat with timeout that
-		// expired 30 seconds ago.
+		// Check first-party caveat with timeout that expired 30 seconds
+		// ago.
 		name: "expired macaroon",
 		run: func(ctxt context.Context, t *testing.T) {
 			readonlyMac, err := testNode.ReadMacaroon(
@@ -106,7 +104,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "macaroon has expired")
 		},
 	}, {
-		// Fifth test: Check first-party caveat with invalid IP address.
+		// Check first-party caveat with invalid IP address.
 		name: "invalid IP macaroon",
 		run: func(ctxt context.Context, t *testing.T) {
 			readonlyMac, err := testNode.ReadMacaroon(
@@ -128,7 +126,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "different IP address")
 		},
 	}, {
-		// Sixth test: Make sure that if we do everything correct and
+		// Make sure that if we do everything correct and
 		// send the admin macaroon with first-party caveats that we can
 		// satisfy, we get a correct answer.
 		name: "correct macaroon",
@@ -149,8 +147,51 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			assert.Contains(t, res.Address, "bcrt1")
 		},
 	}, {
-		// Seventh test: Bake a macaroon that can only access exactly
-		// two RPCs and make sure it works as expected.
+		// Check first-party caveat with invalid IP range.
+		name: "invalid IP range macaroon",
+		run: func(ctxt context.Context, t *testing.T) {
+			readonlyMac, err := testNode.ReadMacaroon(
+				testNode.Cfg.ReadMacPath, defaultTimeout,
+			)
+			require.NoError(t, err)
+			invalidIPRangeMac, err := macaroons.AddConstraints(
+				readonlyMac, macaroons.IPRangeLockConstraint(
+					"1.1.1.1/32",
+				),
+			)
+			require.NoError(t, err)
+			cleanup, client := macaroonClient(
+				t, testNode, invalidIPRangeMac,
+			)
+			defer cleanup()
+			_, err = client.GetInfo(ctxt, infoReq)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "different IP range")
+		},
+	}, {
+		// Make sure that if we do everything correct and send the admin
+		// macaroon with first-party caveats that we can satisfy, we get
+		// a correct answer.
+		name: "correct macaroon",
+		run: func(ctxt context.Context, t *testing.T) {
+			adminMac, err := testNode.ReadMacaroon(
+				testNode.Cfg.AdminMacPath, defaultTimeout,
+			)
+			require.NoError(t, err)
+			adminMac, err = macaroons.AddConstraints(
+				adminMac, macaroons.TimeoutConstraint(30),
+				macaroons.IPRangeLockConstraint("127.0.0.0/8"),
+			)
+			require.NoError(t, err)
+			cleanup, client := macaroonClient(t, testNode, adminMac)
+			defer cleanup()
+			res, err := client.NewAddress(ctxt, newAddrReq)
+			require.NoError(t, err, "get new address")
+			assert.Contains(t, res.Address, "bcrt1")
+		},
+	}, {
+		// Bake a macaroon that can only access exactly two RPCs and
+		// make sure it works as expected.
 		name: "custom URI permissions",
 		run: func(ctxt context.Context, t *testing.T) {
 			entity := macaroons.PermissionEntityCustomURI
@@ -199,9 +240,9 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Contains(t, err.Error(), "permission denied")
 		},
 	}, {
-		// Eighth test: check that with the CheckMacaroonPermissions
-		// RPC, we can check that a macaroon follows (or doesn't)
-		// permissions and constraints.
+		// Check that with the CheckMacaroonPermissions RPC, we can
+		// check that a macaroon follows (or doesn't) permissions and
+		// constraints.
 		name: "unknown permissions",
 		run: func(ctxt context.Context, t *testing.T) {
 			// A test macaroon created with permissions from pool,
@@ -276,6 +317,77 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "permission denied")
 		},
+	}, {
+		// Check that with the CheckMacaroonPermissions RPC, we can
+		// check that a macaroon follows the permissions of a given
+		// method.
+		name: "default permissions from full method",
+		run: func(ctxt context.Context, t *testing.T) {
+			// We test that the macaroon of the test client has
+			// all the permissions for calling the BakeMacaroon RPC.
+			mac, err := testNode.ReadMacaroon(
+				testNode.Cfg.AdminMacPath, wait.DefaultTimeout,
+			)
+			require.NoError(t, err)
+
+			macBytes, err := mac.MarshalBinary()
+			require.NoError(t, err)
+
+			rpcURI := "/lnrpc.Lightning/BakeMacaroon"
+			checkReq := &lnrpc.CheckMacPermRequest{
+				Macaroon:                        macBytes,
+				FullMethod:                      rpcURI,
+				CheckDefaultPermsFromFullMethod: true,
+			}
+
+			// Test that CheckMacaroonPermissions accurately
+			// characterizes macaroon as valid, since the admin
+			// macaroon should have all the permissions.
+			checkResp, err := testClient.CheckMacaroonPermissions(
+				ctxt, checkReq,
+			)
+			require.NoError(t, err)
+			require.Equal(t, checkResp.Valid, true)
+
+			// Check different error cases.
+			dummy := []*lnrpc.MacaroonPermission{{
+				Entity: "foo",
+			}}
+			_, err = testClient.CheckMacaroonPermissions(
+				ctxt, &lnrpc.CheckMacPermRequest{
+					Permissions:                     dummy,
+					CheckDefaultPermsFromFullMethod: true,
+				},
+			)
+			require.ErrorContains(
+				t, err, "cannot check default permissions "+
+					"from full method and from provided "+
+					"permission list at the same time",
+			)
+
+			_, err = testClient.CheckMacaroonPermissions(
+				ctxt, &lnrpc.CheckMacPermRequest{
+					FullMethod:                      "",
+					CheckDefaultPermsFromFullMethod: true,
+				},
+			)
+			require.ErrorContains(
+				t, err, "cannot check default permissions "+
+					"from full method without providing "+
+					"the full method name",
+			)
+
+			_, err = testClient.CheckMacaroonPermissions(
+				ctxt, &lnrpc.CheckMacPermRequest{
+					FullMethod:                      "baz",
+					CheckDefaultPermsFromFullMethod: true,
+				},
+			)
+			require.ErrorContains(
+				t, err, "no permissions found for full method "+
+					"baz",
+			)
+		},
 	}}
 
 	for _, tc := range testCases {
@@ -295,7 +407,7 @@ func testMacaroonAuthentication(ht *lntest.HarnessTest) {
 // in the request must be set correctly, and the baked macaroon has the intended
 // permissions.
 func testBakeMacaroon(ht *lntest.HarnessTest) {
-	var testNode = ht.Alice
+	var testNode = ht.NewNode("Alice", nil)
 
 	testCases := []struct {
 		name string
@@ -521,7 +633,7 @@ func testBakeMacaroon(ht *lntest.HarnessTest) {
 func testDeleteMacaroonID(ht *lntest.HarnessTest) {
 	var (
 		ctxb     = ht.Context()
-		testNode = ht.Alice
+		testNode = ht.NewNode("Alice", nil)
 	)
 	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()

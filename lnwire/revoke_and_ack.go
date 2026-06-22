@@ -38,6 +38,10 @@ type RevokeAndAck struct {
 	// remote nonce and the sender's local nonce.
 	LocalNonce OptMusig2NonceTLV
 
+	// LocalNonces is an optional field that stores a map of local musig2
+	// nonces, keyed by TXID. This is used for splice nonce coordination.
+	LocalNonces OptLocalNonces
+
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
@@ -54,6 +58,10 @@ func NewRevokeAndAck() *RevokeAndAck {
 // A compile time check to ensure RevokeAndAck implements the lnwire.Message
 // interface.
 var _ Message = (*RevokeAndAck)(nil)
+
+// A compile time check to ensure RevokeAndAck implements the
+// lnwire.SizeableMessage interface.
+var _ SizeableMessage = (*RevokeAndAck)(nil)
 
 // Decode deserializes a serialized RevokeAndAck message stored in the
 // passed io.Reader observing the specified protocol version.
@@ -74,8 +82,14 @@ func (c *RevokeAndAck) Decode(r io.Reader, pver uint32) error {
 		return err
 	}
 
-	localNonce := c.LocalNonce.Zero()
-	typeMap, err := tlvRecords.ExtractRecords(&localNonce)
+	var (
+		localNonce      = c.LocalNonce.Zero()
+		localNoncesData LocalNoncesData
+	)
+
+	typeMap, err := tlvRecords.ExtractRecords(
+		&localNonce, &localNoncesData,
+	)
 	if err != nil {
 		return err
 	}
@@ -83,6 +97,9 @@ func (c *RevokeAndAck) Decode(r io.Reader, pver uint32) error {
 	// Set the corresponding TLV types if they were included in the stream.
 	if val, ok := typeMap[c.LocalNonce.TlvType()]; ok && val == nil {
 		c.LocalNonce = tlv.SomeRecordT(localNonce)
+	}
+	if val, ok := typeMap[(LocalNoncesRecordTypeDef)(nil).TypeVal()]; ok && val == nil { //nolint:ll
+		c.LocalNonces = SomeLocalNonces(localNoncesData)
 	}
 
 	if len(tlvRecords) != 0 {
@@ -97,9 +114,12 @@ func (c *RevokeAndAck) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *RevokeAndAck) Encode(w *bytes.Buffer, pver uint32) error {
-	recordProducers := make([]tlv.RecordProducer, 0, 1)
+	recordProducers := make([]tlv.RecordProducer, 0, 2)
 	c.LocalNonce.WhenSome(func(localNonce Musig2NonceTLV) {
 		recordProducers = append(recordProducers, &localNonce)
+	})
+	c.LocalNonces.WhenSome(func(ln LocalNoncesData) {
+		recordProducers = append(recordProducers, &ln)
 	})
 	err := EncodeMessageExtraData(&c.ExtraData, recordProducers...)
 	if err != nil {
@@ -135,4 +155,11 @@ func (c *RevokeAndAck) MsgType() MessageType {
 // NOTE: Part of peer.LinkUpdater interface.
 func (c *RevokeAndAck) TargetChanID() ChannelID {
 	return c.ChanID
+}
+
+// SerializedSize returns the serialized size of the message in bytes.
+//
+// This is part of the lnwire.SizeableMessage interface.
+func (c *RevokeAndAck) SerializedSize() (uint32, error) {
+	return MessageSerializedSize(c)
 }

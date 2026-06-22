@@ -5,6 +5,7 @@ package lnrpc
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/http"
 	"net/textproto"
@@ -12,9 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/context"
 )
 
 const (

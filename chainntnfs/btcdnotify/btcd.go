@@ -17,7 +17,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/queue"
 )
 
@@ -129,11 +129,6 @@ func New(config *rpcclient.ConnConfig, chainParams *chaincfg.Params,
 		quit: make(chan struct{}),
 	}
 
-	// Disable connecting to btcd within the rpcclient.New method. We
-	// defer establishing the connection to our .Start() method.
-	config.DisableConnectOnNew = true
-	config.DisableAutoReconnect = false
-
 	ntfnCallbacks := &rpcclient.NotificationHandlers{
 		OnBlockConnected:    notifier.onBlockConnected,
 		OnBlockDisconnected: notifier.onBlockDisconnected,
@@ -185,7 +180,7 @@ func (b *BtcdNotifier) Stop() error {
 
 	// Shutdown the rpc client, this gracefully disconnects from btcd, and
 	// cleans up all related resources.
-	b.chainConn.Shutdown()
+	b.chainConn.Stop()
 
 	close(b.quit)
 	b.wg.Wait()
@@ -209,7 +204,11 @@ func (b *BtcdNotifier) Stop() error {
 	return nil
 }
 
+// startNotifier is the main starting point for the BtcdNotifier. It connects
+// to btcd and start the main dispatcher goroutine.
 func (b *BtcdNotifier) startNotifier() error {
+	chainntnfs.Log.Infof("btcd notifier starting...")
+
 	// Start our concurrent queues before starting the chain connection, to
 	// ensure onBlockConnected and onRedeemingTx callbacks won't be
 	// blocked.
@@ -219,6 +218,17 @@ func (b *BtcdNotifier) startNotifier() error {
 	// Connect to btcd, and register for notifications on connected, and
 	// disconnected blocks.
 	if err := b.chainConn.Connect(20); err != nil {
+		b.txUpdates.Stop()
+		b.chainUpdates.Stop()
+		return err
+	}
+
+	// Before we fetch the best block/block height we need to register the
+	// notifications for connected blocks, otherwise we might think we are
+	// at an earlier block height because during block notification
+	// registration we might have already mined some new blocks. Hence we
+	// will not get notified accordingly.
+	if err := b.chainConn.NotifyBlocks(); err != nil {
 		b.txUpdates.Stop()
 		b.chainUpdates.Stop()
 		return err
@@ -249,18 +259,14 @@ func (b *BtcdNotifier) startNotifier() error {
 		BlockHeader: &bestBlock.Header,
 	}
 
-	if err := b.chainConn.NotifyBlocks(); err != nil {
-		b.txUpdates.Stop()
-		b.chainUpdates.Stop()
-		return err
-	}
-
 	b.wg.Add(1)
 	go b.notificationDispatcher()
 
 	// Set the active flag now that we've completed the full
 	// startup.
 	atomic.StoreInt32(&b.active, 1)
+
+	chainntnfs.Log.Debugf("btcd notifier started")
 
 	return nil
 }
@@ -371,7 +377,7 @@ out:
 				// TODO(wilmer): add retry logic if rescan fails?
 				b.wg.Add(1)
 
-				//nolint:lll
+				//nolint:ll
 				go func(msg *chainntnfs.HistoricalConfDispatch) {
 					defer b.wg.Done()
 
@@ -544,7 +550,7 @@ out:
 func (b *BtcdNotifier) handleRelevantTx(tx *btcutil.Tx,
 	mempool bool, height uint32) {
 
-	// If this is a mempool spend, we'll ask the mempool notifier to hanlde
+	// If this is a mempool spend, we'll ask the mempool notifier to handle
 	// it.
 	if mempool {
 		err := b.memNotifier.ProcessRelevantSpendTx(tx)
@@ -730,11 +736,16 @@ func (b *BtcdNotifier) handleBlockConnected(epoch chainntnfs.BlockEpoch) error {
 	// satisfy any client requests based upon the new block.
 	b.bestBlock = epoch
 
+	err = b.txNotifier.NotifyHeight(uint32(epoch.Height))
+	if err != nil {
+		return fmt.Errorf("unable to notify height: %w", err)
+	}
+
 	b.notifyBlockEpochs(
 		epoch.Height, epoch.Hash, epoch.BlockHeader,
 	)
 
-	return b.txNotifier.NotifyHeight(uint32(epoch.Height))
+	return nil
 }
 
 // notifyBlockEpochs notifies all registered block epoch clients of the newly
@@ -922,15 +933,25 @@ func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 				"block %v: %v", blockHash, err)
 		}
 
-		if uint32(blockHeader.Height) > ntfn.HistoricalDispatch.StartHeight {
+		spentHeight := uint32(blockHeader.Height)
+		chainntnfs.Log.Debugf("Outpoint(%v) has spent at height %v",
+			outpoint, spentHeight)
+
+		// Since the tx has already been spent at spentHeight, the
+		// heightHint specified by the caller is no longer relevant. We
+		// now update the starting height to be the spent height to make
+		// sure we won't miss it in the rescan.
+		if spentHeight != ntfn.HistoricalDispatch.StartHeight {
 			startHash, err = b.chainConn.GetBlockHash(
-				int64(blockHeader.Height),
+				int64(spentHeight),
 			)
 			if err != nil {
 				return nil, fmt.Errorf("unable to get block "+
 					"hash for height %d: %v",
 					blockHeader.Height, err)
 			}
+
+			ntfn.HistoricalDispatch.StartHeight = spentHeight
 		}
 	}
 

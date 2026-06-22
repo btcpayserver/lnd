@@ -133,7 +133,8 @@ func channelPointStr(chanPoint *lnrpc.ChannelPoint) string {
 // CommitTypeHasTaproot returns whether commitType is a taproot commitment.
 func CommitTypeHasTaproot(commitType lnrpc.CommitmentType) bool {
 	switch commitType {
-	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT,
+		lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
 		return true
 	default:
 		return false
@@ -145,6 +146,7 @@ func CommitTypeHasAnchors(commitType lnrpc.CommitmentType) bool {
 	switch commitType {
 	case lnrpc.CommitmentType_ANCHORS,
 		lnrpc.CommitmentType_SIMPLE_TAPROOT,
+		lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL,
 		lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE:
 		return true
 	default:
@@ -167,7 +169,8 @@ func NodeArgsForCommitType(commitType lnrpc.CommitmentType) []string {
 			"--protocol.anchors",
 			"--protocol.script-enforced-lease",
 		}
-	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT,
+		lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
 		return []string{
 			"--protocol.anchors",
 			"--protocol.simple-taproot-chans",
@@ -181,7 +184,7 @@ func NodeArgsForCommitType(commitType lnrpc.CommitmentType) []string {
 // function provides a simple way to allow test balance assertions to take fee
 // calculations into account.
 func CalcStaticFee(c lnrpc.CommitmentType, numHTLCs int) btcutil.Amount {
-	//nolint:lll
+	//nolint:ll
 	const (
 		htlcWeight         = input.HTLCWeight
 		anchorSize         = 330 * 2
@@ -238,7 +241,7 @@ func CalculateMaxHtlc(chanCap btcutil.Amount) uint64 {
 // CalcStaticFeeBuffer calculates appropriate fee buffer which must be taken
 // into account when sending htlcs.
 func CalcStaticFeeBuffer(c lnrpc.CommitmentType, numHTLCs int) btcutil.Amount {
-	//nolint:lll
+	//nolint:ll
 	const (
 		htlcWeight         = input.HTLCWeight
 		defaultSatPerVByte = lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte
@@ -281,4 +284,21 @@ func CalcStaticFeeBuffer(c lnrpc.CommitmentType, numHTLCs int) btcutil.Amount {
 	)
 
 	return feeBuffer.ToSatoshis()
+}
+
+// CustomRecordsWithUnaccountable copies the map of custom records and adds an
+// accountable signal (replacing in the case of conflict) for assertion in
+// tests.
+func CustomRecordsWithUnaccountable(
+	originalRecords lnwire.CustomRecords) map[uint64][]byte {
+	return originalRecords.MergedCopy(map[uint64][]byte{
+		uint64(lnwire.ExperimentalAccountableType): {
+			lnwire.ExperimentalUnaccountable,
+		}},
+	)
+}
+
+// LnrpcOutpointToStr returns a string representation of an lnrpc.OutPoint.
+func LnrpcOutpointToStr(outpoint *lnrpc.OutPoint) string {
+	return fmt.Sprintf("%s:%d", outpoint.TxidStr, outpoint.OutputIndex)
 }

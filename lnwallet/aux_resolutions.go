@@ -4,7 +4,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -76,6 +76,10 @@ type ResolutionReq struct {
 
 	// CommitTx is the force close commitment transaction.
 	CommitTx *wire.MsgTx
+
+	// CommitTxBlockHeight is the block height where the commitment
+	// transaction confirmed. It is 0 if unknown or not confirmed yet.
+	CommitTxBlockHeight uint32
 
 	// CommitFee is the fee that was paid for the commitment transaction.
 	CommitFee btcutil.Amount

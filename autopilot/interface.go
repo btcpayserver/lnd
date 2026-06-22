@@ -1,12 +1,16 @@
 package autopilot
 
 import (
+	"context"
 	"net"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 )
 
 // DefaultConfTarget is the default confirmation target for autopilot channels.
@@ -28,12 +32,6 @@ type Node interface {
 	// Addrs returns a slice of publicly reachable public TCP addresses
 	// that the peer is known to be listening on.
 	Addrs() []net.Addr
-
-	// ForEachChannel is a higher-order function that will be used to
-	// iterate through all edges emanating from/to the target node. For
-	// each active channel, this function should be called with the
-	// populated ChannelEdge that describes the active channel.
-	ForEachChannel(func(ChannelEdge) error) error
 }
 
 // LocalChannel is a simple struct which contains relevant details of a
@@ -68,7 +66,7 @@ type ChannelEdge struct {
 
 	// Peer is the peer that this channel creates an edge to in the channel
 	// graph.
-	Peer Node
+	Peer route.Vertex
 }
 
 // ChannelGraph in an interface that represents a traversable channel graph.
@@ -81,7 +79,16 @@ type ChannelGraph interface {
 	// ForEachNode is a higher-order function that should be called once
 	// for each connected node within the channel graph. If the passed
 	// callback returns an error, then execution should be terminated.
-	ForEachNode(func(Node) error) error
+	ForEachNode(context.Context, func(context.Context, Node) error,
+		func()) error
+
+	// ForEachNodesChannels iterates through all connected nodes, and for
+	// each node, all the channels that connect to it. The passed callback
+	// will be called with the context, the Node itself, and a slice of
+	// ChannelEdge that connect to the node.
+	ForEachNodesChannels(ctx context.Context,
+		cb func(context.Context, Node, []*ChannelEdge) error,
+		reset func()) error
 }
 
 // NodeScore is a tuple mapping a NodeID to a score indicating the preference
@@ -140,7 +147,7 @@ type AttachmentHeuristic interface {
 	//
 	// NOTE: A NodeID not found in the returned map is implicitly given a
 	// score of 0.
-	NodeScores(g ChannelGraph, chans []LocalChannel,
+	NodeScores(ctx context.Context, g ChannelGraph, chans []LocalChannel,
 		chanSize btcutil.Amount, nodes map[NodeID]struct{}) (
 		map[NodeID]*NodeScore, error)
 }
@@ -153,7 +160,7 @@ type NodeMetric interface {
 	Name() string
 
 	// Refresh refreshes the metric values based on the current graph.
-	Refresh(graph ChannelGraph) error
+	Refresh(ctx context.Context, graph ChannelGraph) error
 
 	// GetMetric returns the latest value of this metric. Values in the
 	// map are per node and can be in arbitrary domain. If normalize is
@@ -215,4 +222,24 @@ type ChannelController interface {
 	//
 	// TODO(roasbeef): add force option?
 	CloseChannel(chanPoint *wire.OutPoint) error
+}
+
+// GraphSource represents read access to the channel graph.
+type GraphSource interface {
+	// ForEachNode iterates through all the stored vertices/nodes in the
+	// graph, executing the passed callback with each node encountered. If
+	// the callback returns an error, then the transaction is aborted and
+	// the iteration stops early.
+	ForEachNode(context.Context, func(*models.Node) error,
+		func()) error
+
+	// ForEachNodeCached is similar to ForEachNode, but it utilizes the
+	// channel graph cache if one is available. It is less consistent than
+	// ForEachNode since any further calls are made across multiple
+	// transactions.
+	ForEachNodeCached(ctx context.Context, withAddrs bool,
+		cb func(ctx context.Context, node route.Vertex,
+			addrs []net.Addr,
+			chans map[uint64]*graphdb.DirectedChannel) error,
+		reset func()) error
 }

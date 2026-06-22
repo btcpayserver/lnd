@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -14,6 +14,9 @@ var (
 	// ErrMaxPosition is returned when trying to increase the position of
 	// the fee function while it's already at its max.
 	ErrMaxPosition = errors.New("position already at max")
+
+	// ErrZeroFeeRateDelta is returned when the fee rate delta is zero.
+	ErrZeroFeeRateDelta = errors.New("fee rate delta is zero")
 )
 
 // mSatPerKWeight represents a fee rate in msat/kw.
@@ -169,7 +172,7 @@ func NewLinearFeeFunction(maxFeeRate chainfee.SatPerKWeight,
 			"endingFeeRate=%v, width=%v, delta=%v", start, end,
 			l.width, l.deltaFeeRate)
 
-		return nil, fmt.Errorf("fee rate delta is zero")
+		return nil, ErrZeroFeeRateDelta
 	}
 
 	// Attach the calculated values to the fee function.

@@ -1,6 +1,9 @@
 package fn
 
-import "golang.org/x/exp/maps"
+import (
+	"maps"
+	"slices"
+)
 
 // Set is a generic set using type params that supports the following
 // operations: diff, union, intersection, and subset.
@@ -29,6 +32,16 @@ func (s Set[T]) Remove(e T) {
 func (s Set[T]) Contains(e T) bool {
 	_, ok := s[e]
 	return ok
+}
+
+// IsEmpty returns true if the set is empty.
+func (s Set[T]) IsEmpty() bool {
+	return len(s) == 0
+}
+
+// Size returns the number of elements in the set.
+func (s Set[T]) Size() uint {
+	return uint(len(s))
 }
 
 // Diff returns the difference between two sets.
@@ -82,7 +95,16 @@ func (s Set[T]) Equal(other Set[T]) bool {
 
 // ToSlice returns the set as a slice.
 func (s Set[T]) ToSlice() []T {
-	return maps.Keys(s)
+	return slices.Collect(maps.Keys(s))
+}
+
+// Copy copies s and returns the result.
+func (s Set[T]) Copy() Set[T] {
+	copy := make(Set[T])
+	for e := range s {
+		copy.Add(e)
+	}
+	return copy
 }
 
 // SetDiff returns all the items that are in the first set but not in the

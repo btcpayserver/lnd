@@ -5,7 +5,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -218,7 +218,7 @@ func (b *BudgetAggregator) filterInputs(inputs InputsMap) InputsMap {
 			continue
 		}
 
-		//nolint:lll
+		//nolint:ll
 		// Calculate the size if the input is included in the tx.
 		//
 		// NOTE: When including this input, we need to account the

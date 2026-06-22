@@ -25,8 +25,9 @@ import (
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
@@ -497,7 +498,7 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 	// Check that alice invoice was settled and bandwidth of HTLC
 	// links was changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State != invpkg.ContractSettled {
@@ -617,7 +618,7 @@ func testChannelLinkMultiHopPayment(t *testing.T,
 	// Check that Carol invoice was settled and bandwidth of HTLC
 	// links were changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State != invpkg.ContractSettled {
@@ -810,7 +811,7 @@ func testChannelLinkInboundFee(t *testing.T, //nolint:thelper
 	// Check that Carol invoice was settled and bandwidth of HTLC
 	// links were changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	require.Equal(t, invpkg.ContractSettled, invoice.State,
@@ -864,7 +865,7 @@ func TestChannelLinkCancelFullCommitment(t *testing.T) {
 	)
 
 	// Fill up the commitment from Alice's side with 20 sat payments.
-	count := (input.MaxHTLCNumber / 2)
+	count := int(maxInflightHtlcs)
 	amt := lnwire.NewMSatFromSatoshis(20000)
 
 	htlcAmt, totalTimelock, hopsForwards := generateHops(amt,
@@ -902,17 +903,17 @@ func TestChannelLinkCancelFullCommitment(t *testing.T) {
 
 	// Now make an additional payment from Alice to Bob, this should be
 	// canceled because the commitment in this direction is full.
-	err = <-makePayment(
+	resp := makePayment(
 		n.aliceServer, n.bobServer, firstHop, hopsForwards, amt,
 		htlcAmt, totalTimelock,
-	).err
-	if err == nil {
-		t.Fatalf("overflow payment should have failed")
-	}
-	lerr, ok := err.(*LinkError)
-	if !ok {
-		t.Fatalf("expected LinkError, got: %T", err)
-	}
+	)
+
+	paymentErr, timeoutErr := fn.RecvOrTimeout(resp.err, 30*time.Second)
+	require.NoError(t, timeoutErr, "timeout receiving payment resp")
+	require.Error(t, paymentErr, "overflow payment should have failed")
+
+	var lerr *LinkError
+	require.ErrorAs(t, paymentErr, &lerr)
 
 	msg := lerr.WireMessage()
 	if _, ok := msg.(*lnwire.FailTemporaryChannelFailure); !ok {
@@ -928,7 +929,7 @@ func TestChannelLinkCancelFullCommitment(t *testing.T) {
 		// to settle.
 		err = wait.NoError(func() error {
 			return n.bobServer.registry.SettleHodlInvoice(
-				context.Background(), preimage,
+				t.Context(), preimage,
 			)
 		}, time.Minute)
 		if err != nil {
@@ -938,10 +939,9 @@ func TestChannelLinkCancelFullCommitment(t *testing.T) {
 
 	// Ensure that all of the payments sent by alice eventually succeed.
 	for errChan := range aliceErrChan {
-		err := <-errChan
-		if err != nil {
-			t.Fatalf("alice payment failed: %v", err)
-		}
+		receivedErr, err := fn.RecvOrTimeout(errChan, 30*time.Second)
+		require.NoError(t, err, "payment timeout")
+		require.NoError(t, receivedErr, "alice payment failed")
 	}
 }
 
@@ -1397,7 +1397,7 @@ func TestUpdateForwardingPolicy(t *testing.T) {
 	// Carol's invoice should now be shown as settled as the payment
 	// succeeded.
 	invoice, err := n.carolServer.registry.LookupInvoice(
-		context.Background(), payResp,
+		t.Context(), payResp,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State != invpkg.ContractSettled {
@@ -1553,7 +1553,7 @@ func TestChannelLinkMultiHopInsufficientPayment(t *testing.T) {
 	// Check that alice invoice wasn't settled and bandwidth of htlc
 	// links hasn't been changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State == invpkg.ContractSettled {
@@ -1733,7 +1733,7 @@ func TestChannelLinkMultiHopUnknownNextHop(t *testing.T) {
 	// Check that alice invoice wasn't settled and bandwidth of htlc
 	// links hasn't been changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State == invpkg.ContractSettled {
@@ -1843,7 +1843,7 @@ func TestChannelLinkMultiHopDecodeError(t *testing.T) {
 	// Check that alice invoice wasn't settled and bandwidth of htlc
 	// links hasn't been changed.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State == invpkg.ContractSettled {
@@ -2169,7 +2169,7 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt,
 			BaseFee:       lnwire.NewMSatFromSatoshis(1),
 			TimeLockDelta: 6,
 		}
-		invoiceRegistry = newMockRegistry(globalPolicy.TimeLockDelta)
+		invoiceRegistry = newMockRegistry(t)
 	)
 
 	pCache := newMockPreimageCache()
@@ -2234,17 +2234,19 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt,
 		PendingCommitTicker:  ticker.New(time.Minute),
 		// Make the BatchSize and Min/MaxUpdateTimeout large enough
 		// to not trigger commit updates automatically during tests.
-		BatchSize:               10000,
-		MinUpdateTimeout:        30 * time.Minute,
-		MaxUpdateTimeout:        40 * time.Minute,
-		MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
-		MaxFeeAllocation:        DefaultMaxLinkFeeAllocation,
-		NotifyActiveLink:        func(wire.OutPoint) {},
-		NotifyActiveChannel:     func(wire.OutPoint) {},
-		NotifyInactiveChannel:   func(wire.OutPoint) {},
-		NotifyInactiveLinkEvent: func(wire.OutPoint) {},
-		HtlcNotifier:            aliceSwitch.cfg.HtlcNotifier,
-		GetAliases:              getAliases,
+		BatchSize:                  10000,
+		MinUpdateTimeout:           30 * time.Minute,
+		MaxUpdateTimeout:           40 * time.Minute,
+		MaxOutgoingCltvExpiry:      DefaultMaxOutgoingCltvExpiry,
+		MaxFeeAllocation:           DefaultMaxLinkFeeAllocation,
+		NotifyActiveLink:           func(wire.OutPoint) {},
+		NotifyActiveChannel:        func(wire.OutPoint) {},
+		NotifyChannelUpdate:        func(*channeldb.OpenChannel) {},
+		NotifyInactiveChannel:      func(wire.OutPoint) {},
+		NotifyInactiveLinkEvent:    func(wire.OutPoint) {},
+		HtlcNotifier:               aliceSwitch.cfg.HtlcNotifier,
+		GetAliases:                 getAliases,
+		ShouldFwdExpAccountability: func() bool { return true },
 	}
 
 	aliceLink := NewChannelLink(aliceCfg, aliceLc.channel)
@@ -2256,7 +2258,7 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt,
 			for {
 				select {
 				case <-notifyUpdateChan:
-				case <-chanLink.Quit:
+				case <-chanLink.cg.Done():
 					close(doneChan)
 					return
 				}
@@ -2266,7 +2268,6 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt,
 
 	t.Cleanup(func() {
 		close(alicePeer.quit)
-		invoiceRegistry.cleanup()
 	})
 
 	harness := singleLinkTestHarness{
@@ -2326,7 +2327,7 @@ func handleStateUpdate(link *channelLink,
 	}
 	link.HandleChannelUpdate(remoteRev)
 
-	ctx, done := link.WithCtxQuitNoTimeout()
+	ctx, done := link.cg.Create(context.Background())
 	defer done()
 
 	remoteSigs, err := remoteChannel.SignNextCommitment(ctx)
@@ -2372,7 +2373,7 @@ func updateState(batchTick chan time.Time, link *channelLink,
 		// Trigger update by ticking the batchTicker.
 		select {
 		case batchTick <- time.Now():
-		case <-link.Quit:
+		case <-link.cg.Done():
 			return fmt.Errorf("link shutting down")
 		}
 		return handleStateUpdate(link, remoteChannel)
@@ -2380,7 +2381,7 @@ func updateState(batchTick chan time.Time, link *channelLink,
 
 	// The remote is triggering the state update, emulate this by
 	// signing and sending CommitSig to the link.
-	ctx, done := link.WithCtxQuitNoTimeout()
+	ctx, done := link.cg.Create(context.Background())
 	defer done()
 
 	remoteSigs, err := remoteChannel.SignNextCommitment(ctx)
@@ -2716,7 +2717,7 @@ func TestChannelLinkBandwidthConsistency(t *testing.T) {
 	)
 	require.NoError(t, err, "unable to create payment")
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	// We must add the invoice to the registry, such that Alice expects
 	// this payment.
 	err = coreLink.cfg.Registry.(*mockInvoiceRegistry).AddInvoice(
@@ -4067,7 +4068,7 @@ func TestChannelRetransmission(t *testing.T) {
 			// Check that alice invoice wasn't settled and
 			// bandwidth of htlc links hasn't been changed.
 			invoice, err = receiver.registry.LookupInvoice(
-				context.Background(), rhash,
+				t.Context(), rhash,
 			)
 			if err != nil {
 				err = fmt.Errorf(
@@ -4552,7 +4553,7 @@ func TestChannelLinkAcceptDuplicatePayment(t *testing.T) {
 	}
 
 	err = n.carolServer.registry.AddInvoice(
-		context.Background(), *invoice, htlc.PaymentHash,
+		t.Context(), *invoice, htlc.PaymentHash,
 	)
 	require.NoError(t, err, "unable to add invoice in carol registry")
 
@@ -4642,7 +4643,7 @@ func TestChannelLinkAcceptOverpay(t *testing.T) {
 	// Even though we sent 2x what was asked for, Carol should still have
 	// accepted the payment and marked it as settled.
 	invoice, err := receiver.registry.LookupInvoice(
-		context.Background(), rhash,
+		t.Context(), rhash,
 	)
 	require.NoError(t, err, "unable to get invoice")
 	if invoice.State != invpkg.ContractSettled {
@@ -4888,6 +4889,8 @@ func (h *persistentLinkHarness) restartLink(
 	// Instantiate with a long interval, so that we can precisely control
 	// the firing via force feeding.
 	bticker := ticker.NewForce(time.Hour)
+
+	//nolint:ll
 	aliceCfg := ChannelLinkConfig{
 		FwrdingPolicy:      globalPolicy,
 		Peer:               alicePeer,
@@ -4922,16 +4925,18 @@ func (h *persistentLinkHarness) restartLink(
 		MinUpdateTimeout: 30 * time.Minute,
 		MaxUpdateTimeout: 40 * time.Minute,
 		// Set any hodl flags requested for the new link.
-		HodlMask:                hodl.MaskFromFlags(hodlFlags...),
-		MaxOutgoingCltvExpiry:   DefaultMaxOutgoingCltvExpiry,
-		MaxFeeAllocation:        DefaultMaxLinkFeeAllocation,
-		NotifyActiveLink:        func(wire.OutPoint) {},
-		NotifyActiveChannel:     func(wire.OutPoint) {},
-		NotifyInactiveChannel:   func(wire.OutPoint) {},
-		NotifyInactiveLinkEvent: func(wire.OutPoint) {},
-		HtlcNotifier:            h.hSwitch.cfg.HtlcNotifier,
-		SyncStates:              syncStates,
-		GetAliases:              getAliases,
+		HodlMask:                   hodl.MaskFromFlags(hodlFlags...),
+		MaxOutgoingCltvExpiry:      DefaultMaxOutgoingCltvExpiry,
+		MaxFeeAllocation:           DefaultMaxLinkFeeAllocation,
+		NotifyActiveLink:           func(wire.OutPoint) {},
+		NotifyActiveChannel:        func(wire.OutPoint) {},
+		NotifyInactiveChannel:      func(wire.OutPoint) {},
+		NotifyInactiveLinkEvent:    func(wire.OutPoint) {},
+		NotifyChannelUpdate:        func(*channeldb.OpenChannel) {},
+		HtlcNotifier:               h.hSwitch.cfg.HtlcNotifier,
+		SyncStates:                 syncStates,
+		GetAliases:                 getAliases,
+		ShouldFwdExpAccountability: func() bool { return true },
 	}
 
 	aliceLink := NewChannelLink(aliceCfg, aliceChannel)
@@ -4943,7 +4948,7 @@ func (h *persistentLinkHarness) restartLink(
 			for {
 				select {
 				case <-notifyUpdateChan:
-				case <-chanLink.Quit:
+				case <-chanLink.cg.Done():
 					close(doneChan)
 					return
 				}
@@ -4970,7 +4975,7 @@ func generateHtlc(t *testing.T, coreLink *channelLink,
 	// We must add the invoice to the registry, such that Alice
 	// expects this payment.
 	err := coreLink.cfg.Registry.(*mockInvoiceRegistry).AddInvoice(
-		context.Background(), *invoice, htlc.PaymentHash,
+		t.Context(), *invoice, htlc.PaymentHash,
 	)
 	require.NoError(t, err, "unable to add invoice to registry")
 
@@ -5929,7 +5934,9 @@ func TestChannelLinkFail(t *testing.T) {
 
 				// Sign a commitment that will include
 				// signature for the HTLC just sent.
-				quitCtx, done := c.WithCtxQuitNoTimeout()
+				quitCtx, done := c.cg.Create(
+					t.Context(),
+				)
 				defer done()
 
 				sigs, err := remoteChannel.SignNextCommitment(
@@ -5976,7 +5983,9 @@ func TestChannelLinkFail(t *testing.T) {
 
 				// Sign a commitment that will include
 				// signature for the HTLC just sent.
-				quitCtx, done := c.WithCtxQuitNoTimeout()
+				quitCtx, done := c.cg.Create(
+					t.Context(),
+				)
 				defer done()
 
 				sigs, err := remoteChannel.SignNextCommitment(
@@ -6200,13 +6209,13 @@ func TestForwardingAsymmetricTimeLockPolicies(t *testing.T) {
 // forwarding policy.
 func TestCheckHtlcForward(t *testing.T) {
 	fetchLastChannelUpdate := func(lnwire.ShortChannelID) (
-		*lnwire.ChannelUpdate, error) {
+		*lnwire.ChannelUpdate1, error) {
 
-		return &lnwire.ChannelUpdate{}, nil
+		return &lnwire.ChannelUpdate1{}, nil
 	}
 
 	failAliasUpdate := func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate {
+		incoming bool) *lnwire.ChannelUpdate1 {
 
 		return nil
 	}
@@ -6381,7 +6390,7 @@ func TestChannelLinkCanceledInvoice(t *testing.T) {
 
 	// Cancel the invoice at bob's end.
 	hash := invoice.Terms.PaymentPreimage.Hash()
-	err = n.bobServer.registry.CancelInvoice(context.Background(), hash)
+	err = n.bobServer.registry.CancelInvoice(t.Context(), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6499,7 +6508,7 @@ func TestChannelLinkHoldInvoiceSettle(t *testing.T) {
 	}
 
 	err = ctx.n.bobServer.registry.SettleHodlInvoice(
-		context.Background(), ctx.preimage,
+		t.Context(), ctx.preimage,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -6545,7 +6554,7 @@ func TestChannelLinkHoldInvoiceCancel(t *testing.T) {
 	}
 
 	err = ctx.n.bobServer.registry.CancelInvoice(
-		context.Background(), ctx.hash,
+		t.Context(), ctx.hash,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -6601,7 +6610,7 @@ func TestChannelLinkHoldInvoiceRestart(t *testing.T) {
 	// We must add the invoice to the registry, such that Alice
 	// expects this payment.
 	err = registry.AddInvoice(
-		context.Background(), *invoice, htlc.PaymentHash,
+		t.Context(), *invoice, htlc.PaymentHash,
 	)
 	require.NoError(t, err, "unable to add invoice to registry")
 
@@ -6637,7 +6646,7 @@ func TestChannelLinkHoldInvoiceRestart(t *testing.T) {
 	<-registry.settleChan
 
 	// Settle the invoice with the preimage.
-	err = registry.SettleHodlInvoice(context.Background(), *preimage)
+	err = registry.SettleHodlInvoice(t.Context(), *preimage)
 	require.NoError(t, err, "settle hodl invoice")
 
 	// Expect alice to send a settle and commitsig message to bob.
@@ -6696,7 +6705,7 @@ func TestChannelLinkRevocationWindowRegular(t *testing.T) {
 	htlc1, invoice1 := generateHtlcAndInvoice(t, 0)
 	htlc2, invoice2 := generateHtlcAndInvoice(t, 1)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	// We must add the invoice to the registry, such that Alice
 	// expects this payment.
 	err = registry.AddInvoice(ctxb, *invoice1, htlc1.PaymentHash)
@@ -6782,7 +6791,7 @@ func TestChannelLinkRevocationWindowHodl(t *testing.T) {
 	invoice2.Terms.PaymentPreimage = nil
 	invoice2.HodlInvoice = true
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	// We must add the invoices to the registry, such that Alice
 	// expects the payments.
 	err = registry.AddInvoice(ctxb, *invoice1, htlc1.PaymentHash)
@@ -7099,7 +7108,7 @@ func TestPipelineSettle(t *testing.T) {
 	// Add the invoice to Alice's registry so she expects it.
 	aliceReg := alice.coreLink.cfg.Registry.(*mockInvoiceRegistry)
 	err = aliceReg.AddInvoice(
-		context.Background(), *invoice1, htlc1.PaymentHash,
+		t.Context(), *invoice1, htlc1.PaymentHash,
 	)
 	require.NoError(t, err)
 
@@ -7539,4 +7548,93 @@ func TestLinkFlushHooksCalled(t *testing.T) {
 	// A -- rev -> B
 	ctx.receiveRevAndAckAliceToBob()
 	assertHookCalled(true)
+}
+
+// TestLinkQuiescenceExitHopProcessingDeferred ensures that we do not send back
+// htlc resolution messages in the case where the link is quiescent AND we are
+// the exit hop. This is needed because we handle exit hop processing in the
+// link instead of the switch and we process htlc resolutions when we receive
+// a RevokeAndAck. Because of this we need to ensure that we hold off on
+// processing the remote adds when we are quiescent. Later, when the channel
+// update traffic is allowed to resume, we will need to verify that the actions
+// we didn't run during the initial RevokeAndAck are run.
+func TestLinkQuiescenceExitHopProcessingDeferred(t *testing.T) {
+	t.Parallel()
+
+	// Initialize two channel state machines for testing.
+	alice, bob, err := createMirroredChannel(
+		t, btcutil.SatoshiPerBitcoin, btcutil.SatoshiPerBitcoin,
+	)
+	require.NoError(t, err)
+
+	// Build a single edge network to test channel quiescence.
+	network := newTwoHopNetwork(
+		t, alice.channel, bob.channel, testStartingHeight,
+	)
+	aliceLink := network.aliceChannelLink
+	bobLink := network.bobChannelLink
+
+	// Generate an invoice for Bob so that Alice can pay him.
+	htlcID := uint64(0)
+	htlc, invoice := generateHtlcAndInvoice(t, htlcID)
+	err = network.bobServer.registry.AddInvoice(
+		nil, *invoice, htlc.PaymentHash,
+	)
+	require.NoError(t, err)
+
+	// Establish a payment circuit for Alice
+	circuit := &PaymentCircuit{
+		Incoming: CircuitKey{
+			HtlcID: htlcID,
+		},
+		PaymentHash: htlc.PaymentHash,
+	}
+	circuitMap := network.aliceServer.htlcSwitch.circuits
+	_, err = circuitMap.CommitCircuits(circuit)
+	require.NoError(t, err)
+
+	// Add a switch packet to Alice's switch so that she can initialize the
+	// payment attempt.
+	err = aliceLink.handleSwitchPacket(&htlcPacket{
+		incomingHTLCID: htlcID,
+		htlc:           htlc,
+		circuit:        circuit,
+	})
+	require.NoError(t, err)
+
+	// give alice enough time to fire the update_add
+	// TODO(proofofkeags): make this not depend on a flakey sleep.
+	<-time.After(time.Millisecond)
+
+	// bob initiates stfu which he can do immediately since he doesn't have
+	// local updates
+	<-bobLink.InitStfu()
+
+	// wait for other possible messages to play out
+	<-time.After(1 * time.Second)
+
+	ensureNoUpdateAfterStfu := func(t *testing.T, trace []lnwire.Message) {
+		stfuReceived := false
+		for _, msg := range trace {
+			if msg.MsgType() == lnwire.MsgStfu {
+				stfuReceived = true
+				continue
+			}
+
+			if stfuReceived && msg.MsgType().IsChannelUpdate() {
+				t.Fatalf("channel update after stfu: %v",
+					msg.MsgType())
+			}
+		}
+	}
+
+	network.aliceServer.protocolTraceMtx.Lock()
+	ensureNoUpdateAfterStfu(t, network.aliceServer.protocolTrace)
+	network.aliceServer.protocolTraceMtx.Unlock()
+
+	network.bobServer.protocolTraceMtx.Lock()
+	ensureNoUpdateAfterStfu(t, network.bobServer.protocolTrace)
+	network.bobServer.protocolTraceMtx.Unlock()
+
+	// TODO(proofofkeags): make sure these actions are run on resume.
 }

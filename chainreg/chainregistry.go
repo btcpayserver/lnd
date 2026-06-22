@@ -23,8 +23,8 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs/btcdnotify"
 	"github.com/lightningnetwork/lnd/chainntnfs/neutrinonotify"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -222,7 +222,7 @@ type ChainControl struct {
 // the parts that can be purely constructed from the passed in global
 // configuration and doesn't need any wallet instance yet.
 //
-//nolint:lll
+//nolint:ll
 func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 	cc := &PartialChainControl{
 		Cfg: cfg,
@@ -385,8 +385,7 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 		)
 		cc.ChainSource = bitcoindConn.NewBitcoindClient()
 
-		// If we're not in regtest mode, then we'll attempt to use a
-		// proper fee estimator for testnet.
+		// Initialize config to connect to bitcoind RPC.
 		rpcConfig := &rpcclient.ConnConfig{
 			Host:                 bitcoindHost,
 			User:                 bitcoindMode.RPCUser,
@@ -396,7 +395,9 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			DisableTLS:           true,
 			HTTPPostMode:         true,
 		}
-		if !cfg.Bitcoin.RegTest {
+
+		// If feeurl is not provided, use bitcoind's fee estimator.
+		if cfg.Fee.URL == "" {
 			log.Infof("Initializing bitcoind backed fee estimator "+
 				"in %s mode", bitcoindMode.EstimateMode)
 
@@ -527,7 +528,7 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			// On local test networks we usually don't have multiple
 			// chain backend peers, so we can skip
 			// the checkOutboundPeers test.
-			if cfg.Bitcoin.SimNet || cfg.Bitcoin.RegTest {
+			if cfg.Bitcoin.IsLocalNetwork() {
 				return nil
 			}
 
@@ -650,7 +651,7 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			// On local test networks we usually don't have multiple
 			// chain backend peers, so we can skip
 			// the checkOutboundPeers test.
-			if cfg.Bitcoin.SimNet || cfg.Bitcoin.RegTest {
+			if cfg.Bitcoin.IsLocalNetwork() {
 				return nil
 			}
 
@@ -660,9 +661,8 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 			return checkOutboundPeers(chainRPC.Client)
 		}
 
-		// If we're not in simnet or regtest mode, then we'll attempt
-		// to use a proper fee estimator for testnet.
-		if !cfg.Bitcoin.SimNet && !cfg.Bitcoin.RegTest {
+		// If feeurl is not provided, use btcd's fee estimator.
+		if cfg.Fee.URL == "" {
 			log.Info("Initializing btcd backed fee estimator")
 
 			// Finally, we'll re-initialize the fee estimator, as
@@ -838,6 +838,15 @@ var (
 		0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00,
 	})
 
+	// BitcoinTestnet4Genesis is the genesis hash of Bitcoin's testnet4
+	// chain.
+	BitcoinTestnet4Genesis = chainhash.Hash([chainhash.HashSize]byte{
+		0x43, 0xf0, 0x8b, 0xda, 0xb0, 0x50, 0xe3, 0x5b,
+		0x56, 0x7c, 0x86, 0x4b, 0x91, 0xf4, 0x7f, 0x50,
+		0xae, 0x72, 0x5a, 0xe2, 0xde, 0x53, 0xbc, 0xfb,
+		0xba, 0xf2, 0x84, 0xda, 0x00, 0x00, 0x00, 0x00,
+	})
+
 	// BitcoinSignetGenesis is the genesis hash of Bitcoin's signet chain.
 	BitcoinSignetGenesis = chainhash.Hash([chainhash.HashSize]byte{
 		0xf6, 0x1e, 0xee, 0x3b, 0x63, 0xa3, 0x80, 0xa4,
@@ -869,8 +878,8 @@ var (
 	ChainDNSSeeds = map[chainhash.Hash][][2]string{
 		BitcoinMainnetGenesis: {
 			{
-				"nodes.lightning.directory",
-				"soa.nodes.lightning.directory",
+				"nodes.lightning.wiki",
+				"soa.nodes.lightning.wiki",
 			},
 			{
 				"lseed.bitcoinstats.com",
@@ -879,14 +888,22 @@ var (
 
 		BitcoinTestnetGenesis: {
 			{
-				"test.nodes.lightning.directory",
-				"soa.nodes.lightning.directory",
+				"test.nodes.lightning.wiki",
+				"soa.nodes.lightning.wiki",
+			},
+		},
+
+		BitcoinTestnet4Genesis: {
+			{
+				"test4.nodes.lightning.wiki",
+				"soa.nodes.lightning.wiki",
 			},
 		},
 
 		BitcoinSignetGenesis: {
 			{
-				"ln.signet.secp.tech",
+				"signet.nodes.lightning.wiki",
+				"soa.nodes.lightning.wiki",
 			},
 		},
 	}

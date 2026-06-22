@@ -2,6 +2,7 @@ package lnwire
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -13,7 +14,7 @@ import (
 // either include both outputs, or only one of the outputs from either side.
 type ClosingSigs struct {
 	// CloserNoClosee is a signature that excludes the output of the
-	// clsoee.
+	// closee.
 	CloserNoClosee tlv.OptionalRecordT[tlv.TlvType1, Sig]
 
 	// NoCloserClosee is a signature that excludes the output of the
@@ -24,22 +25,56 @@ type ClosingSigs struct {
 	CloserAndClosee tlv.OptionalRecordT[tlv.TlvType3, Sig]
 }
 
+// TaprootClosingSigs houses the 3 possible taproot signatures (with nonces)
+// that can be sent when attempting to complete a cooperative channel closure.
+// These use PartialSigWithNonce to implement the JIT nonce pattern.
+type TaprootClosingSigs struct {
+	// CloserNoClosee is a partial signature with nonce that excludes the
+	// output of the closee. Uses TLV type 5.
+	CloserNoClosee tlv.OptionalRecordT[tlv.TlvType5, PartialSigWithNonce]
+
+	// NoCloserClosee is a partial signature with nonce that excludes the
+	// output of the closer. Uses TLV type 6.
+	NoCloserClosee tlv.OptionalRecordT[tlv.TlvType6, PartialSigWithNonce]
+
+	// CloserAndClosee is a partial signature with nonce that includes
+	// both outputs. Uses TLV type 7.
+	CloserAndClosee tlv.OptionalRecordT[tlv.TlvType7, PartialSigWithNonce]
+}
+
 // ClosingComplete is sent by either side to kick off the process of obtaining
 // a valid signature on a c o-operative channel closure of their choice.
 type ClosingComplete struct {
 	// ChannelID serves to identify which channel is to be closed.
 	ChannelID ChannelID
 
+	// CloserScript is the script to which the channel funds will be paid
+	// for the closer (the person sending the ClosingComplete) message.
+	CloserScript DeliveryAddress
+
+	// CloseeScript is the script to which the channel funds will be paid
+	// (the person receiving the ClosingComplete message).
+	CloseeScript DeliveryAddress
+
 	// FeeSatoshis is the total fee in satoshis that the party to the
 	// channel would like to propose for the close transaction.
 	FeeSatoshis btcutil.Amount
 
-	// Sequence is the sequence number to be used in the input spending the
+	// LockTime is the locktime number to be used in the input spending the
 	// funding transaction.
-	Sequence uint32
+	LockTime uint32
 
 	// ClosingSigs houses the 3 possible signatures that can be sent.
+	// For non-taproot channels, these are regular signatures.
 	ClosingSigs
+
+	// TaprootClosingSigs houses the 3 possible taproot signatures that
+	// can be sent. Each signature includes the nonce for the next RBF
+	// round (implementing the JIT nonce pattern).
+	//
+	// NOTE: This field is only populated for taproot channels. When
+	// present, the above ClosingSigs MUST be empty.
+	TaprootClosingSigs
 
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
@@ -49,18 +84,25 @@ type ClosingComplete struct {
 
 // decodeClosingSigs decodes the closing sig TLV records in the passed
 // ExtraOpaqueData.
-func decodeClosingSigs(c *ClosingSigs, tlvRecords ExtraOpaqueData) error {
+func decodeClosingSigs(c *ClosingSigs,
+	tc *TaprootClosingSigs,
+	tlvRecords ExtraOpaqueData) error {
+	// Regular signatures
 	sig1 := c.CloserNoClosee.Zero()
 	sig2 := c.NoCloserClosee.Zero()
 	sig3 := c.CloserAndClosee.Zero()
 
-	typeMap, err := tlvRecords.ExtractRecords(&sig1, &sig2, &sig3)
+	// Taproot signatures (with nonces)
+	tSig1 := tc.CloserNoClosee.Zero()
+	tSig2 := tc.NoCloserClosee.Zero()
+	tSig3 := tc.CloserAndClosee.Zero()
+
+	typeMap, err := tlvRecords.ExtractRecords(
+		&sig1, &sig2, &sig3, &tSig1, &tSig2, &tSig3,
+	)
 	if err != nil {
 		return err
 	}
-
-	// TODO(roasbeef): helper func to made decode of the optional vals
-	// easier?
 
 	if val, ok := typeMap[c.CloserNoClosee.TlvType()]; ok && val == nil {
 		c.CloserNoClosee = tlv.SomeRecordT(sig1)
@@ -72,6 +114,27 @@ func decodeClosingSigs(c *ClosingSigs, tlvRecords ExtraOpaqueData) error {
 		c.CloserAndClosee = tlv.SomeRecordT(sig3)
 	}
 
+	if val, ok := typeMap[tc.CloserNoClosee.TlvType()]; ok && val == nil {
+		tc.CloserNoClosee = tlv.SomeRecordT(tSig1)
+	}
+	if val, ok := typeMap[tc.NoCloserClosee.TlvType()]; ok && val == nil {
+		tc.NoCloserClosee = tlv.SomeRecordT(tSig2)
+	}
+	if val, ok := typeMap[tc.CloserAndClosee.TlvType()]; ok && val == nil {
+		tc.CloserAndClosee = tlv.SomeRecordT(tSig3)
+	}
+
+	// Reject messages that contain both regular and taproot signatures.
+	hasRegular := c.CloserNoClosee.IsSome() ||
+		c.NoCloserClosee.IsSome() || c.CloserAndClosee.IsSome()
+	hasTaproot := tc.CloserNoClosee.IsSome() ||
+		tc.NoCloserClosee.IsSome() || tc.CloserAndClosee.IsSome()
+
+	if hasRegular && hasTaproot {
+		return fmt.Errorf("closing_complete contains both " +
+			"regular and taproot signatures")
+	}
+
 	return nil
 }
 
@@ -79,7 +142,10 @@ func decodeClosingSigs(c *ClosingSigs, tlvRecords ExtraOpaqueData) error {
 // passed io.Reader.
 func (c *ClosingComplete) Decode(r io.Reader, _ uint32) error {
 	// First, read out all the fields that are hard coded into the message.
-	err := ReadElements(r, &c.ChannelID, &c.FeeSatoshis, &c.Sequence)
+	err := ReadElements(
+		r, &c.ChannelID, &c.CloserScript, &c.CloseeScript,
+		&c.FeeSatoshis, &c.LockTime,
+	)
 	if err != nil {
 		return err
 	}
@@ -91,7 +157,11 @@ func (c *ClosingComplete) Decode(r io.Reader, _ uint32) error {
 		return err
 	}
 
-	if err := decodeClosingSigs(&c.ClosingSigs, tlvRecords); err != nil {
+	err = decodeClosingSigs(
+		&c.ClosingSigs, &c.TaprootClosingSigs,
+		tlvRecords,
+	)
+	if err != nil {
 		return err
 	}
 
@@ -103,9 +173,14 @@ func (c *ClosingComplete) Decode(r io.Reader, _ uint32) error {
 }
 
 // closingSigRecords returns the set of records that encode the closing sigs,
-// if present.
-func closingSigRecords(c *ClosingSigs) []tlv.RecordProducer {
-	recordProducers := make([]tlv.RecordProducer, 0, 3)
+// including both regular and taproot signatures.
+func closingSigRecords(c *ClosingSigs,
+	tc *TaprootClosingSigs,
+) []tlv.RecordProducer {
+
+	recordProducers := make([]tlv.RecordProducer, 0, 6)
+
+	// Regular signatures
 	c.CloserNoClosee.WhenSome(func(sig tlv.RecordT[tlv.TlvType1, Sig]) {
 		recordProducers = append(recordProducers, &sig)
 	})
@@ -116,6 +191,23 @@ func closingSigRecords(c *ClosingSigs) []tlv.RecordProducer {
 		recordProducers = append(recordProducers, &sig)
 	})
 
+	// Taproot signatures (with nonces).
+	tc.CloserNoClosee.WhenSome(
+		func(sig tlv.RecordT[tlv.TlvType5, PartialSigWithNonce]) {
+			recordProducers = append(recordProducers, &sig)
+		},
+	)
+	tc.NoCloserClosee.WhenSome(
+		func(sig tlv.RecordT[tlv.TlvType6, PartialSigWithNonce]) {
+			recordProducers = append(recordProducers, &sig)
+		},
+	)
+	tc.CloserAndClosee.WhenSome(
+		func(sig tlv.RecordT[tlv.TlvType7, PartialSigWithNonce]) {
+			recordProducers = append(recordProducers, &sig)
+		},
+	)
+
 	return recordProducers
 }
 
@@ -125,15 +217,24 @@ func (c *ClosingComplete) Encode(w *bytes.Buffer, _ uint32) error {
 		return err
 	}
 
+	if err := WriteDeliveryAddress(w, c.CloserScript); err != nil {
+		return err
+	}
+	if err := WriteDeliveryAddress(w, c.CloseeScript); err != nil {
+		return err
+	}
+
 	if err := WriteSatoshi(w, c.FeeSatoshis); err != nil {
 		return err
 	}
 
-	if err := WriteUint32(w, c.Sequence); err != nil {
+	if err := WriteUint32(w, c.LockTime); err != nil {
 		return err
 	}
 
-	recordProducers := closingSigRecords(&c.ClosingSigs)
+	recordProducers := closingSigRecords(
+		&c.ClosingSigs, &c.TaprootClosingSigs,
+	)
 
 	err := EncodeMessageExtraData(&c.ExtraData, recordProducers...)
 	if err != nil {
@@ -151,6 +252,17 @@ func (c *ClosingComplete) MsgType() MessageType {
 	return MsgClosingComplete
 }
 
+// SerializedSize returns the serialized size of the message in bytes.
+//
+// This is part of the lnwire.SizeableMessage interface.
+func (c *ClosingComplete) SerializedSize() (uint32, error) {
+	return MessageSerializedSize(c)
+}
+
 // A compile time check to ensure ClosingComplete implements the lnwire.Message
 // interface.
 var _ Message = (*ClosingComplete)(nil)
+
+// A compile time check to ensure ClosingComplete implements the
+// lnwire.SizeableMessage interface.
+var _ SizeableMessage = (*ClosingComplete)(nil)

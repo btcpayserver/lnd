@@ -21,19 +21,21 @@ func testHoldInvoicePersistence(ht *lntest.HarnessTest) {
 	const (
 		chanAmt     = btcutil.Amount(1000000)
 		numPayments = 10
-		reason      = lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS //nolint:lll
+		reason      = lnrpc.PaymentFailureReason_FAILURE_REASON_INCORRECT_PAYMENT_DETAILS //nolint:ll
 	)
 
 	// Create carol, and clean up when the test finishes.
 	carol := ht.NewNode("Carol", nil)
 
 	// Connect Alice to Carol.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 	ht.ConnectNodes(alice, carol)
 
 	// Open a channel between Alice and Carol which is private so that we
 	// cover the addition of hop hints for hold invoices.
-	chanPointAlice := ht.OpenChannel(
+	ht.OpenChannel(
 		alice, carol, lntest.OpenChannelParams{
 			Amt:     chanAmt,
 			Private: true,
@@ -51,7 +53,7 @@ func testHoldInvoicePersistence(ht *lntest.HarnessTest) {
 	)
 
 	// Wait for Carol to see the open channel Alice-Bob.
-	ht.AssertTopologyChannelOpen(carol, chanPointBob)
+	ht.AssertChannelInGraph(carol, chanPointBob)
 
 	// Create preimages for all payments we are going to initiate.
 	var preimages []lntypes.Preimage
@@ -106,7 +108,6 @@ func testHoldInvoicePersistence(ht *lntest.HarnessTest) {
 	for _, payReq := range payReqs {
 		req := &routerrpc.SendPaymentRequest{
 			PaymentRequest: payReq,
-			TimeoutSeconds: 60,
 			FeeLimitSat:    1000000,
 		}
 
@@ -184,9 +185,7 @@ func testHoldInvoicePersistence(ht *lntest.HarnessTest) {
 		payStream := alice.RPC.TrackPaymentV2(hash[:])
 		ht.ReceiveTrackPayment(payStream)
 
-		ht.AssertPaymentStatus(
-			alice, preimg, lnrpc.Payment_IN_FLIGHT,
-		)
+		ht.AssertPaymentStatus(alice, hash, lnrpc.Payment_IN_FLIGHT)
 	}
 
 	// Settle invoices half the invoices, cancel the rest.
@@ -210,18 +209,14 @@ func testHoldInvoicePersistence(ht *lntest.HarnessTest) {
 	for i, preimg := range preimages {
 		if i%2 == 0 {
 			ht.AssertPaymentStatus(
-				alice, preimg, lnrpc.Payment_SUCCEEDED,
+				alice, preimg.Hash(), lnrpc.Payment_SUCCEEDED,
 			)
 		} else {
 			payment := ht.AssertPaymentStatus(
-				alice, preimg, lnrpc.Payment_FAILED,
+				alice, preimg.Hash(), lnrpc.Payment_FAILED,
 			)
 			require.Equal(ht, reason, payment.FailureReason,
 				"wrong failure reason")
 		}
 	}
-
-	// Finally, close all channels.
-	ht.CloseChannel(alice, chanPointBob)
-	ht.CloseChannel(alice, chanPointAlice)
 }

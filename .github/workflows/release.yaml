@@ -10,33 +10,37 @@ defaults:
     shell: bash
 
 env:
-  # If you change this value, please change it in the following files as well:
-  # /Dockerfile
-  # /dev.Dockerfile
-  # /make/builder.Dockerfile
-  # /.github/workflows/main.yml
-  GO_VERSION: 1.22.6
+  # If you change this please also update GO_VERSION in Makefile (then run
+  # `make lint` to see where else it needs to be updated as well).
+  GO_VERSION: 1.26.3
 
 jobs:
+  ########################
+  # Create release
+  ########################
   main:
     name: Release build
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: cleanup space
+        uses: ./.github/actions/cleanup-space
+
       - name: setup go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
           go-version: '${{ env.GO_VERSION }}'
+          cache: 'false'
 
       - name: Set env
         run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
       - name: build release for all architectures
-        run: SKIP_VERSION_CHECK=1 make release tag=${{ env.RELEASE_VERSION }}
+        run: make release tag=${{ env.RELEASE_VERSION }}
 
       - name: Create Release
         uses: lightninglabs/gh-actions/action-gh-release@c7149b6a7818d1c39b36b69e727569897b6f2c5a
@@ -122,10 +126,12 @@ jobs:
             that `vendor.tar.gz` and `lnd-source-${{ env.RELEASE_VERSION }}.tar.gz` are in the current directory, follow these steps:
 
             ```
-            tar -xvzf vendor.tar.gz
             tar -xvzf lnd-source-${{ env.RELEASE_VERSION }}.tar.gz
-            GO111MODULE=on go install -v -mod=vendor -ldflags "-X github.com/lightningnetwork/lnd/build.Commit=${{ env.RELEASE_VERSION }}" ./cmd/lnd
-            GO111MODULE=on go install -v -mod=vendor -ldflags "-X github.com/lightningnetwork/lnd/build.Commit=${{ env.RELEASE_VERSION }}" ./cmd/lncli
+            mv vendor.tar.gz lnd-source/
+            cd lnd-source
+            tar -xvzf vendor.tar.gz
+            go install -v -mod=vendor -ldflags "-X github.com/lightningnetwork/lnd/build.Commit=${{ env.RELEASE_VERSION }}" ./cmd/lnd
+            go install -v -mod=vendor -ldflags "-X github.com/lightningnetwork/lnd/build.Commit=${{ env.RELEASE_VERSION }}" ./cmd/lncli
             ```
 
             The `-mod=vendor` flag tells the `go build` command that it doesn't need to fetch the dependencies, and instead, they're all enclosed in the local vendor directory. 

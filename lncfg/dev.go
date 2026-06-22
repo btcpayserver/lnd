@@ -5,6 +5,7 @@ package lncfg
 import (
 	"time"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 )
 
@@ -45,4 +46,28 @@ func (d *DevConfig) GetReservationTimeout() time.Duration {
 // GetZombieSweeperInterval returns the config value for`ZombieSweeperInterval`.
 func (d *DevConfig) GetZombieSweeperInterval() time.Duration {
 	return DefaultZombieSweeperInterval
+}
+
+// GetMaxWaitNumBlocksFundingConf returns the config value for
+// `MaxWaitNumBlocksFundingConf`.
+func (d *DevConfig) GetMaxWaitNumBlocksFundingConf() uint32 {
+	return DefaultMaxWaitNumBlocksFundingConf
+}
+
+// GetUnsafeConnect returns the config value `UnsafeConnect`, which is always
+// false for production build.
+func (d *DevConfig) GetUnsafeConnect() bool {
+	return false
+}
+
+// GetMinFwdHistoryAge returns 0 for production builds, causing the caller to
+// use the hardcoded default of 1h.
+func (d *DevConfig) GetMinFwdHistoryAge() time.Duration {
+	return 0
+}
+
+// ChannelCloseConfs returns the config value for channel close confirmations
+// override, which is always None for production build.
+func (d *DevConfig) ChannelCloseConfs() fn.Option[uint32] {
+	return fn.None[uint32]()
 }

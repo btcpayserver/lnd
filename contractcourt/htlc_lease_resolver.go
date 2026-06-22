@@ -1,12 +1,10 @@
 package contractcourt
 
 import (
-	"math"
-
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -42,9 +40,7 @@ func (h *htlcLeaseResolver) deriveWaitHeight(csvDelay uint32,
 
 	waitHeight := uint32(commitSpend.SpendingHeight) + csvDelay - 1
 	if h.hasCLTV() {
-		waitHeight = uint32(math.Max(
-			float64(waitHeight), float64(h.leaseExpiry),
-		))
+		waitHeight = max(waitHeight, h.leaseExpiry)
 	}
 
 	return waitHeight
@@ -57,15 +53,13 @@ func (h *htlcLeaseResolver) makeSweepInput(op *wire.OutPoint,
 	signDesc *input.SignDescriptor, csvDelay, broadcastHeight uint32,
 	payHash [32]byte, resBlob fn.Option[tlv.Blob]) *input.BaseInput {
 
-	if h.hasCLTV() {
-		log.Infof("%T(%x): CSV and CLTV locks expired, offering "+
-			"second-layer output to sweeper: %v", h, payHash, op)
+	log.Infof("%T(%x): offering second-layer output to sweeper: %v", h,
+		payHash, op)
 
+	if h.hasCLTV() {
 		return input.NewCsvInputWithCltv(
-			op, cltvWtype, signDesc,
-			broadcastHeight, csvDelay,
-			h.leaseExpiry,
-			input.WithResolutionBlob(resBlob),
+			op, cltvWtype, signDesc, broadcastHeight, csvDelay,
+			h.leaseExpiry, input.WithResolutionBlob(resBlob),
 		)
 	}
 

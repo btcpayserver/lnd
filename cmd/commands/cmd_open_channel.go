@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/urfave/cli"
@@ -58,9 +59,22 @@ Signed base64 encoded PSBT or hex encoded raw wire TX (or path to file): `
 	// of memory issues or other weird errors.
 	psbtMaxFileSize = 1024 * 1024
 
-	channelTypeTweakless     = "tweakless"
-	channelTypeAnchors       = "anchors"
+	channelTypeTweakless = "tweakless"
+	channelTypeAnchors   = "anchors"
+
+	// channelTypeSimpleTaproot selects the production taproot channel
+	// type (feature bits 80/81). This is the recommended taproot variant.
 	channelTypeSimpleTaproot = "taproot"
+
+	// channelTypeSimpleTaprootStaging selects the legacy staging taproot
+	// channel type using development feature bits. Kept for compatibility
+	// with peers that have not upgraded to the final variant.
+	channelTypeSimpleTaprootStaging = "taproot-staging"
+
+	// channelTypeSimpleTaprootFinalAlias is a deprecated alias for
+	// "taproot" that resolves to the same production taproot channel type.
+	// Retained so existing scripts continue to work.
+	channelTypeSimpleTaprootFinalAlias = "taproot-final"
 )
 
 // TODO(roasbeef): change default number of confirmations.
@@ -253,8 +267,12 @@ var openChannelCommand = cli.Command{
 		cli.StringFlag{
 			Name: "channel_type",
 			Usage: fmt.Sprintf("(optional) the type of channel to "+
-				"propose to the remote peer (%q, %q, %q)",
+				"propose to the remote peer (%q, %q, %q, %q). "+
+				"%q is accepted as a deprecated alias for %q",
 				channelTypeTweakless, channelTypeAnchors,
+				channelTypeSimpleTaproot,
+				channelTypeSimpleTaprootStaging,
+				channelTypeSimpleTaprootFinalAlias,
 				channelTypeSimpleTaproot),
 		},
 		cli.BoolFlag{
@@ -406,7 +424,7 @@ func openChannel(ctx *cli.Context) error {
 	if ctx.IsSet("utxo") {
 		utxos := ctx.StringSlice("utxo")
 
-		outpoints, err := UtxosToOutpoints(utxos)
+		outpoints, err := lnd.UtxosToOutpoints(utxos)
 		if err != nil {
 			return fmt.Errorf("unable to decode utxos: %w", err)
 		}
@@ -435,7 +453,10 @@ func openChannel(ctx *cli.Context) error {
 
 	req.Private = ctx.Bool("private")
 
-	// Parse the channel type and map it to its RPC representation.
+	// Parse the channel type and map it to its RPC representation. The
+	// bare "taproot" string now selects the production (final) variant;
+	// "taproot-staging" preserves access to the legacy development bits.
+	// "taproot-final" is accepted as a deprecated alias for "taproot".
 	channelType := ctx.String("channel_type")
 	switch channelType {
 	case "":
@@ -444,7 +465,9 @@ func openChannel(ctx *cli.Context) error {
 		req.CommitmentType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
 	case channelTypeAnchors:
 		req.CommitmentType = lnrpc.CommitmentType_ANCHORS
-	case channelTypeSimpleTaproot:
+	case channelTypeSimpleTaproot, channelTypeSimpleTaprootFinalAlias:
+		req.CommitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+	case channelTypeSimpleTaprootStaging:
 		req.CommitmentType = lnrpc.CommitmentType_SIMPLE_TAPROOT
 	default:
 		return fmt.Errorf("unsupported channel type %v", channelType)

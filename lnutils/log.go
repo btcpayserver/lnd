@@ -1,6 +1,13 @@
 package lnutils
 
-import "github.com/davecgh/go-spew/spew"
+import (
+	"log/slog"
+	"strings"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btclog/v2"
+	"github.com/davecgh/go-spew/spew"
+)
 
 // LogClosure is used to provide a closure over expensive logging operations so
 // don't have to be performed when the logging level doesn't warrant it.
@@ -24,4 +31,22 @@ func SpewLogClosure(a any) LogClosure {
 	return func() string {
 		return spew.Sdump(a)
 	}
+}
+
+// NewSeparatorClosure returns a new closure that logs a separator line.
+func NewSeparatorClosure() LogClosure {
+	return func() string {
+		return strings.Repeat("=", 80)
+	}
+}
+
+// LogPubKey returns a slog attribute for logging a public key in hex format.
+func LogPubKey(key string, pubKey *btcec.PublicKey) slog.Attr {
+	// Handle nil pubkey gracefully, although callers should ideally prevent
+	// this.
+	if pubKey == nil {
+		return btclog.Fmt(key, "<nil>")
+	}
+
+	return btclog.Hex6(key, pubKey.SerializeCompressed())
 }

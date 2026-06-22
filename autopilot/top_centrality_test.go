@@ -58,7 +58,7 @@ func testTopCentrality(t *testing.T, graph testGraph,
 		// Attempt to get centrality scores and expect
 		// that the result equals with the expected set.
 		scores, err := topCentrality.NodeScores(
-			graph, channels, chanSize, nodes,
+			t.Context(), graph, channels, chanSize, nodes,
 		)
 
 		require.NoError(t, err)

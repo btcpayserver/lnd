@@ -21,8 +21,10 @@ import (
 	"github.com/jessevdk/go-flags"
 	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/rpcperms"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/urfave/cli"
 	"golang.org/x/term"
@@ -50,6 +52,14 @@ var (
 	customDataPattern = regexp.MustCompile(
 		`"custom_channel_data":\s*"([0-9a-f]+)"`,
 	)
+
+	chanIDPattern = regexp.MustCompile(
+		`"chan_id":\s*"(\d+)"`,
+	)
+
+	channelPointPattern = regexp.MustCompile(
+		`"channel_point":\s*"([0-9a-fA-F]+:[0-9]+)"`,
+	)
 )
 
 // replaceCustomData replaces the custom channel data hex string with the
@@ -72,6 +82,96 @@ func replaceCustomData(jsonBytes []byte) []byte {
 
 			return []byte("\"custom_channel_data\":" +
 				string(decoded))
+		},
+	)
+
+	var buf bytes.Buffer
+	err := json.Indent(&buf, replacedBytes, "", "    ")
+	if err != nil {
+		// If we can't indent the JSON, it likely means the replacement
+		// data wasn't correct, so we return the original JSON.
+		return jsonBytes
+	}
+
+	return buf.Bytes()
+}
+
+// replaceAndAppendScid replaces the chan_id with scid and appends the human
+// readable string representation of scid.
+func replaceAndAppendScid(jsonBytes []byte) []byte {
+	// If there's nothing to replace, return the original JSON.
+	if !chanIDPattern.Match(jsonBytes) {
+		return jsonBytes
+	}
+
+	replacedBytes := chanIDPattern.ReplaceAllFunc(
+		jsonBytes, func(match []byte) []byte {
+			// Extract the captured scid group from the match.
+			chanID := chanIDPattern.FindStringSubmatch(
+				string(match),
+			)[1]
+
+			scid, err := strconv.ParseUint(chanID, 10, 64)
+			if err != nil {
+				return match
+			}
+
+			// Format a new JSON field for the scid (chan_id),
+			// including both its numeric representation and its
+			// string representation (scid_str).
+			scidStr := lnwire.NewShortChanIDFromInt(scid).
+				AltString()
+			updatedField := fmt.Sprintf(
+				`"scid": "%d", "scid_str": "%s"`, scid, scidStr,
+			)
+
+			// Replace the entire match with the new structure.
+			return []byte(updatedField)
+		},
+	)
+
+	var buf bytes.Buffer
+	err := json.Indent(&buf, replacedBytes, "", "    ")
+	if err != nil {
+		// If we can't indent the JSON, it likely means the replacement
+		// data wasn't correct, so we return the original JSON.
+		return jsonBytes
+	}
+
+	return buf.Bytes()
+}
+
+// appendChanID appends the chan_id which is computed using the outpoint
+// of the funding transaction (the txid, and output index).
+func appendChanID(jsonBytes []byte) []byte {
+	// If there's nothing to replace, return the original JSON.
+	if !channelPointPattern.Match(jsonBytes) {
+		return jsonBytes
+	}
+
+	replacedBytes := channelPointPattern.ReplaceAllFunc(
+		jsonBytes, func(match []byte) []byte {
+			chanPoint := channelPointPattern.FindStringSubmatch(
+				string(match),
+			)[1]
+
+			chanOutpoint, err := wire.NewOutPointFromString(
+				chanPoint,
+			)
+			if err != nil {
+				return match
+			}
+
+			// Format a new JSON field computed from the
+			// channel_point (chan_id).
+			chanID := lnwire.NewChanIDFromOutPoint(*chanOutpoint)
+			updatedField := fmt.Sprintf(
+				`"channel_point": "%s", "chan_id": "%s"`,
+				chanPoint, chanID.String(),
+			)
+
+			// Replace the entire match with the new structure.
+			return []byte(updatedField)
 		},
 	)
 
@@ -113,6 +213,7 @@ func printJSON(resp interface{}) {
 	_, _ = out.WriteTo(os.Stdout)
 }
 
+// printRespJSON prints the response in a json format.
 func printRespJSON(resp proto.Message) {
 	jsonBytes, err := lnrpc.ProtoJSONMarshalOpts.Marshal(resp)
 	if err != nil {
@@ -120,7 +221,29 @@ func printRespJSON(resp proto.Message) {
 		return
 	}
 
+	// Make the custom data human readable.
 	jsonBytesReplaced := replaceCustomData(jsonBytes)
+
+	fmt.Printf("%s\n", jsonBytesReplaced)
+}
+
+// printModifiedProtoJSON prints the response with some additional formatting
+// and replacements.
+func printModifiedProtoJSON(resp proto.Message) {
+	jsonBytes, err := lnrpc.ProtoJSONMarshalOpts.Marshal(resp)
+	if err != nil {
+		fmt.Println("unable to decode response: ", err)
+		return
+	}
+
+	// Replace custom_channel_data in the JSON.
+	jsonBytesReplaced := replaceCustomData(jsonBytes)
+
+	// Replace chan_id with scid, and append scid_str and scid fields.
+	jsonBytesReplaced = replaceAndAppendScid(jsonBytesReplaced)
+
+	// Append the chan_id field to the JSON.
+	jsonBytesReplaced = appendChanID(jsonBytesReplaced)
 
 	fmt.Printf("%s\n", jsonBytesReplaced)
 }
@@ -129,41 +252,48 @@ func printRespJSON(resp proto.Message) {
 // to command actions.
 func actionDecorator(f func(*cli.Context) error) func(*cli.Context) error {
 	return func(c *cli.Context) error {
-		if err := f(c); err != nil {
-			s, ok := status.FromError(err)
+		err := f(c)
 
-			// If it's a command for the UnlockerService (like
-			// 'create' or 'unlock') but the wallet is already
-			// unlocked, then these methods aren't recognized any
-			// more because this service is shut down after
-			// successful unlock. That's why the code
-			// 'Unimplemented' means something different for these
-			// two commands.
-			if s.Code() == codes.Unimplemented &&
-				(c.Command.Name == "create" ||
-					c.Command.Name == "unlock" ||
-					c.Command.Name == "changepassword" ||
-					c.Command.Name == "createwatchonly") {
+		// Exit early if there's no error.
+		if err == nil {
+			return nil
+		}
 
-				return fmt.Errorf("Wallet is already unlocked")
-			}
+		// Try to parse the Status representation from this error.
+		s, ok := status.FromError(err)
 
-			// lnd might be active, but not possible to contact
-			// using RPC if the wallet is encrypted. If we get
-			// error code Unimplemented, it means that lnd is
-			// running, but the RPC server is not active yet (only
-			// WalletUnlocker server active) and most likely this
-			// is because of an encrypted wallet.
-			if ok && s.Code() == codes.Unimplemented {
-				return fmt.Errorf("Wallet is encrypted. " +
-					"Please unlock using 'lncli unlock', " +
-					"or set password using 'lncli create'" +
-					" if this is the first time starting " +
-					"lnd.")
-			}
+		// If this cannot be represented by a Status, exit early.
+		if !ok {
 			return err
 		}
-		return nil
+
+		// If it's a command for the UnlockerService (like 'create' or
+		// 'unlock') but the wallet is already unlocked, then these
+		// methods aren't recognized any more because this service is
+		// shut down after successful unlock.
+		if s.Code() == codes.Unknown && strings.Contains(
+			s.Message(), rpcperms.ErrWalletUnlocked.Error(),
+		) && (c.Command.Name == "create" ||
+			c.Command.Name == "unlock" ||
+			c.Command.Name == "changepassword" ||
+			c.Command.Name == "createwatchonly") {
+
+			return errors.New("wallet is already unlocked")
+		}
+
+		// lnd might be active, but not possible to contact using RPC if
+		// the wallet is encrypted.
+		if s.Code() == codes.Unknown && strings.Contains(
+			s.Message(), rpcperms.ErrWalletLocked.Error(),
+		) {
+
+			return errors.New("wallet is encrypted - please " +
+				"unlock using 'lncli unlock', or set " +
+				"password using 'lncli create' if this is " +
+				"the first time starting lnd")
+		}
+
+		return s.Err()
 	}
 }
 
@@ -272,6 +402,14 @@ var estimateFeeCommand = cli.Command{
 				"transaction *should* confirm in",
 		},
 		coinSelectionStrategyFlag,
+		cli.StringSliceFlag{
+			Name: "utxo",
+			Usage: "a utxo specified as outpoint(tx:idx) which " +
+				"will be used as input for the transaction " +
+				"to be estimated. This flag can be " +
+				"repeatedly used to specify multiple utxos " +
+				"as inputs.",
+		},
 	},
 	Action: actionDecorator(estimateFees),
 }
@@ -293,10 +431,21 @@ func estimateFees(ctx *cli.Context) error {
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
+	var inputs []*lnrpc.OutPoint
+	if ctx.IsSet("utxo") {
+		utxos := ctx.StringSlice("utxo")
+
+		inputs, err = lnd.UtxosToOutpoints(utxos)
+		if err != nil {
+			return fmt.Errorf("unable to decode utxos: %w", err)
+		}
+	}
+
 	resp, err := client.EstimateFee(ctxc, &lnrpc.EstimateFeeRequest{
 		AddrToAmount:          amountToAddr,
 		TargetConf:            int32(ctx.Int64("conf_target")),
 		CoinSelectionStrategy: coinSelectionStrategy,
+		Inputs:                inputs,
 	})
 	if err != nil {
 		return err
@@ -461,7 +610,7 @@ func sendCoins(ctx *cli.Context) error {
 	// In case that the user has specified the sweepall flag, we'll
 	// calculate the amount to send based on the current wallet balance.
 	displayAmt := amt
-	if ctx.Bool("sweepall") {
+	if ctx.Bool("sweepall") && !ctx.IsSet("utxo") {
 		balanceResponse, err := client.WalletBalance(
 			ctxc, &lnrpc.WalletBalanceRequest{
 				MinConfs: minConfs,
@@ -477,9 +626,35 @@ func sendCoins(ctx *cli.Context) error {
 	if ctx.IsSet("utxo") {
 		utxos := ctx.StringSlice("utxo")
 
-		outpoints, err = UtxosToOutpoints(utxos)
+		outpoints, err = lnd.UtxosToOutpoints(utxos)
 		if err != nil {
 			return fmt.Errorf("unable to decode utxos: %w", err)
+		}
+
+		if ctx.Bool("sweepall") {
+			displayAmt = 0
+			// If we're sweeping all funds of the utxos, we'll need
+			// to set the display amount to the total amount of the
+			// utxos.
+			unspents, err := client.ListUnspent(
+				ctxc, &lnrpc.ListUnspentRequest{
+					MinConfs: 0,
+					MaxConfs: math.MaxInt32,
+				},
+			)
+			if err != nil {
+				return err
+			}
+
+			for _, utxo := range outpoints {
+				for _, unspent := range unspents.Utxos {
+					unspentUtxo := unspent.Outpoint
+					if isSameOutpoint(utxo, unspentUtxo) {
+						displayAmt += unspent.AmountSat
+						break
+					}
+				}
+			}
 		}
 	}
 
@@ -515,6 +690,10 @@ func sendCoins(ctx *cli.Context) error {
 
 	printRespJSON(txid)
 	return nil
+}
+
+func isSameOutpoint(a, b *lnrpc.OutPoint) bool {
+	return a.TxidStr == b.TxidStr && a.OutputIndex == b.OutputIndex
 }
 
 var listUnspentCommand = cli.Command{
@@ -624,12 +803,12 @@ func listUnspent(ctx *cli.Context) error {
 	// to stdout. At the moment, this filters out the raw txid bytes from
 	// each utxo's outpoint and only prints the txid string.
 	var listUnspentResp = struct {
-		Utxos []*Utxo `json:"utxos"`
+		Utxos []*lnd.Utxo `json:"utxos"`
 	}{
-		Utxos: make([]*Utxo, 0, len(resp.Utxos)),
+		Utxos: make([]*lnd.Utxo, 0, len(resp.Utxos)),
 	}
 	for _, protoUtxo := range resp.Utxos {
-		utxo := NewUtxoFromProto(protoUtxo)
+		utxo := lnd.NewUtxoFromProto(protoUtxo)
 		listUnspentResp.Utxos = append(listUnspentResp.Utxos, utxo)
 	}
 
@@ -859,6 +1038,11 @@ var closeChannelCommand = cli.Command{
 	comparison is the end boundary of the fee negotiation, if not specified
 	it's always x3 of the starting value. Increasing this value increases
 	the chance of a successful negotiation.
+	Moreover if the channel has active HTLCs on it, the coop close will
+	wait until all HTLCs are resolved and will not allow any new HTLCs on
+	the channel. The channel will appear as disabled in the listchannels
+	output. The command will block in that case until the channel close tx
+	is broadcasted.
 
 	In the case of a cooperative closure, one can manually set the address
 	to deliver funds to upon closure. This is optional, and may only be used
@@ -890,8 +1074,10 @@ var closeChannelCommand = cli.Command{
 			Usage: "attempt an uncooperative closure",
 		},
 		cli.BoolFlag{
-			Name:  "block",
-			Usage: "block until the channel is closed",
+			Name: "block",
+			Usage: `block will wait for the channel to be closed,
+			"meaning that it will wait for the channel close tx to
+			get 1 confirmation.`,
 		},
 		cli.Int64Flag{
 			Name: "conf_target",
@@ -965,6 +1151,9 @@ func closeChannel(ctx *cli.Context) error {
 		SatPerVbyte:     ctx.Uint64(feeRateFlag),
 		DeliveryAddress: ctx.String("delivery_addr"),
 		MaxFeePerVbyte:  ctx.Uint64("max_fee_rate"),
+		// This makes sure that a coop close will also be executed if
+		// active HTLCs are present on the channel.
+		NoWait: true,
 	}
 
 	// After parsing the request, we'll spin up a goroutine that will
@@ -1002,7 +1191,9 @@ func closeChannel(ctx *cli.Context) error {
 // executeChannelClose attempts to close the channel from a request. The closing
 // transaction ID is sent through `txidChan` as soon as it is broadcasted to the
 // network. The block boolean is used to determine if we should block until the
-// closing transaction receives all of its required confirmations.
+// closing transaction receives a confirmation of 1 block. The logging outputs
+// are sent to stderr to avoid conflicts with the JSON output of the command
+// and potential work flows which depend on a proper JSON output.
 func executeChannelClose(ctxc context.Context, client lnrpc.LightningClient,
 	req *lnrpc.CloseChannelRequest, txidChan chan<- string, block bool) error {
 
@@ -1021,9 +1212,17 @@ func executeChannelClose(ctxc context.Context, client lnrpc.LightningClient,
 
 		switch update := resp.Update.(type) {
 		case *lnrpc.CloseStatusUpdate_CloseInstant:
-			if req.NoWait {
-				return nil
+			fmt.Fprintln(os.Stderr, "Channel close successfully "+
+				"initiated")
+
+			pendingHtlcs := update.CloseInstant.NumPendingHtlcs
+			if pendingHtlcs > 0 {
+				fmt.Fprintf(os.Stderr, "Cooperative channel "+
+					"close waiting for %d HTLCs to be "+
+					"resolved before the close process "+
+					"can kick off\n", pendingHtlcs)
 			}
+
 		case *lnrpc.CloseStatusUpdate_ClosePending:
 			closingHash := update.ClosePending.Txid
 			txid, err := chainhash.NewHash(closingHash)
@@ -1031,12 +1230,22 @@ func executeChannelClose(ctxc context.Context, client lnrpc.LightningClient,
 				return err
 			}
 
+			fmt.Fprintf(os.Stderr, "Channel close transaction "+
+				"broadcasted: %v\n", txid)
+
 			txidChan <- txid.String()
 
 			if !block {
 				return nil
 			}
+
+			fmt.Fprintln(os.Stderr, "Waiting for channel close "+
+				"confirmation ...")
+
 		case *lnrpc.CloseStatusUpdate_ChanClose:
+			fmt.Fprintln(os.Stderr, "Channel close successfully "+
+				"confirmed")
+
 			return nil
 		}
 	}
@@ -1717,7 +1926,7 @@ func ListChannels(ctx *cli.Context) error {
 		return err
 	}
 
-	printRespJSON(resp)
+	printModifiedProtoJSON(resp)
 
 	return nil
 }
@@ -1779,7 +1988,7 @@ func closedChannels(ctx *cli.Context) error {
 		return err
 	}
 
-	printRespJSON(resp)
+	printModifiedProtoJSON(resp)
 
 	return nil
 }
@@ -1797,6 +2006,11 @@ var describeGraphCommand = cli.Command{
 				"graph. Unannounced channels are both private channels, and " +
 				"public channels that are not yet announced to the network.",
 		},
+		cli.BoolFlag{
+			Name: "include_auth_proof",
+			Usage: "If set, will include announcements' " +
+				"signatures into ChannelEdge.",
+		},
 	},
 	Action: actionDecorator(describeGraph),
 }
@@ -1808,6 +2022,7 @@ func describeGraph(ctx *cli.Context) error {
 
 	req := &lnrpc.ChannelGraphRequest{
 		IncludeUnannounced: ctx.Bool("include_unannounced"),
+		IncludeAuthProof:   ctx.Bool("include_auth_proof"),
 	}
 
 	graph, err := client.DescribeGraph(ctxc, req)
@@ -1865,6 +2080,11 @@ var getChanInfoCommand = cli.Command{
 				"the chan_id param is set this param is " +
 				"ignored.",
 		},
+		cli.BoolFlag{
+			Name: "include_auth_proof",
+			Usage: "If set, will include announcements' " +
+				"signatures into ChannelEdge.",
+		},
 	},
 	Action: actionDecorator(getChanInfo),
 }
@@ -1898,8 +2118,9 @@ func getChanInfo(ctx *cli.Context) error {
 	}
 
 	req := &lnrpc.ChanInfoRequest{
-		ChanId:    chanID,
-		ChanPoint: chanPoint,
+		ChanId:           chanID,
+		ChanPoint:        chanPoint,
+		IncludeAuthProof: ctx.Bool("include_auth_proof"),
 	}
 
 	chanInfo, err := client.GetChanInfo(ctxc, req)
@@ -1928,6 +2149,12 @@ var getNodeInfoCommand = cli.Command{
 			Usage: "if true, will return all known channels " +
 				"associated with the node",
 		},
+		cli.BoolFlag{
+			Name: "include_auth_proof",
+			Usage: "If set, will include announcements' " +
+				"signatures into ChannelEdge. Depends on " +
+				"include_channels",
+		},
 	},
 	Action: actionDecorator(getNodeInfo),
 }
@@ -1950,8 +2177,9 @@ func getNodeInfo(ctx *cli.Context) error {
 	}
 
 	req := &lnrpc.NodeInfoRequest{
-		PubKey:          pubKey,
-		IncludeChannels: ctx.Bool("include_channels"),
+		PubKey:           pubKey,
+		IncludeChannels:  ctx.Bool("include_channels"),
+		IncludeAuthProof: ctx.Bool("include_auth_proof"),
 	}
 
 	nodeInfo, err := client.GetNodeInfo(ctxc, req)
@@ -2040,25 +2268,59 @@ var listChainTxnsCommand = cli.Command{
 		cli.Int64Flag{
 			Name: "end_height",
 			Usage: "the block height until which to list " +
-				"transactions, inclusive, to get " +
-				"transactions until the chain tip, including " +
-				"unconfirmed, set this value to -1",
+				"transactions, inclusive; by default this " +
+				"will return all transactions up to the " +
+				"chain tip including unconfirmed " +
+				"transactions",
+			Value: -1,
+		},
+		cli.UintFlag{
+			Name: "index_offset",
+			Usage: "the index of a transaction that will be " +
+				"used in a query to determine which " +
+				"transaction should be returned in the " +
+				"response",
+		},
+		cli.IntFlag{
+			Name: "max_transactions",
+			Usage: "the max number of transactions to " +
+				"return; leave at default of 0 to return " +
+				"all transactions",
+			Value: 0,
 		},
 	},
 	Description: `
 	List all transactions an address of the wallet was involved in.
 
 	This call will return a list of wallet related transactions that paid
-	to an address our wallet controls, or spent utxos that we held. The
-	start_height and end_height flags can be used to specify an inclusive
-	block range over which to query for transactions. If the end_height is
-	less than the start_height, transactions will be queried in reverse.
-	To get all transactions until the chain tip, including unconfirmed
-	transactions (identifiable with BlockHeight=0), set end_height to -1.
-	By default, this call will get all transactions our wallet was involved
-	in, including unconfirmed transactions.
-`,
+	to an address our wallet controls, or spent utxos that we held.
+
+	By default, this call will get all transactions until the chain tip, 
+	including unconfirmed transactions (end_height=-1).`,
 	Action: actionDecorator(listChainTxns),
+}
+
+func parseBlockHeightInputs(ctx *cli.Context) (int32, int32, error) {
+	startHeight := int32(ctx.Int64("start_height"))
+	endHeight := int32(ctx.Int64("end_height"))
+
+	if ctx.IsSet("start_height") && ctx.IsSet("end_height") {
+		if endHeight != -1 && startHeight > endHeight {
+			return startHeight, endHeight,
+				errors.New("start_height should " +
+					"be less than end_height if " +
+					"end_height is not equal to -1")
+		}
+	}
+
+	if startHeight < 0 {
+		return startHeight, endHeight,
+			errors.New("start_height should " +
+				"be greater than or " +
+				"equal to 0")
+	}
+
+	return startHeight, endHeight, nil
 }
 
 func listChainTxns(ctx *cli.Context) error {
@@ -2066,13 +2328,16 @@ func listChainTxns(ctx *cli.Context) error {
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
-	req := &lnrpc.GetTransactionsRequest{}
-
-	if ctx.IsSet("start_height") {
-		req.StartHeight = int32(ctx.Int64("start_height"))
+	startHeight, endHeight, err := parseBlockHeightInputs(ctx)
+	if err != nil {
+		return err
 	}
-	if ctx.IsSet("end_height") {
-		req.EndHeight = int32(ctx.Int64("end_height"))
+
+	req := &lnrpc.GetTransactionsRequest{
+		IndexOffset:     uint32(ctx.Uint64("index_offset")),
+		MaxTransactions: uint32(ctx.Uint64("max_transactions")),
+		StartHeight:     startHeight,
+		EndHeight:       endHeight,
 	}
 
 	resp, err := client.GetTransactions(ctxc, req)
@@ -2098,10 +2363,12 @@ func stopDaemon(ctx *cli.Context) error {
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
-	_, err := client.StopDaemon(ctxc, &lnrpc.StopRequest{})
+	resp, err := client.StopDaemon(ctxc, &lnrpc.StopRequest{})
 	if err != nil {
 		return err
 	}
+
+	printRespJSON(resp)
 
 	return nil
 }
@@ -2327,6 +2594,21 @@ var updateChannelPolicyCommand = cli.Command{
 				"channels will be updated. Takes the form of " +
 				"txid:output_index",
 		},
+		cli.BoolFlag{
+			Name: "create_missing_edge",
+			Usage: "Under unknown circumstances a channel can " +
+				"exist with a missing edge in the graph " +
+				"database. This can cause an 'edge not " +
+				"found' error when calling `getchaninfo` " +
+				"and/or cause the default channel policy to " +
+				"be used during forwards. Setting this flag " +
+				"will recreate the edge if not found, " +
+				"allowing updating this channel policy and " +
+				"fixing the missing edge problem for this " +
+				"channel permanently. For fields not set in " +
+				"this command, the default policy will be " +
+				"created.",
+		},
 	},
 	Action: actionDecorator(updateChannelPolicy),
 }
@@ -2486,11 +2768,14 @@ func updateChannelPolicy(ctx *cli.Context) error {
 		}
 	}
 
+	createMissingEdge := ctx.Bool("create_missing_edge")
+
 	req := &lnrpc.PolicyUpdateRequest{
-		BaseFeeMsat:   baseFee,
-		TimeLockDelta: uint32(timeLockDelta),
-		MaxHtlcMsat:   ctx.Uint64("max_htlc_msat"),
-		InboundFee:    inboundFee,
+		BaseFeeMsat:       baseFee,
+		TimeLockDelta:     uint32(timeLockDelta),
+		MaxHtlcMsat:       ctx.Uint64("max_htlc_msat"),
+		InboundFee:        inboundFee,
+		CreateMissingEdge: createMissingEdge,
 	}
 
 	if ctx.IsSet("min_htlc_msat") {
@@ -2523,12 +2808,14 @@ func updateChannelPolicy(ctx *cli.Context) error {
 	// to stdout. At the moment, this filters out the raw txid bytes from
 	// each failed update's outpoint and only prints the txid string.
 	var listFailedUpdateResp = struct {
-		FailedUpdates []*FailedUpdate `json:"failed_updates"`
+		FailedUpdates []*lnd.FailedUpdate `json:"failed_updates"`
 	}{
-		FailedUpdates: make([]*FailedUpdate, 0, len(resp.FailedUpdates)),
+		FailedUpdates: make(
+			[]*lnd.FailedUpdate, 0, len(resp.FailedUpdates),
+		),
 	}
 	for _, protoUpdate := range resp.FailedUpdates {
-		failedUpdate := NewFailedUpdateFromProto(protoUpdate)
+		failedUpdate := lnd.NewFailedUpdateFromProto(protoUpdate)
 		listFailedUpdateResp.FailedUpdates = append(
 			listFailedUpdateResp.FailedUpdates, failedUpdate)
 	}
@@ -2677,10 +2964,10 @@ func exportChanBackup(ctx *cli.Context) error {
 
 		printJSON(struct {
 			ChanPoint  string `json:"chan_point"`
-			ChanBackup []byte `json:"chan_backup"`
+			ChanBackup string `json:"chan_backup"`
 		}{
 			ChanPoint:  chanPoint.String(),
-			ChanBackup: chanBackup.ChanBackup,
+			ChanBackup: hex.EncodeToString(chanBackup.ChanBackup),
 		})
 		return nil
 	}
@@ -2705,19 +2992,6 @@ func exportChanBackup(ctx *cli.Context) error {
 	}
 
 	// TODO(roasbeef): support for export | restore ?
-
-	var chanPoints []string
-	for _, chanPoint := range chanBackup.MultiChanBackup.ChanPoints {
-		txid, err := chainhash.NewHash(chanPoint.GetFundingTxidBytes())
-		if err != nil {
-			return err
-		}
-
-		chanPoints = append(chanPoints, wire.OutPoint{
-			Hash:  *txid,
-			Index: chanPoint.OutputIndex,
-		}.String())
-	}
 
 	printRespJSON(chanBackup)
 
@@ -2967,10 +3241,12 @@ func restoreChanBackup(ctx *cli.Context) error {
 
 	req.Backup = backups.Backup
 
-	_, err = client.RestoreChannelBackups(ctxc, &req)
+	resp, err := client.RestoreChannelBackups(ctxc, &req)
 	if err != nil {
 		return fmt.Errorf("unable to restore chan backups: %w", err)
 	}
+
+	printRespJSON(resp)
 
 	return nil
 }

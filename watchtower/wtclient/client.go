@@ -5,14 +5,14 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btclog"
-	"github.com/lightningnetwork/lnd/build"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -210,9 +210,7 @@ func newClient(cfg *clientCfg) (*client, error) {
 	if err != nil {
 		return nil, err
 	}
-	prefix := fmt.Sprintf("(%s)", identifier)
-
-	plog := build.NewPrefixLog(prefix, log)
+	plog := log.WithPrefix(fmt.Sprintf("(%s)", identifier))
 
 	queueDB := cfg.DB.GetDBQueue([]byte(identifier))
 	queue, err := NewDiskOverflowQueue[*wtdb.BackupID](
@@ -305,6 +303,15 @@ func getTowerAndSessionCandidates(db DB, keyRing ECDHKeyRing,
 	candidateSessions := make(map[wtdb.SessionID]*ClientSession)
 	for _, dbTower := range towers {
 		tower, err := NewTowerFromDBTower(dbTower)
+		if errors.Is(err, ErrTowerOnlyV2Onion) {
+			log.Warnf("Skipping tower %x: all persisted "+
+				"addresses are Tor v2 .onion which is no "+
+				"longer supported; add a fresh v3 address "+
+				"to re-activate this tower",
+				dbTower.IdentityKey.SerializeCompressed())
+
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1255,9 +1262,7 @@ func (c *client) handleNewTower(tower *Tower) error {
 		return fmt.Errorf("unable to determine sessions for tower %x: "+
 			"%v", tower.IdentityKey.SerializeCompressed(), err)
 	}
-	for id, session := range sessions {
-		c.candidateSessions[id] = session
-	}
+	maps.Copy(c.candidateSessions, sessions)
 
 	return nil
 }

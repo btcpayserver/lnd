@@ -9,7 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -202,12 +202,14 @@ func writeTaggedFields(bufferBase32 *bytes.Buffer, invoice *Invoice) error {
 		var version byte
 		switch addr := invoice.FallbackAddr.(type) {
 		case *btcutil.AddressPubKeyHash:
-			version = 17
+			version = fallbackVersionPubkeyHash
 		case *btcutil.AddressScriptHash:
-			version = 18
+			version = fallbackVersionScriptHash
 		case *btcutil.AddressWitnessPubKeyHash:
 			version = addr.WitnessVersion()
 		case *btcutil.AddressWitnessScriptHash:
+			version = addr.WitnessVersion()
+		case *btcutil.AddressTaproot:
 			version = addr.WitnessVersion()
 		default:
 			return fmt.Errorf("unknown fallback address type")

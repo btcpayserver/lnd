@@ -2,12 +2,14 @@ package commands
 
 import (
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"math"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli"
 )
 
 // TestParseChanPoint tests parseChanPoint with various
@@ -127,10 +129,9 @@ func TestReplaceCustomData(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name        string
-		data        string
-		replaceData string
-		expected    string
+		name     string
+		data     string
+		expected string
 	}{
 		{
 			name:     "no replacement necessary",
@@ -139,10 +140,10 @@ func TestReplaceCustomData(t *testing.T) {
 		},
 		{
 			name: "valid json with replacement",
-			data: "{\"foo\":\"bar\",\"custom_channel_data\":\"" +
+			data: `{"foo":"bar","custom_channel_data":"` +
 				hex.EncodeToString([]byte(
-					"{\"bar\":\"baz\"}",
-				)) + "\"}",
+					`{"bar":"baz"}`,
+				)) + `"}`,
 			expected: `{
     "foo": "bar",
     "custom_channel_data": {
@@ -152,10 +153,10 @@ func TestReplaceCustomData(t *testing.T) {
 		},
 		{
 			name: "valid json with replacement and space",
-			data: "{\"foo\":\"bar\",\"custom_channel_data\": \"" +
+			data: `{"foo":"bar","custom_channel_data": "` +
 				hex.EncodeToString([]byte(
-					"{\"bar\":\"baz\"}",
-				)) + "\"}",
+					`{"bar":"baz"}`,
+				)) + `"}`,
 			expected: `{
     "foo": "bar",
     "custom_channel_data": {
@@ -178,9 +179,11 @@ func TestReplaceCustomData(t *testing.T) {
 				"\"custom_channel_data\":\"a\"",
 		},
 		{
-			name:     "valid json, invalid hex, just formatted",
-			data:     "{\"custom_channel_data\":\"f\"}",
-			expected: "{\n    \"custom_channel_data\": \"f\"\n}",
+			name: "valid json, invalid hex, just formatted",
+			data: `{"custom_channel_data":"f"}`,
+			expected: `{
+    "custom_channel_data": "f"
+}`,
 		},
 	}
 
@@ -188,6 +191,304 @@ func TestReplaceCustomData(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			result := replaceCustomData([]byte(tc.data))
 			require.Equal(t, tc.expected, string(result))
+		})
+	}
+}
+
+// TestReplaceAndAppendScid tests whether chan_id is replaced with scid and
+// scid_str in the JSON console output.
+func TestReplaceAndAppendScid(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		data     string
+		expected string
+	}{
+		{
+			name:     "no replacement necessary",
+			data:     "foo",
+			expected: "foo",
+		},
+		{
+			name: "valid json with replacement",
+			data: `{"foo":"bar","chan_id":"829031767408640"}`,
+			expected: `{
+    "foo": "bar",
+    "scid": "829031767408640",
+    "scid_str": "754x1x0"
+}`,
+		},
+		{
+			name: "valid json with replacement and space",
+			data: `{"foo":"bar","chan_id": "829031767408640"}`,
+			expected: `{
+    "foo": "bar",
+    "scid": "829031767408640",
+    "scid_str": "754x1x0"
+}`,
+		},
+		{
+			name: "doesn't match pattern, returned identical",
+			data: "this ain't even json, and no chan_id " +
+				"either",
+			expected: "this ain't even json, and no chan_id " +
+				"either",
+		},
+		{
+			name: "invalid json",
+			data: "this ain't json, " +
+				"\"chan_id\":\"18446744073709551616\"",
+			expected: "this ain't json, " +
+				"\"chan_id\":\"18446744073709551616\"",
+		},
+		{
+			name: "valid json, invalid uint, just formatted",
+			data: `{"chan_id":"18446744073709551616"}`,
+			expected: `{
+    "chan_id": "18446744073709551616"
+}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := replaceAndAppendScid([]byte(tc.data))
+			require.Equal(t, tc.expected, string(result))
+		})
+	}
+}
+
+// TestAppendChanID tests whether chan_id (BOLT02) is appended
+// to the JSON console output.
+func TestAppendChanID(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		data     string
+		expected string
+	}{
+		{
+			name:     "no amendment necessary",
+			data:     "foo",
+			expected: "foo",
+		},
+		{
+			name: "valid json with amendment",
+			data: `{"foo":"bar","channel_point":"6ab312e3b744e` +
+				`1b80a33a6541697df88766515c31c08e839bf11dc` +
+				`9fcc036a19:0"}`,
+			expected: `{
+    "foo": "bar",
+    "channel_point": "6ab312e3b744e1b80a33a6541697df88766515c31c` +
+				`08e839bf11dc9fcc036a19:0",
+    "chan_id": "196a03cc9fdc11bf39e8081cc315657688df971654a` +
+				`6330ab8e144b7e312b36a"
+}`,
+		},
+		{
+			name: "valid json with amendment and space",
+			data: `{"foo":"bar","channel_point": "6ab312e3b744e` +
+				`1b80a33a6541697df88766515c31c08e839bf11dc` +
+				`9fcc036a19:0"}`,
+			expected: `{
+    "foo": "bar",
+    "channel_point": "6ab312e3b744e1b80a33a6541697df88766515c31c` +
+				`08e839bf11dc9fcc036a19:0",
+    "chan_id": "196a03cc9fdc11bf39e8081cc315657688df971654a` +
+				`6330ab8e144b7e312b36a"
+}`,
+		},
+		{
+			name: "doesn't match pattern, returned identical",
+			data: "this ain't even json, and no channel_point " +
+				"either",
+			expected: "this ain't even json, and no channel_point" +
+				" either",
+		},
+		{
+			name: "invalid json",
+			data: "this ain't json, " +
+				"\"channel_point\":\"f:0\"",
+			expected: "this ain't json, " +
+				"\"channel_point\":\"f:0\"",
+		},
+		{
+			name: "valid json with invalid outpoint, formatted",
+			data: `{"channel_point":"f:0"}`,
+			expected: `{
+    "channel_point": "f:0"
+}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := appendChanID([]byte(tc.data))
+			require.Equal(t, tc.expected, string(result))
+		})
+	}
+}
+
+// TestParseBlockHeightInputs tests the input block heights and ensure that the
+// proper errors are returned when they could lead in invalid results.
+func TestParseBlockHeightInputs(t *testing.T) {
+	t.Parallel()
+
+	app := cli.NewApp()
+
+	startDefault, endDefault := int64(0), int64(-1)
+
+	testCases := []struct {
+		name          string
+		expectedStart int32
+		expectedEnd   int32
+		expectedErr   string
+	}{
+		{
+			name:          "start less than end",
+			expectedStart: 100,
+			expectedEnd:   200,
+			expectedErr:   "",
+		},
+		{
+			name:          "start greater than end",
+			expectedStart: 200,
+			expectedEnd:   100,
+			expectedErr: "start_height should be " +
+				"less than end_height if end_height is " +
+				"not equal to -1",
+		},
+		{
+			name:          "only start height set",
+			expectedStart: 100,
+			expectedEnd:   -1,
+			expectedErr:   "",
+		},
+		{
+			name:          "start set and end height set as -1",
+			expectedStart: 100,
+			expectedEnd:   -1,
+			expectedErr:   "",
+		},
+		{
+			name:          "neither start nor end heights defined",
+			expectedStart: 0,
+			expectedEnd:   -1,
+			expectedErr:   "",
+		},
+		{
+			name:          "only end height defined",
+			expectedStart: 0,
+			expectedEnd:   100,
+			expectedErr:   "",
+		},
+		{
+			name:          "start height is a negative",
+			expectedStart: -1,
+			expectedEnd:   100,
+			expectedErr: "start_height should be greater " +
+				"than or equal to 0",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			flagSet := flag.NewFlagSet(
+				"listchaintxns", flag.ContinueOnError,
+			)
+
+			var startHeight, endHeight int64
+			flagSet.Int64Var(
+				&startHeight, "start_height", startDefault, "",
+			)
+			flagSet.Int64Var(
+				&endHeight, "end_height", endDefault, "",
+			)
+
+			err := flagSet.Set(
+				"start_height",
+				strconv.Itoa(int(tc.expectedStart)),
+			)
+			require.NoError(
+				t, err, "failed to set start_height flag",
+			)
+
+			err = flagSet.Set(
+				"end_height", strconv.Itoa(int(tc.expectedEnd)),
+			)
+			require.NoError(
+				t, err, "failed to set end_height flag",
+			)
+
+			ctx := cli.NewContext(app, flagSet, nil)
+			start, end, err := parseBlockHeightInputs(ctx)
+			if tc.expectedErr != "" {
+				require.EqualError(t, err, tc.expectedErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.expectedStart, start)
+			require.Equal(t, tc.expectedEnd, end)
+		})
+	}
+}
+
+// TestParseChanIDs tests the parseChanIDs function with various
+// valid and invalid input values and verifies the output.
+func TestParseChanIDs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		chanIDs     []string
+		expected    []uint64
+		expectedErr bool
+	}{
+		{
+			name: "valid chan ids",
+			chanIDs: []string{
+				"1499733860352000", "17592186044552773633",
+			},
+			expected: []uint64{
+				1499733860352000, 17592186044552773633,
+			},
+			expectedErr: false,
+		},
+		{
+			name: "invalid chan id",
+			chanIDs: []string{
+				"channel id",
+			},
+			expected:    []uint64{},
+			expectedErr: true,
+		},
+		{
+			name: "negative chan id",
+			chanIDs: []string{
+				"-10000",
+			},
+			expected:    []uint64{},
+			expectedErr: true,
+		},
+		{
+			name:        "empty chan ids",
+			chanIDs:     []string{},
+			expected:    nil,
+			expectedErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			chanIDs, err := parseChanIDs(tc.chanIDs)
+			if tc.expectedErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, chanIDs)
 		})
 	}
 }

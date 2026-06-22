@@ -16,6 +16,39 @@
     "application/json"
   ],
   "paths": {
+    "/v2/wallet/BumpForceCloseFee": {
+      "post": {
+        "summary": "lncli: `wallet bumpforceclosefee`\nBumpForceCloseFee is an endpoint that allows users to bump the fee of a\nchannel force close. This only works for channels with option_anchors.",
+        "operationId": "WalletKit_BumpForceCloseFee",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WalletKit"
+        ]
+      }
+    },
     "/v2/wallet/accounts": {
       "get": {
         "summary": "lncli: `wallet accounts list`\nListAccounts retrieves all accounts belonging to the wallet by default. A\nname and key scope filter can be provided to filter through all of the\nwallet accounts and return only those matching.",
@@ -273,7 +306,7 @@
     },
     "/v2/wallet/estimatefee/{conf_target}": {
       "get": {
-        "summary": "EstimateFee attempts to query the internal fee estimator of the wallet to\ndetermine the fee (in sat/kw) to attach to a transaction in order to\nachieve the confirmation target.",
+        "summary": "lncli: `wallet estimatefeerate`\nEstimateFee attempts to query the internal fee estimator of the wallet to\ndetermine the fee (in sat/kw) to attach to a transaction in order to\nachieve the confirmation target.",
         "operationId": "WalletKit_EstimateFee",
         "responses": {
           "200": {
@@ -474,7 +507,7 @@
     },
     "/v2/wallet/psbt/sign": {
       "post": {
-        "summary": "SignPsbt expects a partial transaction with all inputs and outputs fully\ndeclared and tries to sign all unsigned inputs that have all required fields\n(UTXO information, BIP32 derivation information, witness or sig scripts)\nset.\nIf no error is returned, the PSBT is ready to be given to the next signer or\nto be finalized if lnd was the last signer.",
+        "summary": "lncli: `wallet psbt sign`\nSignPsbt expects a partial transaction with all inputs and outputs fully\ndeclared and tries to sign all unsigned inputs that have all required fields\n(UTXO information, BIP32 derivation information, witness or sig scripts)\nset.\nIf no error is returned, the PSBT is ready to be given to the next signer or\nto be finalized if lnd was the last signer.",
         "description": "NOTE: This RPC only signs inputs (and only those it can sign), it does not\nperform any other tasks (such as coin selection, UTXO locking or\ninput/output/fee value validation, PSBT finalization). Any input that is\nincomplete will be skipped.",
         "operationId": "WalletKit_SignPsbt",
         "responses": {
@@ -647,7 +680,7 @@
     },
     "/v2/wallet/sweeps/pending": {
       "get": {
-        "summary": "lncli: `pendingsweeps`\nPendingSweeps returns lists of on-chain outputs that lnd is currently\nattempting to sweep within its central batching engine. Outputs with similar\nfee rates are batched together in order to sweep them within a single\ntransaction.",
+        "summary": "lncli: `wallet pendingsweeps`\nPendingSweeps returns lists of on-chain outputs that lnd is currently\nattempting to sweep within its central batching engine. Outputs with similar\nfee rates are batched together in order to sweep them within a single\ntransaction.",
         "description": "NOTE: Some of the fields within PendingSweepsRequest are not guaranteed to\nremain supported. This is an advanced API that depends on the internals of\nthe UtxoSweeper, so things may change.",
         "operationId": "WalletKit_PendingSweeps",
         "responses": {
@@ -949,6 +982,25 @@
       "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)",
       "title": "`AddressType` has to be one of:"
     },
+    "lnrpcChannelPoint": {
+      "type": "object",
+      "properties": {
+        "funding_txid_bytes": {
+          "type": "string",
+          "format": "byte",
+          "description": "Txid of the funding transaction. When using REST, this field must be\nencoded as base64."
+        },
+        "funding_txid_str": {
+          "type": "string",
+          "description": "Hex-encoded string representing the byte-reversed hash of the funding\ntransaction."
+        },
+        "output_index": {
+          "type": "integer",
+          "format": "int64",
+          "title": "The index of the output of the funding transaction"
+        }
+      }
+    },
     "lnrpcCoinSelectionStrategy": {
       "type": "string",
       "enum": [
@@ -1084,6 +1136,7 @@
         "output_details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcOutputDetail"
           },
           "title": "Outputs that received funds for this transaction"
@@ -1099,6 +1152,7 @@
         "previous_outpoints": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcPreviousOutPoint"
           },
           "description": "PreviousOutpoints/Inputs of this transaction."
@@ -1111,9 +1165,20 @@
         "transactions": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcTransaction"
           },
           "description": "The list of transactions relevant to the wallet."
+        },
+        "last_index": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The index of the last item in the set of returned transactions. This can be\nused to seek further, pagination style."
+        },
+        "first_index": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The index of the last item in the set of returned transactions. This can be\nused to seek backwards, pagination style."
         }
       }
     },
@@ -1151,14 +1216,11 @@
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -1173,6 +1235,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }
@@ -1280,6 +1343,7 @@
         "addresses": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcAddressProperty"
           },
           "description": "List of address, its type internal/external \u0026 balance.\nNote that the order of addresses will be random and not according to the\nderivation index, since that information is not stored by the underlying\nwallet."
@@ -1360,7 +1424,7 @@
         "target_conf": {
           "type": "integer",
           "format": "int64",
-          "description": "Optional. The deadline in number of blocks that the input should be spent\nwithin. When not set, for new inputs, the default value (1008) is used;\nfor existing inputs, their current values will be retained."
+          "description": "Optional. The conf target the underlying fee estimator will use to\nestimate the starting fee rate for the fee function."
         },
         "sat_per_byte": {
           "type": "integer",
@@ -1378,12 +1442,17 @@
         },
         "immediate": {
           "type": "boolean",
-          "description": "Optional. Whether this input will be swept immediately. When set to true,\nthe sweeper will sweep this input without waiting for the next batch."
+          "description": "Optional. Whether this input will be swept immediately. When set to true,\nthe sweeper will sweep this input without waiting for the next block."
         },
         "budget": {
           "type": "string",
           "format": "uint64",
           "description": "Optional. The max amount in sats that can be used as the fees. Setting this\nvalue greater than the input's value may result in CPFP - one or more wallet\nutxos will be used to pay the fees specified by the budget. If not set, for\nnew inputs, by default 50% of the input's value will be treated as the\nbudget for fee bumping; for existing inputs, their current budgets will be\nretained."
+        },
+        "deadline_delta": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Optional. The deadline delta in number of blocks that the output\nshould be spent within. This translates internally to the width of the\nfee function that the sweeper will use to bump the fee rate. When the\ndeadline is reached, ALL the budget will be spent as fees."
         }
       }
     },
@@ -1393,6 +1462,48 @@
         "status": {
           "type": "string",
           "description": "The status of the bump fee operation."
+        }
+      }
+    },
+    "walletrpcBumpForceCloseFeeRequest": {
+      "type": "object",
+      "properties": {
+        "chan_point": {
+          "$ref": "#/definitions/lnrpcChannelPoint",
+          "description": "The channel point which force close transaction we are attempting to\nbump the fee rate for."
+        },
+        "deadline_delta": {
+          "type": "integer",
+          "format": "int64",
+          "title": "Optional. The deadline delta in number of blocks that the anchor output\nshould be spent within to bump the closing transaction. When the\ndeadline is reached, ALL the budget will be spent as fees"
+        },
+        "starting_feerate": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The starting fee rate, expressed in sat/vbyte. This value will be\nused by the sweeper's fee function as its starting fee rate. When not set,\nthe sweeper will use the estimated fee rate using the target_conf as the\nstarting fee rate."
+        },
+        "immediate": {
+          "type": "boolean",
+          "description": "Optional. Whether this cpfp transaction will be triggered immediately. When\nset to true, the sweeper will consider all currently registered sweeps and\ntrigger new batch transactions including the sweeping of the anchor output\nrelated to the selected force close transaction."
+        },
+        "budget": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The max amount in sats that can be used as the fees. For already\nregistered anchor outputs if not set explicitly the old value will be used.\nFor channel force closes which have no HTLCs in their commitment transaction\nthis value has to be set to an appropriate amount to pay for the cpfp\ntransaction of the force closed channel otherwise the fee bumping will fail."
+        },
+        "target_conf": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Optional. The conf target the underlying fee estimator will use to\nestimate the starting fee rate for the fee function."
+        }
+      }
+    },
+    "walletrpcBumpForceCloseFeeResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the force close fee bump operation."
         }
       }
     },
@@ -1475,6 +1586,11 @@
           "format": "uint64",
           "description": "The fee rate, expressed in sat/vbyte, that should be used to spend the\ninput with."
         },
+        "sat_per_kw": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The fee rate, expressed in sat/kWU, that should be used to spend the\ninput with."
+        },
         "account": {
           "type": "string",
           "description": "The name of the account to fund the PSBT with. If empty, the default wallet\naccount is used."
@@ -1495,6 +1611,21 @@
         "coin_selection_strategy": {
           "$ref": "#/definitions/lnrpcCoinSelectionStrategy",
           "description": "The strategy to use for selecting coins during funding the PSBT."
+        },
+        "max_fee_ratio": {
+          "type": "number",
+          "format": "double",
+          "description": "The max fee to total output amount ratio that this psbt should adhere to."
+        },
+        "custom_lock_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The custom lock ID to use for the inputs in the funded PSBT. The value\nif set must be exactly 32 bytes long. If empty, the default lock ID will\nbe used."
+        },
+        "lock_expiration_seconds": {
+          "type": "string",
+          "format": "uint64",
+          "description": "If set, then the inputs in the funded PSBT will be locked for the\nspecified duration. The lock duration is specified in seconds. If not\nset, the default lock duration will be used."
         }
       }
     },
@@ -1514,6 +1645,7 @@
         "locked_utxos": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcUtxoLease"
           },
           "description": "The list of lock leases that were acquired for the inputs in the funded PSBT\npacket. Only inputs added to the PSBT by this RPC are locked, inputs that\nwere already present in the PSBT are not locked."
@@ -1593,7 +1725,13 @@
       }
     },
     "walletrpcImportPublicKeyResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the import operation."
+        }
+      }
     },
     "walletrpcImportTapscriptRequest": {
       "type": "object",
@@ -1665,7 +1803,13 @@
       }
     },
     "walletrpcLabelTransactionResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the label operation."
+        }
+      }
     },
     "walletrpcLeaseOutputRequest": {
       "type": "object",
@@ -1702,6 +1846,7 @@
         "accounts": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcAccount"
           }
         }
@@ -1713,6 +1858,7 @@
         "account_with_addresses": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcAccountWithAddresses"
           },
           "description": "A list of all the accounts and their addresses."
@@ -1725,6 +1871,7 @@
         "locked_utxos": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcUtxoLease"
           },
           "description": "The list of currently leased utxos."
@@ -1771,6 +1918,7 @@
         "utxos": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcUtxo"
           },
           "description": "A list of utxos satisfying the specified number of confirmations."
@@ -1845,6 +1993,11 @@
           "type": "integer",
           "format": "int64",
           "description": "The deadline height used for this output when perform fee bumping."
+        },
+        "maturity_height": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The block height which the input's locktime will expire at. Zero if the\ninput has no locktime."
         }
       }
     },
@@ -1854,6 +2007,7 @@
         "pending_sweeps": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcPendingSweep"
           },
           "description": "The set of outputs currently being swept by lnd's central batching engine."
@@ -1903,7 +2057,13 @@
       }
     },
     "walletrpcReleaseOutputResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the release operation."
+        }
+      }
     },
     "walletrpcRemoveTransactionResponse": {
       "type": "object",
@@ -1935,6 +2095,7 @@
         "outputs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/signrpcTxOut"
           },
           "description": "A slice of the outputs that should be created in the transaction produced."
@@ -2040,6 +2201,7 @@
         "all_leaves": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/walletrpcTapLeaf"
           },
           "description": "The complete, ordered list of all tap leaves of the tree."
@@ -2080,6 +2242,7 @@
         "inputs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcOutPoint"
           },
           "description": "An optional list of inputs to use. Every input must be an UTXO known to the\nwallet that has not been locked before. The sum of all inputs must be\nsufficiently greater than the sum of all outputs to pay a miner fee with the\nfee rate specified in the parent message.\n\nIf no inputs are specified, coin selection will be performed instead and\ninputs of sufficient value will be added to the resulting PSBT."
@@ -2193,10 +2356,17 @@
         "TAPROOT_HTLC_LOCAL_OFFERED_TIMEOUT",
         "TAPROOT_HTLC_ACCEPTED_REMOTE_SUCCESS",
         "TAPROOT_HTLC_ACCEPTED_LOCAL_SUCCESS",
-        "TAPROOT_COMMITMENT_REVOKE"
+        "TAPROOT_COMMITMENT_REVOKE",
+        "TAPROOT_LOCAL_COMMIT_SPEND_FINAL",
+        "TAPROOT_REMOTE_COMMIT_SPEND_FINAL",
+        "TAPROOT_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL_FINAL",
+        "TAPROOT_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL_FINAL",
+        "TAPROOT_HTLC_OFFERED_REMOTE_TIMEOUT_FINAL",
+        "TAPROOT_HTLC_ACCEPTED_REMOTE_SUCCESS_FINAL",
+        "TAPROOT_COMMITMENT_REVOKE_FINAL"
       ],
       "default": "UNKNOWN_WITNESS",
-      "description": " - COMMITMENT_TIME_LOCK: A witness that allows us to spend the output of a commitment transaction\nafter a relative lock-time lockout.\n - COMMITMENT_NO_DELAY: A witness that allows us to spend a settled no-delay output immediately on a\ncounterparty's commitment transaction.\n - COMMITMENT_REVOKE: A witness that allows us to sweep the settled output of a malicious\ncounterparty's who broadcasts a revoked commitment transaction.\n - HTLC_OFFERED_REVOKE: A witness that allows us to sweep an HTLC which we offered to the remote\nparty in the case that they broadcast a revoked commitment state.\n - HTLC_ACCEPTED_REVOKE: A witness that allows us to sweep an HTLC output sent to us in the case that\nthe remote party broadcasts a revoked commitment state.\n - HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness that allows us to sweep an HTLC output that we extended to a\nparty, but was never fulfilled.  This HTLC output isn't directly on the\ncommitment transaction, but is the result of a confirmed second-level HTLC\ntransaction. As a result, we can only spend this after a CSV delay.\n - HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness that allows us to sweep an HTLC output that was offered to us, and\nfor which we have a payment preimage. This HTLC output isn't directly on our\ncommitment transaction, but is the result of confirmed second-level HTLC\ntransaction. As a result, we can only spend this after a CSV delay.\n - HTLC_OFFERED_REMOTE_TIMEOUT: A witness that allows us to sweep an HTLC that we offered to the remote\nparty which lies in the commitment transaction of the remote party. We can\nspend this output after the absolute CLTV timeout of the HTLC as passed.\n - HTLC_ACCEPTED_REMOTE_SUCCESS: A witness that allows us to sweep an HTLC that was offered to us by the\nremote party. We use this witness in the case that the remote party goes to\nchain, and we know the pre-image to the HTLC. We can sweep this without any\nadditional timeout.\n - HTLC_SECOND_LEVEL_REVOKE: A witness that allows us to sweep an HTLC from the remote party's commitment\ntransaction in the case that the broadcast a revoked commitment, but then\nalso immediately attempt to go to the second level to claim the HTLC.\n - WITNESS_KEY_HASH: A witness type that allows us to spend a regular p2wkh output that's sent to\nan output which is under complete control of the backing wallet.\n - NESTED_WITNESS_KEY_HASH: A witness type that allows us to sweep an output that sends to a nested P2SH\nscript that pays to a key solely under our control.\n - COMMITMENT_ANCHOR: A witness type that allows us to spend our anchor on the commitment\ntransaction.\n - COMMITMENT_NO_DELAY_TWEAKLESS: A witness type that is similar to the COMMITMENT_NO_DELAY type,\nbut it omits the tweak that randomizes the key we need to\nspend with a channel peer supplied set of randomness.\n - COMMITMENT_TO_REMOTE_CONFIRMED: A witness type that allows us to spend our output on the counterparty's\ncommitment transaction after a confirmation.\n - HTLC_OFFERED_TIMEOUT_SECOND_LEVEL_INPUT_CONFIRMED: A witness type that allows us to sweep an HTLC output that we extended\nto a party, but was never fulfilled. This _is_ the HTLC output directly\non our commitment transaction, and the input to the second-level HTLC\ntimeout transaction. It can only be spent after CLTV expiry, and\ncommitment confirmation.\n - HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL_INPUT_CONFIRMED: A witness type that allows us to sweep an HTLC output that was offered\nto us, and for which we have a payment preimage. This _is_ the HTLC\noutput directly on our commitment transaction, and the input to the\nsecond-level HTLC success transaction. It can only be spent after the\ncommitment has confirmed.\n - LEASE_COMMITMENT_TIME_LOCK: A witness type that allows us to spend our output on our local\ncommitment transaction after a relative and absolute lock-time lockout as\npart of the script enforced lease commitment type.\n - LEASE_COMMITMENT_TO_REMOTE_CONFIRMED: A witness type that allows us to spend our output on the counterparty's\ncommitment transaction after a confirmation and absolute locktime as part\nof the script enforced lease commitment type.\n - LEASE_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness type that allows us to sweep an HTLC output that we extended\nto a party, but was never fulfilled. This HTLC output isn't directly on\nthe commitment transaction, but is the result of a confirmed second-level\nHTLC transaction. As a result, we can only spend this after a CSV delay\nand CLTV locktime as part of the script enforced lease commitment type.\n - LEASE_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness type that allows us to sweep an HTLC output that was offered\nto us, and for which we have a payment preimage. This HTLC output isn't\ndirectly on our commitment transaction, but is the result of confirmed\nsecond-level HTLC transaction. As a result, we can only spend this after\na CSV delay and CLTV locktime as part of the script enforced lease\ncommitment type.\n - TAPROOT_PUB_KEY_SPEND: A witness type that allows us to spend a regular p2tr output that's sent\nto an output which is under complete control of the backing wallet.\n - TAPROOT_LOCAL_COMMIT_SPEND: A witness type that allows us to spend our settled local commitment after a\nCSV delay when we force close the channel.\n - TAPROOT_REMOTE_COMMIT_SPEND: A witness type that allows us to spend our settled local commitment after\na CSV delay when the remote party has force closed the channel.\n - TAPROOT_ANCHOR_SWEEP_SPEND: A witness type that we'll use for spending our own anchor output.\n - TAPROOT_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness that allows us to timeout an HTLC we offered to the remote party\non our commitment transaction. We use this when we need to go on chain to\ntime out an HTLC.\n - TAPROOT_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness type that allows us to sweep an HTLC we accepted on our commitment\ntransaction after we go to the second level on chain.\n - TAPROOT_HTLC_SECOND_LEVEL_REVOKE: A witness that allows us to sweep an HTLC on the revoked transaction of the\nremote party that goes to the second level.\n - TAPROOT_HTLC_ACCEPTED_REVOKE: A witness that allows us to sweep an HTLC sent to us by the remote party\nin the event that they broadcast a revoked state.\n - TAPROOT_HTLC_OFFERED_REVOKE: A witness that allows us to sweep an HTLC we offered to the remote party if\nthey broadcast a revoked commitment.\n - TAPROOT_HTLC_OFFERED_REMOTE_TIMEOUT: A witness that allows us to sweep an HTLC we offered to the remote party\nthat lies on the commitment transaction for the remote party. We can spend\nthis output after the absolute CLTV timeout of the HTLC as passed.\n - TAPROOT_HTLC_LOCAL_OFFERED_TIMEOUT: A witness type that allows us to sign the second level HTLC timeout\ntransaction when spending from an HTLC residing on our local commitment\ntransaction.\nThis is used by the sweeper to re-sign inputs if it needs to aggregate\nseveral second level HTLCs.\n - TAPROOT_HTLC_ACCEPTED_REMOTE_SUCCESS: A witness that allows us to sweep an HTLC that was offered to us by the\nremote party for a taproot channels. We use this witness in the case that\nthe remote party goes to chain, and we know the pre-image to the HTLC. We\ncan sweep this without any additional timeout.\n - TAPROOT_HTLC_ACCEPTED_LOCAL_SUCCESS: A witness type that allows us to sweep the HTLC offered to us on our local\ncommitment transaction. We'll use this when we need to go on chain to sweep\nthe HTLC. In this case, this is the second level HTLC success transaction.\n - TAPROOT_COMMITMENT_REVOKE: A witness that allows us to sweep the settled output of a malicious\ncounterparty's who broadcasts a revoked taproot commitment transaction."
+      "description": " - COMMITMENT_TIME_LOCK: A witness that allows us to spend the output of a commitment transaction\nafter a relative lock-time lockout.\n - COMMITMENT_NO_DELAY: A witness that allows us to spend a settled no-delay output immediately on a\ncounterparty's commitment transaction.\n - COMMITMENT_REVOKE: A witness that allows us to sweep the settled output of a malicious\ncounterparty's who broadcasts a revoked commitment transaction.\n - HTLC_OFFERED_REVOKE: A witness that allows us to sweep an HTLC which we offered to the remote\nparty in the case that they broadcast a revoked commitment state.\n - HTLC_ACCEPTED_REVOKE: A witness that allows us to sweep an HTLC output sent to us in the case that\nthe remote party broadcasts a revoked commitment state.\n - HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness that allows us to sweep an HTLC output that we extended to a\nparty, but was never fulfilled.  This HTLC output isn't directly on the\ncommitment transaction, but is the result of a confirmed second-level HTLC\ntransaction. As a result, we can only spend this after a CSV delay.\n - HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness that allows us to sweep an HTLC output that was offered to us, and\nfor which we have a payment preimage. This HTLC output isn't directly on our\ncommitment transaction, but is the result of confirmed second-level HTLC\ntransaction. As a result, we can only spend this after a CSV delay.\n - HTLC_OFFERED_REMOTE_TIMEOUT: A witness that allows us to sweep an HTLC that we offered to the remote\nparty which lies in the commitment transaction of the remote party. We can\nspend this output after the absolute CLTV timeout of the HTLC as passed.\n - HTLC_ACCEPTED_REMOTE_SUCCESS: A witness that allows us to sweep an HTLC that was offered to us by the\nremote party. We use this witness in the case that the remote party goes to\nchain, and we know the pre-image to the HTLC. We can sweep this without any\nadditional timeout.\n - HTLC_SECOND_LEVEL_REVOKE: A witness that allows us to sweep an HTLC from the remote party's commitment\ntransaction in the case that the broadcast a revoked commitment, but then\nalso immediately attempt to go to the second level to claim the HTLC.\n - WITNESS_KEY_HASH: A witness type that allows us to spend a regular p2wkh output that's sent to\nan output which is under complete control of the backing wallet.\n - NESTED_WITNESS_KEY_HASH: A witness type that allows us to sweep an output that sends to a nested P2SH\nscript that pays to a key solely under our control.\n - COMMITMENT_ANCHOR: A witness type that allows us to spend our anchor on the commitment\ntransaction.\n - COMMITMENT_NO_DELAY_TWEAKLESS: A witness type that is similar to the COMMITMENT_NO_DELAY type,\nbut it omits the tweak that randomizes the key we need to\nspend with a channel peer supplied set of randomness.\n - COMMITMENT_TO_REMOTE_CONFIRMED: A witness type that allows us to spend our output on the counterparty's\ncommitment transaction after a confirmation.\n - HTLC_OFFERED_TIMEOUT_SECOND_LEVEL_INPUT_CONFIRMED: A witness type that allows us to sweep an HTLC output that we extended\nto a party, but was never fulfilled. This _is_ the HTLC output directly\non our commitment transaction, and the input to the second-level HTLC\ntimeout transaction. It can only be spent after CLTV expiry, and\ncommitment confirmation.\n - HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL_INPUT_CONFIRMED: A witness type that allows us to sweep an HTLC output that was offered\nto us, and for which we have a payment preimage. This _is_ the HTLC\noutput directly on our commitment transaction, and the input to the\nsecond-level HTLC success transaction. It can only be spent after the\ncommitment has confirmed.\n - LEASE_COMMITMENT_TIME_LOCK: A witness type that allows us to spend our output on our local\ncommitment transaction after a relative and absolute lock-time lockout as\npart of the script enforced lease commitment type.\n - LEASE_COMMITMENT_TO_REMOTE_CONFIRMED: A witness type that allows us to spend our output on the counterparty's\ncommitment transaction after a confirmation and absolute locktime as part\nof the script enforced lease commitment type.\n - LEASE_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness type that allows us to sweep an HTLC output that we extended\nto a party, but was never fulfilled. This HTLC output isn't directly on\nthe commitment transaction, but is the result of a confirmed second-level\nHTLC transaction. As a result, we can only spend this after a CSV delay\nand CLTV locktime as part of the script enforced lease commitment type.\n - LEASE_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness type that allows us to sweep an HTLC output that was offered\nto us, and for which we have a payment preimage. This HTLC output isn't\ndirectly on our commitment transaction, but is the result of confirmed\nsecond-level HTLC transaction. As a result, we can only spend this after\na CSV delay and CLTV locktime as part of the script enforced lease\ncommitment type.\n - TAPROOT_PUB_KEY_SPEND: A witness type that allows us to spend a regular p2tr output that's sent\nto an output which is under complete control of the backing wallet.\n - TAPROOT_LOCAL_COMMIT_SPEND: A witness type that allows us to spend our settled local commitment after a\nCSV delay when we force close the channel.\n - TAPROOT_REMOTE_COMMIT_SPEND: A witness type that allows us to spend our settled local commitment after\na CSV delay when the remote party has force closed the channel.\n - TAPROOT_ANCHOR_SWEEP_SPEND: A witness type that we'll use for spending our own anchor output.\n - TAPROOT_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL: A witness that allows us to timeout an HTLC we offered to the remote party\non our commitment transaction. We use this when we need to go on chain to\ntime out an HTLC.\n - TAPROOT_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL: A witness type that allows us to sweep an HTLC we accepted on our commitment\ntransaction after we go to the second level on chain.\n - TAPROOT_HTLC_SECOND_LEVEL_REVOKE: A witness that allows us to sweep an HTLC on the revoked transaction of the\nremote party that goes to the second level.\n - TAPROOT_HTLC_ACCEPTED_REVOKE: A witness that allows us to sweep an HTLC sent to us by the remote party\nin the event that they broadcast a revoked state.\n - TAPROOT_HTLC_OFFERED_REVOKE: A witness that allows us to sweep an HTLC we offered to the remote party if\nthey broadcast a revoked commitment.\n - TAPROOT_HTLC_OFFERED_REMOTE_TIMEOUT: A witness that allows us to sweep an HTLC we offered to the remote party\nthat lies on the commitment transaction for the remote party. We can spend\nthis output after the absolute CLTV timeout of the HTLC as passed.\n - TAPROOT_HTLC_LOCAL_OFFERED_TIMEOUT: A witness type that allows us to sign the second level HTLC timeout\ntransaction when spending from an HTLC residing on our local commitment\ntransaction.\nThis is used by the sweeper to re-sign inputs if it needs to aggregate\nseveral second level HTLCs.\n - TAPROOT_HTLC_ACCEPTED_REMOTE_SUCCESS: A witness that allows us to sweep an HTLC that was offered to us by the\nremote party for a taproot channels. We use this witness in the case that\nthe remote party goes to chain, and we know the pre-image to the HTLC. We\ncan sweep this without any additional timeout.\n - TAPROOT_HTLC_ACCEPTED_LOCAL_SUCCESS: A witness type that allows us to sweep the HTLC offered to us on our local\ncommitment transaction. We'll use this when we need to go on chain to sweep\nthe HTLC. In this case, this is the second level HTLC success transaction.\n - TAPROOT_COMMITMENT_REVOKE: A witness that allows us to sweep the settled output of a malicious\ncounterparty's who broadcasts a revoked taproot commitment transaction.\n - TAPROOT_LOCAL_COMMIT_SPEND_FINAL: A witness type that allows us to spend our settled local commitment after a\nCSV delay when we force close a production taproot channel.\n - TAPROOT_REMOTE_COMMIT_SPEND_FINAL: A witness type that allows us to spend our settled local commitment after\na CSV delay when the remote party has force closed a production taproot\nchannel.\n - TAPROOT_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL_FINAL: A witness that allows us to timeout an HTLC we offered to the remote party\non our production taproot commitment transaction. We use this when we need\nto go on chain to time out an HTLC.\n - TAPROOT_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL_FINAL: A witness type that allows us to sweep an HTLC we accepted on our\nproduction taproot commitment transaction after we go to the second level\non chain.\n - TAPROOT_HTLC_OFFERED_REMOTE_TIMEOUT_FINAL: A witness that allows us to sweep an HTLC we offered to the remote party\nthat lies on the production taproot commitment transaction for the remote\nparty. We can spend this output after the absolute CLTV timeout of the\nHTLC as passed.\n - TAPROOT_HTLC_ACCEPTED_REMOTE_SUCCESS_FINAL: A witness that allows us to sweep an HTLC that was offered to us by the\nremote party for a production taproot channel. We use this witness in the\ncase that the remote party goes to chain, and we know the pre-image to the\nHTLC. We can sweep this without any additional timeout.\n - TAPROOT_COMMITMENT_REVOKE_FINAL: A witness type that allows us to sweep the settled output of a malicious\ncounterparty's who broadcasts a revoked production taproot commitment\ntransaction."
     }
   }
 }

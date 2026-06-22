@@ -1,13 +1,12 @@
 package chanbackup
 
 import (
+	"context"
 	"fmt"
-	"net"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 )
 
 // LiveChannelSource is an interface that allows us to query for the set of
@@ -19,23 +18,14 @@ type LiveChannelSource interface {
 
 	// FetchChannel attempts to locate a live channel identified by the
 	// passed chanPoint. Optionally an existing db tx can be supplied.
-	FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
-		*channeldb.OpenChannel, error)
-}
-
-// AddressSource is an interface that allows us to query for the set of
-// addresses a node can be connected to.
-type AddressSource interface {
-	// AddrsForNode returns all known addresses for the target node public
-	// key.
-	AddrsForNode(nodePub *btcec.PublicKey) ([]net.Addr, error)
+	FetchChannel(chanPoint wire.OutPoint) (*channeldb.OpenChannel, error)
 }
 
 // assembleChanBackup attempts to assemble a static channel backup for the
 // passed open channel. The backup includes all information required to restore
 // the channel, as well as addressing information so we can find the peer and
 // reconnect to them to initiate the protocol.
-func assembleChanBackup(addrSource AddressSource,
+func assembleChanBackup(ctx context.Context, addrSource channeldb.AddrSource,
 	openChan *channeldb.OpenChannel) (*Single, error) {
 
 	log.Debugf("Crafting backup for ChannelPoint(%v)",
@@ -43,9 +33,14 @@ func assembleChanBackup(addrSource AddressSource,
 
 	// First, we'll query the channel source to obtain all the addresses
 	// that are associated with the peer for this channel.
-	nodeAddrs, err := addrSource.AddrsForNode(openChan.IdentityPub)
+	known, nodeAddrs, err := addrSource.AddrsForNode(
+		ctx, openChan.IdentityPub,
+	)
 	if err != nil {
 		return nil, err
+	}
+	if !known {
+		return nil, fmt.Errorf("node unknown by address source")
 	}
 
 	single := NewSingle(openChan, nodeAddrs)
@@ -53,15 +48,58 @@ func assembleChanBackup(addrSource AddressSource,
 	return &single, nil
 }
 
+// buildCloseTxInputs generates inputs needed to force close a channel from
+// an open channel. Anyone having these inputs and the signer, can sign the
+// force closure transaction. Warning! If the channel state updates, an attempt
+// to close the channel using this method with outdated CloseTxInputs can result
+// in loss of funds! This may happen if an outdated channel backup is attempted
+// to be used to force close the channel.
+func buildCloseTxInputs(
+	targetChan *channeldb.OpenChannel) fn.Option[CloseTxInputs] {
+
+	log.Debugf("Crafting CloseTxInputs for ChannelPoint(%v)",
+		targetChan.FundingOutpoint)
+
+	localCommit := targetChan.LocalCommitment
+
+	if localCommit.CommitTx == nil {
+		log.Infof("CommitTx is nil for ChannelPoint(%v), "+
+			"skipping CloseTxInputs. This is possible when "+
+			"DLP is active.", targetChan.FundingOutpoint)
+
+		return fn.None[CloseTxInputs]()
+	}
+
+	// We need unsigned force close tx and the counterparty's signature.
+	inputs := CloseTxInputs{
+		CommitTx:  localCommit.CommitTx,
+		CommitSig: localCommit.CommitSig,
+	}
+
+	// In case of a taproot channel, commit height is needed as well to
+	// produce verification nonce for the taproot channel using shachain.
+	if targetChan.ChanType.IsTaproot() {
+		inputs.CommitHeight = localCommit.CommitHeight
+	}
+
+	// In case of a custom taproot channel, TapscriptRoot is needed as well.
+	if targetChan.ChanType.HasTapscriptRoot() {
+		inputs.TapscriptRoot = targetChan.TapscriptRoot
+	}
+
+	return fn.Some(inputs)
+}
+
 // FetchBackupForChan attempts to create a plaintext static channel backup for
 // the target channel identified by its channel point. If we're unable to find
 // the target channel, then an error will be returned.
-func FetchBackupForChan(chanPoint wire.OutPoint, chanSource LiveChannelSource,
-	addrSource AddressSource) (*Single, error) {
+func FetchBackupForChan(ctx context.Context, chanPoint wire.OutPoint,
+	chanSource LiveChannelSource,
+	addrSource channeldb.AddrSource) (*Single, error) {
 
 	// First, we'll query the channel source to see if the channel is known
 	// and open within the database.
-	targetChan, err := chanSource.FetchChannel(nil, chanPoint)
+	targetChan, err := chanSource.FetchChannel(chanPoint)
 	if err != nil {
 		// If we can't find the channel, then we return with an error,
 		// as we have nothing to  backup.
@@ -70,7 +108,7 @@ func FetchBackupForChan(chanPoint wire.OutPoint, chanSource LiveChannelSource,
 
 	// Once we have the target channel, we can assemble the backup using
 	// the source to obtain any extra information that we may need.
-	staticChanBackup, err := assembleChanBackup(addrSource, targetChan)
+	staticChanBackup, err := assembleChanBackup(ctx, addrSource, targetChan)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create chan backup: %w", err)
 	}
@@ -80,8 +118,8 @@ func FetchBackupForChan(chanPoint wire.OutPoint, chanSource LiveChannelSource,
 
 // FetchStaticChanBackups will return a plaintext static channel back up for
 // all known active/open channels within the passed channel source.
-func FetchStaticChanBackups(chanSource LiveChannelSource,
-	addrSource AddressSource) ([]Single, error) {
+func FetchStaticChanBackups(ctx context.Context, chanSource LiveChannelSource,
+	addrSource channeldb.AddrSource) ([]Single, error) {
 
 	// First, we'll query the backup source for information concerning all
 	// currently open and available channels.
@@ -95,7 +133,7 @@ func FetchStaticChanBackups(chanSource LiveChannelSource,
 	// channel.
 	staticChanBackups := make([]Single, 0, len(openChans))
 	for _, openChan := range openChans {
-		chanBackup, err := assembleChanBackup(addrSource, openChan)
+		chanBackup, err := assembleChanBackup(ctx, addrSource, openChan)
 		if err != nil {
 			return nil, err
 		}

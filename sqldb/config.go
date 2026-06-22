@@ -21,25 +21,73 @@ const (
 // SqliteConfig holds all the config arguments needed to interact with our
 // sqlite DB.
 //
-//nolint:lll
+//nolint:ll
 type SqliteConfig struct {
 	Timeout        time.Duration `long:"timeout" description:"The time after which a database query should be timed out."`
 	BusyTimeout    time.Duration `long:"busytimeout" description:"The maximum amount of time to wait for a database connection to become available for a query."`
 	MaxConnections int           `long:"maxconnections" description:"The maximum number of open connections to the database. Set to zero for unlimited."`
 	PragmaOptions  []string      `long:"pragmaoptions" description:"A list of pragma options to set on a database connection. For example, 'auto_vacuum=incremental'. Note that the flag must be specified multiple times if multiple options are to be set."`
 	SkipMigrations bool          `long:"skipmigrations" description:"Skip applying migrations on startup."`
+	QueryConfig    `group:"query" namespace:"query"`
+}
+
+const (
+	// DefaultSqliteMaxConns is the default number of maximum open
+	// connections for SQLite. SQLite only supports a single writer, so a
+	// low default reduces contention on the busy_timeout and limits
+	// resource usage, especially on mobile.
+	DefaultSqliteMaxConns = 2
+
+	// DefaultSqliteBusyTimeout is the default busy_timeout value used
+	// when no BusyTimeout is configured.
+	DefaultSqliteBusyTimeout = 5 * time.Second
+)
+
+// busyTimeoutMs returns the busy_timeout value in milliseconds. If
+// BusyTimeout is not set, it returns the default value.
+func (s *SqliteConfig) busyTimeoutMs() int64 {
+	if s.BusyTimeout > 0 {
+		return s.BusyTimeout.Milliseconds()
+	}
+
+	return DefaultSqliteBusyTimeout.Milliseconds()
+}
+
+// MaxConns returns the effective maximum number of open connections. If
+// MaxConnections is not set, it returns a default of 2. This low default is
+// chosen because SQLite only supports a single writer, which helps reduce
+// contention and resource usage.
+func (s *SqliteConfig) MaxConns() int {
+	if s.MaxConnections > 0 {
+		return s.MaxConnections
+	}
+
+	return DefaultSqliteMaxConns
+}
+
+// Validate checks that the SqliteConfig values are valid.
+func (p *SqliteConfig) Validate() error {
+	if err := p.QueryConfig.Validate(true); err != nil {
+		return fmt.Errorf("invalid query config: %w", err)
+	}
+
+	return nil
 }
 
 // PostgresConfig holds the postgres database configuration.
 //
-//nolint:lll
+//nolint:ll
 type PostgresConfig struct {
-	Dsn            string        `long:"dsn" description:"Database connection string."`
-	Timeout        time.Duration `long:"timeout" description:"Database connection timeout. Set to zero to disable."`
-	MaxConnections int           `long:"maxconnections" description:"The maximum number of open connections to the database. Set to zero for unlimited."`
-	SkipMigrations bool          `long:"skipmigrations" description:"Skip applying migrations on startup."`
+	Dsn                     string        `long:"dsn" description:"Database connection string."`
+	Timeout                 time.Duration `long:"timeout" description:"Database connection timeout. Set to zero to disable."`
+	MaxConnections          int           `long:"maxconnections" description:"The maximum number of open connections to the database. Set to zero for unlimited."`
+	SkipMigrations          bool          `long:"skipmigrations" description:"Skip applying migrations on startup."`
+	ChannelDBWithGlobalLock bool          `long:"channeldb-with-global-lock" description:"Use a global lock for channeldb access. This ensures only a single writer at a time but reduces concurrency. This is a temporary workaround until the revocation log is migrated to a native sql schema."`
+	WalletDBWithGlobalLock  bool          `long:"walletdb-with-global-lock" description:"Use a global lock for wallet database access. This ensures only a single writer at a time but reduces concurrency. This is a temporary workaround until the wallet subsystem is upgraded to a native sql schema."`
+	QueryConfig             `group:"query" namespace:"query"`
 }
 
+// Validate checks that the PostgresConfig values are valid.
 func (p *PostgresConfig) Validate() error {
 	if p.Dsn == "" {
 		return fmt.Errorf("DSN is required")
@@ -49,6 +97,10 @@ func (p *PostgresConfig) Validate() error {
 	_, err := url.Parse(p.Dsn)
 	if err != nil {
 		return fmt.Errorf("invalid DSN: %w", err)
+	}
+
+	if err := p.QueryConfig.Validate(false); err != nil {
+		return fmt.Errorf("invalid query config: %w", err)
 	}
 
 	return nil

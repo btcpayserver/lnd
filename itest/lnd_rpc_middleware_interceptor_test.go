@@ -13,6 +13,7 @@ import (
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/zpay32"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/macaroon.v2"
 )
@@ -74,6 +75,19 @@ func testRPCMiddlewareInterceptor(ht *lntest.HarnessTest) {
 		middlewareInterceptionTest(
 			tt, alice, bob, registration, readonlyMac,
 			customCaveatReadonlyMac, true,
+		)
+	})
+
+	// Test that multiple read-only middlewares can be registered at the
+	// same time and that both receive intercept messages.
+	//
+	// NOTE: we restart the node here to make sure the old interceptor is
+	// removed from registration.
+	ht.RestartNode(alice)
+	ht.EnsureConnected(alice, bob)
+	ht.Run("multiple read-only middlewares", func(tt *testing.T) {
+		multipleReadOnlyMiddlewareTest(
+			tt, alice, readonlyMac,
 		)
 	})
 
@@ -153,9 +167,13 @@ func testRPCMiddlewareInterceptor(ht *lntest.HarnessTest) {
 	// And finally make sure mandatory middleware is always checked for any
 	// RPC request.
 	ht.Run("mandatory middleware", func(tt *testing.T) {
-		st := ht.Subtest(tt)
-		middlewareMandatoryTest(st, alice)
+		middlewareMandatoryTest(ht, alice)
 	})
+
+	// We now shut down the node manually to prevent the test from failing
+	// because we can't call the stop RPC if we unregister the middleware
+	// in the defer statement above.
+	ht.KillNode(alice)
 }
 
 // middlewareRegistrationRestrictionTests tests all restrictions that apply to
@@ -202,6 +220,62 @@ func middlewareRegistrationRestrictionTests(t *testing.T,
 	}
 }
 
+// multipleReadOnlyMiddlewareTest verifies that multiple read-only middlewares
+// can be registered simultaneously and that both receive intercept messages for
+// the same RPC call.
+func multipleReadOnlyMiddlewareTest(t *testing.T,
+	node *node.HarnessNode, userMac *macaroon.Macaroon) {
+
+	t.Helper()
+
+	ctxb := t.Context()
+	ctxc, cancel := context.WithTimeout(ctxb, defaultTimeout)
+	defer cancel()
+
+	// Register two read-only middlewares with different names.
+	reg1 := registerMiddleware(
+		t, node, &lnrpc.MiddlewareRegistration{
+			MiddlewareName: "itest-readonly-one",
+			ReadOnlyMode:   true,
+		}, true,
+	)
+	defer reg1.cancel()
+
+	reg2 := registerMiddleware(
+		t, node, &lnrpc.MiddlewareRegistration{
+			MiddlewareName: "itest-readonly-two",
+			ReadOnlyMode:   true,
+		}, true,
+	)
+	defer reg2.cancel()
+
+	// Create a client connection to simulate a user request.
+	cleanup, client := macaroonClient(t, node, userMac)
+	defer cleanup()
+
+	// Send a simple RPC request listing all channels to trigger the rpc
+	// interceptors. We need to invoke the intercept logic in a goroutine
+	// because we'd block the execution of the main task otherwise.
+	req := &lnrpc.ListChannelsRequest{ActiveOnly: true}
+	go reg1.interceptUnary(
+		"/lnrpc.Lightning/ListChannels", req, nil, true, false,
+		nil,
+	)
+	go reg2.interceptUnary(
+		"/lnrpc.Lightning/ListChannels", req, nil, true, false,
+		nil,
+	)
+
+	// Do the actual call now and wait for both interceptors to process.
+	resp, err := client.ListChannels(ctxc, req)
+	require.NoError(t, err)
+
+	// Since both middlewares are read-only, they cannot replace the
+	// response. Verify that both received the same response as the client.
+	assertInterceptedType(t, resp, <-reg1.responsesChan)
+	assertInterceptedType(t, resp, <-reg2.responsesChan)
+}
+
 // middlewareInterceptionTest tests that unary and streaming requests can be
 // intercepted. It also makes sure that depending on the mode (read-only or
 // custom macaroon caveat) a middleware only gets access to the requests it
@@ -215,9 +289,21 @@ func middlewareInterceptionTest(t *testing.T,
 
 	// Everything we test here should be executed in a matter of
 	// milliseconds, so we can use one single timeout context for all calls.
-	ctxb := context.Background()
+	ctxb := t.Context()
 	ctxc, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()
+
+	// Add some gRPC metadata pairs to the context that we use for one of
+	// the calls. This is so that we can test that the interceptor does
+	// properly receive the pairs via the interceptor request.
+	requestMetadata := metadata.MD{
+		"itest-metadata-key": []string{"itest-metadata-value"},
+		"itest-metadata-key2": []string{
+			"itest-metadata-value1",
+			"itest-metadata-value2",
+		},
+	}
+	ctxm := metadata.NewOutgoingContext(ctxc, requestMetadata)
 
 	// Create a client connection that we'll use to simulate user requests
 	// to lnd with.
@@ -230,10 +316,11 @@ func middlewareInterceptionTest(t *testing.T,
 	req := &lnrpc.ListChannelsRequest{ActiveOnly: true}
 	go registration.interceptUnary(
 		"/lnrpc.Lightning/ListChannels", req, nil, readOnly, false,
+		requestMetadata,
 	)
 
 	// Do the actual call now and wait for the interceptor to do its thing.
-	resp, err := client.ListChannels(ctxc, req)
+	resp, err := client.ListChannels(ctxm, req)
 	require.NoError(t, err)
 
 	// Did we receive the correct intercept message?
@@ -248,7 +335,7 @@ func middlewareInterceptionTest(t *testing.T,
 	}
 	go registration.interceptUnary(
 		"/lnrpc.Lightning/ListChannels", invalidReq, nil, readOnly,
-		false,
+		false, nil,
 	)
 
 	// Do the actual call now and wait for the interceptor to do its thing.
@@ -354,7 +441,7 @@ func middlewareResponseManipulationTest(t *testing.T,
 
 	// Everything we test here should be executed in a matter of
 	// milliseconds, so we can use one single timeout context for all calls.
-	ctxb := context.Background()
+	ctxb := t.Context()
 	ctxc, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()
 
@@ -380,7 +467,7 @@ func middlewareResponseManipulationTest(t *testing.T,
 	req := &lnrpc.ListChannelsRequest{ActiveOnly: true}
 	go registration.interceptUnary(
 		"/lnrpc.Lightning/ListChannels", req, replacementResponse,
-		readOnly, false,
+		readOnly, false, nil,
 	)
 
 	// Do the actual call now and wait for the interceptor to do its thing.
@@ -404,7 +491,7 @@ func middlewareResponseManipulationTest(t *testing.T,
 	}
 	go registration.interceptUnary(
 		"/lnrpc.Lightning/ListChannels", invalidReq, betterError,
-		readOnly, false,
+		readOnly, false, nil,
 	)
 
 	// Do the actual call now and wait for the interceptor to do its thing.
@@ -471,7 +558,7 @@ func middlewareRequestManipulationTest(t *testing.T, node *node.HarnessNode,
 
 	// Everything we test here should be executed in a matter of
 	// milliseconds, so we can use one single timeout context for all calls.
-	ctxb := context.Background()
+	ctxb := t.Context()
 	ctxc, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()
 
@@ -496,7 +583,7 @@ func middlewareRequestManipulationTest(t *testing.T, node *node.HarnessNode,
 	}
 	go registration.interceptUnary(
 		"/lnrpc.Lightning/AddInvoice", req, replacementRequest,
-		readOnly, true,
+		readOnly, true, nil,
 	)
 
 	// Do the actual call now and wait for the interceptor to do its thing.
@@ -564,7 +651,7 @@ func middlewareMandatoryTest(ht *lntest.HarnessTest, node *node.HarnessNode) {
 	err = node.WaitUntilServerActive()
 	require.NoError(ht, err)
 
-	ctxb := context.Background()
+	ctxb := ht.Context()
 	ctxc, cancel := context.WithTimeout(ctxb, defaultTimeout)
 	defer cancel()
 
@@ -593,11 +680,6 @@ func middlewareMandatoryTest(ht *lntest.HarnessTest, node *node.HarnessNode) {
 	time.Sleep(500 * time.Millisecond)
 	node.RPC.ListChannels(&lnrpc.ListChannelsRequest{})
 	node.RPC.SubscribeInvoices(&lnrpc.InvoiceSubscription{})
-
-	// We now shut down the node manually to prevent the test from failing
-	// because we can't call the stop RPC if we unregister the middleware
-	// in the defer statement above.
-	ht.KillNode(node)
 }
 
 // assertInterceptedType makes sure that the intercept message sent by the RPC
@@ -718,11 +800,27 @@ func registerMiddleware(t *testing.T, node *node.HarnessNode,
 // read from the response channel.
 func (h *middlewareHarness) interceptUnary(methodURI string,
 	expectedRequest proto.Message, responseReplacement interface{},
-	readOnly bool, replaceRequest bool) {
+	readOnly bool, replaceRequest bool, expectedMetadata metadata.MD) {
 
 	// Read intercept message and make sure it's for an RPC request.
 	reqIntercept, err := h.stream.Recv()
 	require.NoError(h.t, err)
+
+	// Check that we have the expected metadata in the request.
+	if len(expectedMetadata) > 0 {
+		require.GreaterOrEqual(
+			h.t, len(reqIntercept.MetadataPairs),
+			len(expectedMetadata),
+		)
+
+		for key := range expectedMetadata {
+			require.Contains(h.t, reqIntercept.MetadataPairs, key)
+			require.Equal(
+				h.t, expectedMetadata[key],
+				reqIntercept.MetadataPairs[key].Values,
+			)
+		}
+	}
 
 	// Make sure the custom condition is populated correctly (if we're using
 	// a macaroon with a custom condition).

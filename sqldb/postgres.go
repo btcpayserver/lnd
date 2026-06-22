@@ -1,6 +1,7 @@
 package sqldb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -9,7 +10,7 @@ import (
 	"time"
 
 	pgx_migrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-	_ "github.com/golang-migrate/migrate/v4/source/file" // Read migrations from files. // nolint:lll
+	_ "github.com/golang-migrate/migrate/v4/source/file" // Read migrations from files. // nolint:ll
 	_ "github.com/jackc/pgx/v5"
 	"github.com/lightningnetwork/lnd/sqldb/sqlc"
 )
@@ -28,10 +29,18 @@ var (
 	// has some differences.
 	postgresSchemaReplacements = map[string]string{
 		"BLOB":                "BYTEA",
-		"INTEGER PRIMARY KEY": "SERIAL PRIMARY KEY",
-		"BIGINT PRIMARY KEY":  "BIGSERIAL PRIMARY KEY",
-		"TIMESTAMP":           "TIMESTAMP WITHOUT TIME ZONE",
+		"INTEGER PRIMARY KEY": "BIGSERIAL PRIMARY KEY",
+		// We need this space in front of the TIMESTAMP keyword to
+		// avoid replacing words which just have the word "TIMESTAMP" in
+		// them.
+		" TIMESTAMP": " TIMESTAMP WITHOUT TIME ZONE",
 	}
+
+	// Make sure PostgresStore implements the MigrationExecutor interface.
+	_ MigrationExecutor = (*PostgresStore)(nil)
+
+	// Make sure PostgresStore implements the DB interface.
+	_ DB = (*PostgresStore)(nil)
 )
 
 // replacePasswordInDSN takes a DSN string and returns it with the password
@@ -92,9 +101,25 @@ func NewPostgresStore(cfg *PostgresConfig) (*PostgresStore, error) {
 	}
 	log.Infof("Using SQL database '%s'", sanitizedDSN)
 
-	rawDB, err := sql.Open("pgx", cfg.Dsn)
+	db, err := sql.Open("pgx", cfg.Dsn)
 	if err != nil {
 		return nil, err
+	}
+
+	// Ensure the migration tracker table exists before running migrations.
+	// This table tracks migration progress and ensures compatibility with
+	// SQLC query generation. If the table is already created by an SQLC
+	// migration, this operation becomes a no-op.
+	migrationTrackerSQL := `
+	CREATE TABLE IF NOT EXISTS migration_tracker (
+		version INTEGER UNIQUE NOT NULL,
+		migration_time TIMESTAMP NOT NULL
+	);`
+
+	_, err = db.Exec(migrationTrackerSQL)
+	if err != nil {
+		return nil, fmt.Errorf("error creating migration tracker: %w",
+			err)
 	}
 
 	maxConns := defaultMaxConns
@@ -102,30 +127,42 @@ func NewPostgresStore(cfg *PostgresConfig) (*PostgresStore, error) {
 		maxConns = cfg.MaxConnections
 	}
 
-	rawDB.SetMaxOpenConns(maxConns)
-	rawDB.SetMaxIdleConns(maxConns)
-	rawDB.SetConnMaxLifetime(connIdleLifetime)
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+	db.SetConnMaxLifetime(connIdleLifetime)
 
-	queries := sqlc.New(rawDB)
+	queries := sqlc.New(db)
 
-	s := &PostgresStore{
+	return &PostgresStore{
 		cfg: cfg,
 		BaseDB: &BaseDB{
-			DB:      rawDB,
+			DB:      db,
 			Queries: queries,
 		},
-	}
+	}, nil
+}
+
+// GetBaseDB returns the underlying BaseDB instance for the Postgres store.
+// It is a trivial helper method to comply with the sqldb.DB interface.
+func (s *PostgresStore) GetBaseDB() *BaseDB {
+	return s.BaseDB
+}
+
+// ApplyAllMigrations applies both the SQLC and custom in-code migrations to the
+// Postgres database.
+func (s *PostgresStore) ApplyAllMigrations(ctx context.Context,
+	migrations []MigrationConfig) error {
 
 	// Execute migrations unless configured to skip them.
-	if !cfg.SkipMigrations {
-		err := s.ExecuteMigrations(TargetLatest)
-		if err != nil {
-			return nil, fmt.Errorf("error executing migrations: %w",
-				err)
-		}
+	if s.cfg.SkipMigrations {
+		return nil
 	}
 
-	return s, nil
+	return ApplyMigrations(ctx, s.BaseDB, s, migrations)
+}
+
+func errPostgresMigration(err error) error {
+	return fmt.Errorf("error creating postgres migration: %w", err)
 }
 
 // ExecuteMigrations runs migrations for the Postgres database, depending on the
@@ -138,7 +175,7 @@ func (s *PostgresStore) ExecuteMigrations(target MigrationTarget) error {
 
 	driver, err := pgx_migrate.WithInstance(s.DB, &pgx_migrate.Config{})
 	if err != nil {
-		return fmt.Errorf("error creating postgres migration: %w", err)
+		return errPostgresMigration(err)
 	}
 
 	// Populate the database with our set of schemas based on our embedded
@@ -147,4 +184,32 @@ func (s *PostgresStore) ExecuteMigrations(target MigrationTarget) error {
 	return applyMigrations(
 		postgresFS, driver, "sqlc/migrations", dbName, target,
 	)
+}
+
+// GetSchemaVersion returns the current schema version of the Postgres database.
+func (s *PostgresStore) GetSchemaVersion() (int, bool, error) {
+	driver, err := pgx_migrate.WithInstance(s.DB, &pgx_migrate.Config{})
+	if err != nil {
+		return 0, false, errPostgresMigration(err)
+
+	}
+
+	version, dirty, err := driver.Version()
+	if err != nil {
+		return 0, false, err
+	}
+
+	return version, dirty, nil
+}
+
+// SetSchemaVersion sets the schema version of the Postgres database.
+//
+// NOTE: This alters the internal database schema tracker. USE WITH CAUTION!!!
+func (s *PostgresStore) SetSchemaVersion(version int, dirty bool) error {
+	driver, err := pgx_migrate.WithInstance(s.DB, &pgx_migrate.Config{})
+	if err != nil {
+		return errPostgresMigration(err)
+	}
+
+	return driver.SetVersion(version, dirty)
 }

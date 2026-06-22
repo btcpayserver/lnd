@@ -6,10 +6,12 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/zpay32"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -89,7 +91,7 @@ func (h *hopHintsConfigMock) FetchChannelEdgesByID(chanID uint64) (
 	policy2, ok := args.Get(2).(*models.ChannelEdgePolicy)
 	require.True(h.t, ok)
 
-	return edgeInfo, policy1, policy2, err
+	return edgeInfo, policy1, policy2, nil
 }
 
 // getTestPubKey returns a valid parsed pub key to be used in our tests.
@@ -305,10 +307,19 @@ var shouldIncludeChannelTestCases = []struct {
 		h.Mock.On(
 			"FetchChannelEdgesByID", mock.Anything,
 		).Once().Return(
-			&models.ChannelEdgeInfo{
-				NodeKey1Bytes: selectedPolicy,
-			},
+			func() *models.ChannelEdgeInfo {
+				edge, err := models.NewV1Channel(
+					0, chainhash.Hash{}, selectedPolicy,
+					route.Vertex{},
+					&models.ChannelV1Fields{},
+				)
+				require.NoError(h.t, err)
+
+				return edge
+			}(),
+			//nolint:ll
 			&models.ChannelEdgePolicy{
+				Version:                   lnwire.GossipVersion1,
 				FeeBaseMSat:               1000,
 				FeeProportionalMillionths: 20,
 				TimeLockDelta:             13,
@@ -355,7 +366,9 @@ var shouldIncludeChannelTestCases = []struct {
 		).Once().Return(
 			&models.ChannelEdgeInfo{},
 			&models.ChannelEdgePolicy{},
+			//nolint:ll
 			&models.ChannelEdgePolicy{
+				Version:                   lnwire.GossipVersion1,
 				FeeBaseMSat:               1000,
 				FeeProportionalMillionths: 20,
 				TimeLockDelta:             13,
@@ -400,7 +413,9 @@ var shouldIncludeChannelTestCases = []struct {
 		).Once().Return(
 			&models.ChannelEdgeInfo{},
 			&models.ChannelEdgePolicy{},
+			//nolint:ll
 			&models.ChannelEdgePolicy{
+				Version:                   lnwire.GossipVersion1,
 				FeeBaseMSat:               1000,
 				FeeProportionalMillionths: 20,
 				TimeLockDelta:             13,

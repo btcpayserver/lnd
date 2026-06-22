@@ -13,10 +13,12 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnencrypt"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
+	"github.com/lightningnetwork/lnd/tor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,6 +37,19 @@ var (
 
 	addr1, _ = net.ResolveTCPAddr("tcp", "10.0.0.2:9000")
 	addr2, _ = net.ResolveTCPAddr("tcp", "10.0.0.3:9000")
+	addr3    = &tor.OnionAddr{
+		OnionService: "3g2upl4pq6kufc4m.onion",
+		Port:         9735,
+	}
+	addr4 = &lnwire.DNSAddress{
+		Hostname: "example.com",
+		Port:     8080,
+	}
+	addr5 = &lnwire.OpaqueAddrs{
+		// The first byte must be an address type we are not yet aware
+		// of for it to be a valid OpaqueAddrs.
+		Payload: []byte{math.MaxUint8, 1, 2, 3, 4},
+	}
 )
 
 func assertSingleEqual(t *testing.T, a, b Single) {
@@ -95,6 +110,29 @@ func assertSingleEqual(t *testing.T, a, b Single) {
 				a.Addresses[i], b.Addresses[i])
 		}
 	}
+
+	// Make sure that CloseTxInputs are present either in both backups,
+	// or in none of them.
+	require.Equal(t, a.CloseTxInputs.IsSome(), b.CloseTxInputs.IsSome())
+
+	if a.CloseTxInputs.IsSome() {
+		// Cache CloseTxInputs into short variables.
+		ai := a.CloseTxInputs.UnwrapOrFail(t)
+		bi := b.CloseTxInputs.UnwrapOrFail(t)
+
+		// Compare serialized unsigned transactions.
+		var abuf, bbuf bytes.Buffer
+		require.NoError(t, ai.CommitTx.Serialize(&abuf))
+		require.NoError(t, bi.CommitTx.Serialize(&bbuf))
+		aBytes := abuf.Bytes()
+		bBytes := bbuf.Bytes()
+		require.Equal(t, aBytes, bBytes)
+
+		// Compare counterparty's signature and commit height.
+		require.Equal(t, ai.CommitSig, bi.CommitSig)
+		require.Equal(t, ai.CommitHeight, bi.CommitHeight)
+		require.Equal(t, ai.TapscriptRoot, bi.TapscriptRoot)
+	}
 }
 
 func genRandomOpenChannelShell() (*channeldb.OpenChannel, error) {
@@ -124,7 +162,7 @@ func genRandomOpenChannelShell() (*channeldb.OpenChannel, error) {
 		isInitiator = true
 	}
 
-	chanType := channeldb.ChannelType(rand.Intn(8))
+	chanType := channeldb.ChannelType(rand.Intn(1 << 12))
 
 	localCfg := channeldb.ChannelConfig{
 		ChannelStateBounds: channeldb.ChannelStateBounds{},
@@ -184,6 +222,29 @@ func genRandomOpenChannelShell() (*channeldb.OpenChannel, error) {
 		},
 	}
 
+	var localCommit channeldb.ChannelCommitment
+	if chanType.IsTaproot() {
+		var commitSig [64]byte
+		if _, err := rand.Read(commitSig[:]); err != nil {
+			return nil, err
+		}
+
+		localCommit = channeldb.ChannelCommitment{
+			CommitTx:     sampleCommitTx,
+			CommitSig:    commitSig[:],
+			CommitHeight: rand.Uint64(),
+		}
+	}
+
+	var tapscriptRootOption fn.Option[chainhash.Hash]
+	if chanType.HasTapscriptRoot() {
+		var tapscriptRoot chainhash.Hash
+		if _, err := rand.Read(tapscriptRoot[:]); err != nil {
+			return nil, err
+		}
+		tapscriptRootOption = fn.Some(tapscriptRoot)
+	}
+
 	return &channeldb.OpenChannel{
 		ChainHash:       chainHash,
 		ChanType:        chanType,
@@ -196,8 +257,59 @@ func genRandomOpenChannelShell() (*channeldb.OpenChannel, error) {
 		IdentityPub:        pub,
 		LocalChanCfg:       localCfg,
 		RemoteChanCfg:      remoteCfg,
+		LocalCommitment:    localCommit,
 		RevocationProducer: shaChainProducer,
+		TapscriptRoot:      tapscriptRootOption,
 	}, nil
+}
+
+// TestVersionEncoding tests encoding and decoding of version byte.
+func TestVersionEncoding(t *testing.T) {
+	cases := []struct {
+		version     SingleBackupVersion
+		hasCloseTx  bool
+		versionByte byte
+	}{
+		{
+			version:     DefaultSingleVersion,
+			hasCloseTx:  false,
+			versionByte: DefaultSingleVersion,
+		},
+		{
+			version:     DefaultSingleVersion,
+			hasCloseTx:  true,
+			versionByte: DefaultSingleVersion | closeTxVersionMask,
+		},
+		{
+			version:     AnchorsCommitVersion,
+			hasCloseTx:  false,
+			versionByte: AnchorsCommitVersion,
+		},
+		{
+			version:     AnchorsCommitVersion,
+			hasCloseTx:  true,
+			versionByte: AnchorsCommitVersion | closeTxVersionMask,
+		},
+	}
+
+	for _, tc := range cases {
+		gotVersionByte := tc.version.Encode(tc.hasCloseTx)
+		require.Equal(t, tc.versionByte, gotVersionByte)
+
+		gotVersion, gotHasCloseTx := DecodeVersion(tc.versionByte)
+		require.Equal(t, tc.version, gotVersion)
+		require.Equal(t, tc.hasCloseTx, gotHasCloseTx)
+	}
+}
+
+var sampleCommitTx = &wire.MsgTx{
+	TxIn: []*wire.TxIn{
+		{PreviousOutPoint: wire.OutPoint{Hash: [32]byte{1}}},
+	},
+	TxOut: []*wire.TxOut{
+		{Value: 1e8, PkScript: []byte("1")},
+		{Value: 2e8, PkScript: []byte("2")},
+	},
 }
 
 // TestSinglePackUnpack tests that we're able to unpack a previously packed
@@ -211,7 +323,9 @@ func TestSinglePackUnpack(t *testing.T) {
 	channel, err := genRandomOpenChannelShell()
 	require.NoError(t, err, "unable to gen open channel")
 
-	singleChanBackup := NewSingle(channel, []net.Addr{addr1, addr2})
+	singleChanBackup := NewSingle(
+		channel, []net.Addr{addr1, addr2, addr3, addr4, addr5},
+	)
 
 	keyRing := &lnencrypt.MockKeyRing{}
 
@@ -219,6 +333,9 @@ func TestSinglePackUnpack(t *testing.T) {
 		// version is the pack/unpack version that we should use to
 		// decode/encode the final SCB.
 		version SingleBackupVersion
+
+		// closeTxInputs is the data needed to produce a force close tx.
+		closeTxInputs fn.Option[CloseTxInputs]
 
 		// valid tests us if this test case should pass or not.
 		valid bool
@@ -250,16 +367,111 @@ func TestSinglePackUnpack(t *testing.T) {
 			valid:   true,
 		},
 
+		// The new taproot channel version should
+		// pack/unpack with no problem.
+		{
+			version: SimpleTaprootVersion,
+			valid:   true,
+		},
+
+		// The new tapscript root channel version should pack/unpack
+		// with no problem.
+		{
+			version: TapscriptRootVersion,
+			valid:   true,
+		},
+
 		// A non-default version, atm this should result in a failure.
 		{
 			version: 99,
 			valid:   false,
+		},
+
+		// Versions with CloseTxInputs.
+		{
+			version: DefaultSingleVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:  sampleCommitTx,
+				CommitSig: []byte("signature"),
+			}),
+			valid: true,
+		},
+		{
+			version: TweaklessCommitVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:  sampleCommitTx,
+				CommitSig: []byte("signature"),
+			}),
+			valid: true,
+		},
+		{
+			version: AnchorsCommitVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:  sampleCommitTx,
+				CommitSig: []byte("signature"),
+			}),
+			valid: true,
+		},
+		{
+			version: ScriptEnforcedLeaseVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:  sampleCommitTx,
+				CommitSig: []byte("signature"),
+			}),
+			valid: true,
+		},
+		{
+			version: SimpleTaprootVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:     sampleCommitTx,
+				CommitSig:    []byte("signature"),
+				CommitHeight: 42,
+			}),
+			valid: true,
+		},
+		{
+			version: TapscriptRootVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:      sampleCommitTx,
+				CommitSig:     []byte("signature"),
+				CommitHeight:  42,
+				TapscriptRoot: fn.Some(chainhash.Hash{1}),
+			}),
+			valid: true,
+		},
+		{
+			version: 99,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:  sampleCommitTx,
+				CommitSig: []byte("signature"),
+			}),
+			valid: false,
+		},
+		{
+			version: 99,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:     sampleCommitTx,
+				CommitSig:    []byte("signature"),
+				CommitHeight: 42,
+			}),
+			valid: false,
+		},
+		{
+			version: TapscriptRootVersion,
+			closeTxInputs: fn.Some(CloseTxInputs{
+				CommitTx:     sampleCommitTx,
+				CommitSig:    []byte("signature"),
+				CommitHeight: 42,
+				// TapscriptRoot is not filled.
+			}),
+			valid: false,
 		},
 	}
 	for i, versionCase := range versionTestCases {
 		// First, we'll re-assign SCB version to what was indicated in
 		// the test case.
 		singleChanBackup.Version = versionCase.version
+		singleChanBackup.CloseTxInputs = versionCase.closeTxInputs
 
 		var b bytes.Buffer
 
@@ -438,7 +650,9 @@ func TestSingleUnconfirmedChannel(t *testing.T) {
 	channel.ShortChannelID.BlockHeight = 0
 	channel.FundingBroadcastHeight = fundingBroadcastHeight
 
-	singleChanBackup := NewSingle(channel, []net.Addr{addr1, addr2})
+	singleChanBackup := NewSingle(
+		channel, []net.Addr{addr1, addr2, addr3, addr4, addr5},
+	)
 	keyRing := &lnencrypt.MockKeyRing{}
 
 	// Pack it and then unpack it again to make sure everything is written

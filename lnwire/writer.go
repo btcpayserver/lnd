@@ -35,6 +35,9 @@ var (
 	// ErrNilOpaqueAddrs is returned when the supplied address is nil.
 	ErrNilOpaqueAddrs = errors.New("cannot write nil OpaqueAddrs")
 
+	// ErrNilDNSAddress is returned when the supplied address is nil.
+	ErrNilDNSAddress = errors.New("cannot write nil DNS address")
+
 	// ErrNilPublicKey is returned when a nil pubkey is used.
 	ErrNilPublicKey = errors.New("cannot write nil pubkey")
 
@@ -331,7 +334,8 @@ func WriteOnionAddr(buf *bytes.Buffer, addr *tor.OnionAddr) error {
 		descriptor  []byte
 	)
 
-	// Decide the suffixIndex and descriptor.
+	// Decide the suffixIndex and descriptor. v2 round-trips for wire
+	// fidelity even though lnd no longer produces it.
 	switch len(addr.OnionService) {
 	case tor.V2Len:
 		descriptor = []byte{byte(v2OnionAddr)}
@@ -362,6 +366,28 @@ func WriteOnionAddr(buf *bytes.Buffer, addr *tor.OnionAddr) error {
 	}
 
 	return WriteUint16(buf, uint16(addr.Port))
+}
+
+// WriteDNSAddress appends the DNS address to the provided buffer.
+func WriteDNSAddress(buf *bytes.Buffer, addr *DNSAddress) error {
+	if addr == nil {
+		return ErrNilDNSAddress
+	}
+
+	// Write the descriptor, the hostname length, and the hostname.
+	if _, err := buf.Write([]byte{byte(dnsAddr)}); err != nil {
+		return err
+	}
+
+	if err := WriteUint8(buf, uint8(len(addr.Hostname))); err != nil {
+		return err
+	}
+
+	if _, err := buf.WriteString(addr.Hostname); err != nil {
+		return err
+	}
+
+	return WriteUint16(buf, addr.Port)
 }
 
 // WriteOpaqueAddrs appends the payload of the given OpaqueAddrs to buffer.
@@ -395,6 +421,10 @@ func WriteNetAddrs(buf *bytes.Buffer, addresses []net.Addr) error {
 			}
 		case *OpaqueAddrs:
 			if err := WriteOpaqueAddrs(addrBuf, a); err != nil {
+				return err
+			}
+		case *DNSAddress:
+			if err := WriteDNSAddress(addrBuf, a); err != nil {
 				return err
 			}
 		default:

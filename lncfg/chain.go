@@ -8,7 +8,7 @@ import (
 
 // Chain holds the configuration options for the daemon's chain settings.
 //
-//nolint:lll
+//nolint:ll
 type Chain struct {
 	Active   bool   `long:"active" description:"DEPRECATED: If the chain should be active or not. This field is now ignored since only the Bitcoin chain is supported" hidden:"true"`
 	ChainDir string `long:"chaindir" description:"The directory to store the chain's data within."`
@@ -17,6 +17,7 @@ type Chain struct {
 
 	MainNet         bool     `long:"mainnet" description:"Use the main network"`
 	TestNet3        bool     `long:"testnet" description:"Use the test network"`
+	TestNet4        bool     `long:"testnet4" description:"Use the testnet4 test network"`
 	SimNet          bool     `long:"simnet" description:"Use the simulation test network"`
 	RegTest         bool     `long:"regtest" description:"Use the regression test network"`
 	SigNet          bool     `long:"signet" description:"Use the signet test network"`
@@ -50,4 +51,10 @@ func (c *Chain) Validate(minTimeLockDelta uint32, minDelay uint16) error {
 	}
 
 	return nil
+}
+
+// IsLocalNetwork returns true if the chain is a local network, such as
+// simnet or regtest.
+func (c *Chain) IsLocalNetwork() bool {
+	return c.SimNet || c.RegTest
 }

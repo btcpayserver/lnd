@@ -8,7 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -64,6 +64,13 @@ type InputSet interface {
 	// StartingFeeRate returns the max starting fee rate found in the
 	// inputs.
 	StartingFeeRate() fn.Option[chainfee.SatPerKWeight]
+
+	// Immediate returns a boolean to indicate whether the tx made from
+	// this input set should be published immediately.
+	//
+	// TODO(yy): create a new method `Params` to combine the informational
+	// methods DeadlineHeight, Budget, StartingFeeRate and Immediate.
+	Immediate() bool
 }
 
 // createWalletTxInput converts a wallet utxo into an object that can be added
@@ -141,7 +148,7 @@ func validateInputs(inputs []SweeperInput, deadlineHeight int32) error {
 	// dedupInputs is a set used to track unique outpoints of the inputs.
 	dedupInputs := fn.NewSet(
 		// Iterate all the inputs and map the function.
-		fn.Map(func(inp SweeperInput) wire.OutPoint {
+		fn.Map(inputs, func(inp SweeperInput) wire.OutPoint {
 			// If the input has a deadline height, we'll check if
 			// it's the same as the specified.
 			inp.params.DeadlineHeight.WhenSome(func(h int32) {
@@ -156,7 +163,7 @@ func validateInputs(inputs []SweeperInput, deadlineHeight int32) error {
 			})
 
 			return inp.OutPoint()
-		}, inputs)...,
+		})...,
 	)
 
 	// Make sure the inputs share the same deadline height when there is
@@ -237,6 +244,28 @@ func (b *BudgetInputSet) addInput(input SweeperInput) {
 	b.inputs = append(b.inputs, &input)
 }
 
+// addWalletInput takes a wallet UTXO and adds it as an input to be used as
+// budget for the input set.
+func (b *BudgetInputSet) addWalletInput(utxo *lnwallet.Utxo) error {
+	input, err := createWalletTxInput(utxo)
+	if err != nil {
+		return err
+	}
+
+	pi := SweeperInput{
+		Input: input,
+		params: Params{
+			DeadlineHeight: fn.Some(b.deadlineHeight),
+		},
+	}
+	b.addInput(pi)
+
+	log.Debugf("Added wallet input to input set: op=%v, amt=%v",
+		pi.OutPoint(), utxo.Value)
+
+	return nil
+}
+
 // NeedWalletInput returns true if the input set needs more wallet inputs.
 //
 // A set may need wallet inputs when it has a required output or its total
@@ -267,7 +296,9 @@ func (b *BudgetInputSet) NeedWalletInput() bool {
 		}
 
 		// Get the amount left after covering the input's own budget.
-		// This amount can then be lent to the above input.
+		// This amount can then be lent to the above input. For a wallet
+		// input, its `Budget` is set to zero, which means the whole
+		// input can be borrowed to cover the budget.
 		budget := inp.params.Budget
 		output := btcutil.Amount(inp.SignDesc().Output.Value)
 		budgetBorrowable += output - budget
@@ -289,11 +320,19 @@ func (b *BudgetInputSet) NeedWalletInput() bool {
 	return budgetBorrowable < budgetNeeded
 }
 
-// copyInputs returns a copy of the slice of the inputs in the set.
-func (b *BudgetInputSet) copyInputs() []*SweeperInput {
-	inputs := make([]*SweeperInput, len(b.inputs))
-	copy(inputs, b.inputs)
-	return inputs
+// hasNormalInput return a bool to indicate whether there exists an input that
+// doesn't require a TxOut. When an input has no required outputs, it's either a
+// wallet input, or an input we want to sweep.
+func (b *BudgetInputSet) hasNormalInput() bool {
+	for _, inp := range b.inputs {
+		if inp.RequiredTxOut() != nil {
+			continue
+		}
+
+		return true
+	}
+
+	return false
 }
 
 // AddWalletInputs adds wallet inputs to the set until the specified budget is
@@ -328,28 +367,12 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 		return utxos[i].Value < utxos[j].Value
 	})
 
-	// Make a copy of the current inputs. If the wallet doesn't have enough
-	// utxos to cover the budget, we will revert the current set to its
-	// original state by removing the added wallet inputs.
-	originalInputs := b.copyInputs()
-
 	// Add wallet inputs to the set until the specified budget is covered.
 	for _, utxo := range utxos {
-		input, err := createWalletTxInput(utxo)
+		err := b.addWalletInput(utxo)
 		if err != nil {
 			return err
 		}
-
-		pi := SweeperInput{
-			Input: input,
-			params: Params{
-				DeadlineHeight: fn.Some(b.deadlineHeight),
-			},
-		}
-		b.addInput(pi)
-
-		log.Debugf("Added wallet input to input set: op=%v, amt=%v",
-			pi.OutPoint(), utxo.Value)
 
 		// Return if we've reached the minimum output amount.
 		if !b.NeedWalletInput() {
@@ -357,11 +380,22 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 		}
 	}
 
-	// The wallet doesn't have enough utxos to cover the budget. Revert the
-	// input set to its original state.
-	b.inputs = originalInputs
+	// Exit if there are no inputs can contribute to the fees.
+	if !b.hasNormalInput() {
+		return ErrNotEnoughInputs
+	}
 
-	return ErrNotEnoughInputs
+	// If there's at least one input that can contribute to fees, we allow
+	// the sweep to continue, even though the full budget can't be met.
+	// Maybe later more wallet inputs will become available and we can add
+	// them if needed.
+	budget := b.Budget()
+	total, spendable := b.inputAmts()
+	log.Warnf("Not enough wallet UTXOs: need budget=%v, has spendable=%v, "+
+		"total=%v, missing at least %v, sweeping anyway...", budget,
+		spendable, total, budget-spendable)
+
+	return nil
 }
 
 // Budget returns the total budget of the set.
@@ -397,6 +431,28 @@ func (b *BudgetInputSet) Inputs() []input.Input {
 	return inputs
 }
 
+// inputAmts returns two values for the set - the total input amount, and the
+// spendable amount. Only the spendable amount can be used to pay the fees.
+func (b *BudgetInputSet) inputAmts() (btcutil.Amount, btcutil.Amount) {
+	var (
+		totalAmt     btcutil.Amount
+		spendableAmt btcutil.Amount
+	)
+
+	for _, inp := range b.inputs {
+		output := btcutil.Amount(inp.SignDesc().Output.Value)
+		totalAmt += output
+
+		if inp.RequiredTxOut() != nil {
+			continue
+		}
+
+		spendableAmt += output
+	}
+
+	return totalAmt, spendableAmt
+}
+
 // StartingFeeRate returns the max starting fee rate found in the inputs.
 //
 // NOTE: part of the InputSet interface.
@@ -413,4 +469,19 @@ func (b *BudgetInputSet) StartingFeeRate() fn.Option[chainfee.SatPerKWeight] {
 	}
 
 	return startingFeeRate
+}
+
+// Immediate returns whether the inputs should be swept immediately.
+//
+// NOTE: part of the InputSet interface.
+func (b *BudgetInputSet) Immediate() bool {
+	for _, inp := range b.inputs {
+		// As long as one of the inputs is immediate, the whole set is
+		// immediate.
+		if inp.params.Immediate {
+			return true
+		}
+	}
+
+	return false
 }

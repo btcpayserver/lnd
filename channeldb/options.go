@@ -1,8 +1,6 @@
 package channeldb
 
 import (
-	"time"
-
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/kvdb"
 )
@@ -28,36 +26,31 @@ const (
 // OptionalMiragtionConfig defines the flags used to signal whether a
 // particular migration needs to be applied.
 type OptionalMiragtionConfig struct {
-	// PruneRevocationLog specifies that the revocation log migration needs
-	// to be applied.
-	PruneRevocationLog bool
+	// MigrationFlags is an array of booleans indicating which optional
+	// migrations should be run. The index in the array corresponds to the
+	// migration number in optionalVersions.
+	MigrationFlags []bool
+
+	// DecayedLog is a reference to the decayed log database. The channeldb
+	// is inherently part of the optional migration flow so there is no need
+	// to specify it here. The DecayedLog is a separate database in case the
+	// kvdb backend is set to `bbolt`. And also for the kvdb SQL backend
+	// case it is a separate table therefore we need to reference it here
+	// as well to use the right query to access the decayed log.
+	DecayedLog kvdb.Backend
+}
+
+// NewOptionalMiragtionConfig creates a new OptionalMiragtionConfig with the
+// default migration flags.
+func NewOptionalMiragtionConfig() OptionalMiragtionConfig {
+	return OptionalMiragtionConfig{
+		MigrationFlags: make([]bool, len(optionalVersions)),
+	}
 }
 
 // Options holds parameters for tuning and customizing a channeldb.DB.
 type Options struct {
-	kvdb.BoltBackendConfig
 	OptionalMiragtionConfig
-
-	// RejectCacheSize is the maximum number of rejectCacheEntries to hold
-	// in the rejection cache.
-	RejectCacheSize int
-
-	// ChannelCacheSize is the maximum number of ChannelEdges to hold in the
-	// channel cache.
-	ChannelCacheSize int
-
-	// BatchCommitInterval is the maximum duration the batch schedulers will
-	// wait before attempting to commit a pending set of updates.
-	BatchCommitInterval time.Duration
-
-	// PreAllocCacheNumNodes is the number of nodes we expect to be in the
-	// graph cache, so we can pre-allocate the map accordingly.
-	PreAllocCacheNumNodes int
-
-	// UseGraphCache denotes whether the in-memory graph cache should be
-	// used or a fallback version that uses the underlying database for
-	// path finding.
-	UseGraphCache bool
 
 	// NoMigration specifies that underlying backend was opened in read-only
 	// mode and migrations shouldn't be performed. This can be useful for
@@ -75,29 +68,25 @@ type Options struct {
 	// database if set to true.
 	dryRun bool
 
-	// keepFailedPaymentAttempts determines whether failed htlc attempts
-	// are kept on disk or removed to save space.
-	keepFailedPaymentAttempts bool
-
 	// storeFinalHtlcResolutions determines whether to persistently store
 	// the final resolution of incoming htlcs.
 	storeFinalHtlcResolutions bool
+
+	// tombstoneClosedChannels, when true, instructs CloseChannel to skip
+	// the cascading deletion of nested per-channel state and rely on the
+	// outpoint-index flip to mark the channel as closed. KV-over-SQL
+	// backends (sqlite, postgres) opt in because nested-bucket deletes
+	// inside a write transaction translate into a long-running
+	// ON DELETE CASCADE that holds the database write-lock for many
+	// seconds on long-lived channels. bbolt and etcd leave this off; the
+	// synchronous delete is already cheap there.
+	tombstoneClosedChannels bool
 }
 
 // DefaultOptions returns an Options populated with default values.
 func DefaultOptions() Options {
 	return Options{
-		BoltBackendConfig: kvdb.BoltBackendConfig{
-			NoFreelistSync:    true,
-			AutoCompact:       false,
-			AutoCompactMinAge: kvdb.DefaultBoltAutoCompactMinAge,
-			DBTimeout:         kvdb.DefaultDBTimeout,
-		},
-		OptionalMiragtionConfig: OptionalMiragtionConfig{},
-		RejectCacheSize:         DefaultRejectCacheSize,
-		ChannelCacheSize:        DefaultChannelCacheSize,
-		PreAllocCacheNumNodes:   DefaultPreAllocCacheNumNodes,
-		UseGraphCache:           true,
+		OptionalMiragtionConfig: NewOptionalMiragtionConfig(),
 		NoMigration:             false,
 		clock:                   clock.NewDefaultClock(),
 	}
@@ -106,69 +95,11 @@ func DefaultOptions() Options {
 // OptionModifier is a function signature for modifying the default Options.
 type OptionModifier func(*Options)
 
-// OptionSetRejectCacheSize sets the RejectCacheSize to n.
-func OptionSetRejectCacheSize(n int) OptionModifier {
-	return func(o *Options) {
-		o.RejectCacheSize = n
-	}
-}
-
-// OptionSetChannelCacheSize sets the ChannelCacheSize to n.
-func OptionSetChannelCacheSize(n int) OptionModifier {
-	return func(o *Options) {
-		o.ChannelCacheSize = n
-	}
-}
-
-// OptionSetPreAllocCacheNumNodes sets the PreAllocCacheNumNodes to n.
-func OptionSetPreAllocCacheNumNodes(n int) OptionModifier {
-	return func(o *Options) {
-		o.PreAllocCacheNumNodes = n
-	}
-}
-
-// OptionSetUseGraphCache sets the UseGraphCache option to the given value.
-func OptionSetUseGraphCache(use bool) OptionModifier {
-	return func(o *Options) {
-		o.UseGraphCache = use
-	}
-}
-
 // OptionNoRevLogAmtData sets the NoRevLogAmtData option to the given value. If
 // it is set to true then amount data will not be stored in the revocation log.
 func OptionNoRevLogAmtData(noAmtData bool) OptionModifier {
 	return func(o *Options) {
 		o.NoRevLogAmtData = noAmtData
-	}
-}
-
-// OptionSetSyncFreelist allows the database to sync its freelist.
-func OptionSetSyncFreelist(b bool) OptionModifier {
-	return func(o *Options) {
-		o.NoFreelistSync = !b
-	}
-}
-
-// OptionAutoCompact turns on automatic database compaction on startup.
-func OptionAutoCompact() OptionModifier {
-	return func(o *Options) {
-		o.AutoCompact = true
-	}
-}
-
-// OptionAutoCompactMinAge sets the minimum age for automatic database
-// compaction.
-func OptionAutoCompactMinAge(minAge time.Duration) OptionModifier {
-	return func(o *Options) {
-		o.AutoCompactMinAge = minAge
-	}
-}
-
-// OptionSetBatchCommitInterval sets the batch commit interval for the internval
-// batch schedulers.
-func OptionSetBatchCommitInterval(interval time.Duration) OptionModifier {
-	return func(o *Options) {
-		o.BatchCommitInterval = interval
 	}
 }
 
@@ -195,14 +126,6 @@ func OptionDryRunMigration(dryRun bool) OptionModifier {
 	}
 }
 
-// OptionKeepFailedPaymentAttempts controls whether failed payment attempts are
-// kept on disk after a payment settles.
-func OptionKeepFailedPaymentAttempts(keepFailedPaymentAttempts bool) OptionModifier {
-	return func(o *Options) {
-		o.keepFailedPaymentAttempts = keepFailedPaymentAttempts
-	}
-}
-
 // OptionStoreFinalHtlcResolutions controls whether to persistently store the
 // final resolution of incoming htlcs.
 func OptionStoreFinalHtlcResolutions(
@@ -217,6 +140,35 @@ func OptionStoreFinalHtlcResolutions(
 // revocation logs needs to be applied or not.
 func OptionPruneRevocationLog(prune bool) OptionModifier {
 	return func(o *Options) {
-		o.OptionalMiragtionConfig.PruneRevocationLog = prune
+		o.OptionalMiragtionConfig.MigrationFlags[0] = prune
+	}
+}
+
+// OptionWithDecayedLogDB sets the decayed log database reference which might
+// be used for some migrations because generally we only touch the channeldb
+// databases in the migrations, this is a way to allow also access to the
+// decayed log database.
+func OptionWithDecayedLogDB(decayedLog kvdb.Backend) OptionModifier {
+	return func(o *Options) {
+		o.OptionalMiragtionConfig.DecayedLog = decayedLog
+	}
+}
+
+// OptionGcDecayedLog specifies whether the decayed log migration has to
+// take place.
+func OptionGcDecayedLog(noGc bool) OptionModifier {
+	return func(o *Options) {
+		o.OptionalMiragtionConfig.MigrationFlags[1] = !noGc
+	}
+}
+
+// OptionTombstoneClosedChannels controls whether CloseChannel skips the
+// cascading deletion of nested per-channel state and relies on the
+// outpoint-index flip to mark the channel as closed. Set this to true on
+// KV-over-SQL backends (sqlite, postgres); leave it false for bbolt and
+// etcd.
+func OptionTombstoneClosedChannels(enabled bool) OptionModifier {
+	return func(o *Options) {
+		o.tombstoneClosedChannels = enabled
 	}
 }

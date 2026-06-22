@@ -1,6 +1,8 @@
 package lnmock
 
 import (
+	"context"
+
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -18,7 +20,7 @@ type MockChain struct {
 // Compile-time constraint to ensure MockChain implements the Chain interface.
 var _ chain.Interface = (*MockChain)(nil)
 
-func (m *MockChain) Start() error {
+func (m *MockChain) Start(_ context.Context) error {
 	args := m.Called()
 
 	return args.Error(0)
@@ -72,6 +74,18 @@ func (m *MockChain) GetBlockHeader(hash *chainhash.Hash) (
 	}
 
 	return args.Get(0).(*wire.BlockHeader), args.Error(1)
+}
+
+func (m *MockChain) GetUtxo(op *wire.OutPoint, pkScript []byte,
+	heightHint uint32, cancel <-chan struct{}) (*wire.TxOut, error) {
+
+	args := m.Called(op, pkScript, heightHint, cancel)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*wire.TxOut), args.Error(1)
 }
 
 func (m *MockChain) IsCurrent() bool {

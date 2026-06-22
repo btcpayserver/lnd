@@ -171,6 +171,16 @@ const (
 	// sender-generated preimages according to BOLT XX.
 	AMPOptional FeatureBit = 31
 
+	// QuiescenceRequired is a required feature bit that denotes that a
+	// connection established with this node must support the quiescence
+	// protocol if it wants to have a channel relationship.
+	QuiescenceRequired FeatureBit = 34
+
+	// QuiescenceOptional is an optional feature bit that denotes that a
+	// connection established with this node is permitted to use the
+	// quiescence protocol.
+	QuiescenceOptional FeatureBit = 35
+
 	// ExplicitChannelTypeRequired is a required bit that denotes that a
 	// connection established with this node is to use explicit channel
 	// commitment types for negotiation instead of the existing implicit
@@ -223,6 +233,22 @@ const (
 	// able and willing to accept keysend payments.
 	KeysendOptional = 55
 
+	// RbfCoopCloseRequired is a required feature bit that signals that
+	// the new RBF-based co-op close protocol is supported.
+	RbfCoopCloseRequired = 60
+
+	// RbfCoopCloseOptional is an optional feature bit that signals that the
+	// new RBF-based co-op close protocol is supported.
+	RbfCoopCloseOptional = 61
+
+	// RbfCoopCloseRequiredStaging is a required feature bit that signals
+	// that the new RBF-based co-op close protocol is supported.
+	RbfCoopCloseRequiredStaging = 160
+
+	// RbfCoopCloseOptionalStaging is an optional feature bit that signals
+	// that the new RBF-based co-op close protocol is supported.
+	RbfCoopCloseOptionalStaging = 161
+
 	// ScriptEnforcedLeaseRequired is a required feature bit that signals
 	// that the node requires channels having zero-fee second-level HTLC
 	// transactions, which also imply anchor commitments, along with an
@@ -263,6 +289,16 @@ const (
 	// being finalized.
 	SimpleTaprootChannelsOptionalStaging = 181
 
+	// ExperimentalAccountabilityRequired is a required feature bit that
+	// indicates that the node will relay experimental accountability
+	// signals.
+	ExperimentalAccountabilityRequired FeatureBit = 260
+
+	// ExperimentalAccountabilityOptional is an optional feature bit that
+	// indicates that the node will relay experimental accountability
+	// signals.
+	ExperimentalAccountabilityOptional FeatureBit = 261
+
 	// Bolt11BlindedPathsRequired is a required feature bit that indicates
 	// that the node is able to understand the blinded path tagged field in
 	// a BOLT 11 invoice.
@@ -281,12 +317,20 @@ const (
 	// support for the special custom taproot overlay channel.
 	SimpleTaprootOverlayChansRequired = 2026
 
+	// OnionMessagesRequired is a required feature bit that indicates that
+	// the node can forward onion messages.
+	OnionMessagesRequired = 38
+
+	// OnionMessagesOptional is an optional feature bit that indicates
+	// that the node can forward onion messages.
+	OnionMessagesOptional = 39
+
 	// MaxBolt11Feature is the maximum feature bit value allowed in bolt 11
 	// invoices.
 	//
 	// The base 32 encoded tagged fields in invoices are limited to 10 bits
 	// to express the length of the field's data.
-	//nolint:lll
+	//nolint:ll
 	// See: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md#tagged-fields
 	//
 	// With a maximum length field of 1023 (2^10 -1) and 5 bit encoding,
@@ -327,6 +371,8 @@ var Features = map[FeatureBit]string{
 	WumboChannelsOptional:                "wumbo-channels",
 	AMPRequired:                          "amp",
 	AMPOptional:                          "amp",
+	QuiescenceRequired:                   "quiescence",
+	QuiescenceOptional:                   "quiescence",
 	PaymentMetadataOptional:              "payment-metadata",
 	PaymentMetadataRequired:              "payment-metadata",
 	ExplicitChannelTypeOptional:          "explicit-commitment-type",
@@ -349,8 +395,16 @@ var Features = map[FeatureBit]string{
 	SimpleTaprootChannelsOptionalStaging: "simple-taproot-chans-x",
 	SimpleTaprootOverlayChansOptional:    "taproot-overlay-chans",
 	SimpleTaprootOverlayChansRequired:    "taproot-overlay-chans",
+	ExperimentalAccountabilityRequired:   "accountable-x",
+	ExperimentalAccountabilityOptional:   "accountable-x",
 	Bolt11BlindedPathsOptional:           "bolt-11-blinded-paths",
 	Bolt11BlindedPathsRequired:           "bolt-11-blinded-paths",
+	RbfCoopCloseOptional:                 "rbf-coop-close",
+	RbfCoopCloseRequired:                 "rbf-coop-close",
+	RbfCoopCloseOptionalStaging:          "rbf-coop-close-x",
+	RbfCoopCloseRequiredStaging:          "rbf-coop-close-x",
+	OnionMessagesOptional:                "onion-messages",
+	OnionMessagesRequired:                "onion-messages",
 }
 
 // RawFeatureVector represents a set of feature bits as defined in BOLT-09.  A
@@ -404,7 +458,7 @@ func (fv RawFeatureVector) Equals(other *RawFeatureVector) bool {
 	return true
 }
 
-// Merges sets all feature bits in other on the receiver's feature vector.
+// Merge sets all feature bits in other on the receiver's feature vector.
 func (fv *RawFeatureVector) Merge(other *RawFeatureVector) error {
 	for bit := range other.features {
 		err := fv.SafeSet(bit)
@@ -652,31 +706,39 @@ func (fv *RawFeatureVector) sizeFunc() uint64 {
 // Record returns a TLV record that can be used to encode/decode raw feature
 // vectors. Note that the length of the feature vector is not included, because
 // it is covered by the TLV record's length field.
-func (fv *RawFeatureVector) Record(recordType tlv.Type) tlv.Record {
+func (fv *RawFeatureVector) Record() tlv.Record {
 	return tlv.MakeDynamicRecord(
-		recordType, fv, fv.sizeFunc, rawFeatureEncoder,
-		rawFeatureDecoder,
+		0, fv, fv.sizeFunc, rawFeatureEncoder, rawFeatureDecoder,
 	)
 }
 
 // rawFeatureEncoder is a custom TLV encoder for raw feature vectors.
 func rawFeatureEncoder(w io.Writer, val interface{}, _ *[8]byte) error {
-	if f, ok := val.(*RawFeatureVector); ok {
-		return f.encode(w, f.SerializeSize(), 8)
+	if v, ok := val.(*RawFeatureVector); ok {
+		// Encode the feature bits as a byte slice without its length
+		// prepended, as that's already taken care of by the TLV record.
+		fv := *v
+		return fv.encode(w, fv.SerializeSize(), 8)
 	}
 
-	return tlv.NewTypeForEncodingErr(val, "*lnwire.RawFeatureVector")
+	return tlv.NewTypeForEncodingErr(val, "lnwire.RawFeatureVector")
 }
 
 // rawFeatureDecoder is a custom TLV decoder for raw feature vectors.
 func rawFeatureDecoder(r io.Reader, val interface{}, _ *[8]byte,
 	l uint64) error {
 
-	if f, ok := val.(*RawFeatureVector); ok {
-		return f.decode(r, int(l), 8)
+	if v, ok := val.(*RawFeatureVector); ok {
+		fv := NewRawFeatureVector()
+		if err := fv.decode(r, int(l), 8); err != nil {
+			return err
+		}
+		*v = *fv
+
+		return nil
 	}
 
-	return tlv.NewTypeForEncodingErr(val, "*lnwire.RawFeatureVector")
+	return tlv.NewTypeForEncodingErr(val, "lnwire.RawFeatureVector")
 }
 
 // FeatureVector represents a set of enabled features. The set stores

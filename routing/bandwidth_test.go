@@ -1,13 +1,15 @@
 package routing
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
@@ -139,18 +141,19 @@ type mockTrafficShaper struct{}
 // by the provided channel ID may have external mechanisms that would
 // allow it to carry out the payment.
 func (*mockTrafficShaper) ShouldHandleTraffic(_ lnwire.ShortChannelID,
-	_ fn.Option[tlv.Blob]) (bool, error) {
+	_, _ fn.Option[tlv.Blob]) (bool, error) {
 
 	return true, nil
 }
 
-// PaymentBandwidth returns the available bandwidth for a custom channel
-// decided by the given channel aux blob and HTLC blob. A return value
-// of 0 means there is no bandwidth available. To find out if a channel
-// is a custom channel that should be handled by the traffic shaper, the
-// HandleTraffic method should be called first.
-func (*mockTrafficShaper) PaymentBandwidth(_, _ fn.Option[tlv.Blob],
-	linkBandwidth, _ lnwire.MilliSatoshi) (lnwire.MilliSatoshi, error) {
+// PaymentBandwidth returns the available bandwidth for a custom channel decided
+// by the given channel funding/commitment aux blob and HTLC blob. A return
+// value of 0 means there is no bandwidth available. To find out if a channel is
+// a custom channel that should be handled by the traffic shaper, the
+// ShouldHandleTraffic method should be called first.
+func (*mockTrafficShaper) PaymentBandwidth(_, _, _ fn.Option[tlv.Blob],
+	linkBandwidth, _ lnwire.MilliSatoshi,
+	_ lnwallet.AuxHtlcView, _ route.Vertex) (lnwire.MilliSatoshi, error) {
 
 	return linkBandwidth, nil
 }
@@ -159,8 +162,12 @@ func (*mockTrafficShaper) PaymentBandwidth(_, _ fn.Option[tlv.Blob],
 // data blob of an HTLC, may produce a different blob or modify the
 // amount of bitcoin this htlc should carry.
 func (*mockTrafficShaper) ProduceHtlcExtraData(totalAmount lnwire.MilliSatoshi,
-	_ lnwire.CustomRecords) (lnwire.MilliSatoshi, lnwire.CustomRecords,
-	error) {
+	_ lnwire.CustomRecords, _ route.Vertex) (lnwire.MilliSatoshi,
+	lnwire.CustomRecords, error) {
 
 	return totalAmount, nil, nil
+}
+
+func (*mockTrafficShaper) IsCustomHTLC(_ lnwire.CustomRecords) bool {
+	return false
 }

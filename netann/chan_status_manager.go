@@ -1,6 +1,7 @@
 package netann
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -60,7 +62,7 @@ type ChanStatusConfig struct {
 	// ApplyChannelUpdate processes new ChannelUpdates signed by our node by
 	// updating our local routing table and broadcasting the update to our
 	// peers.
-	ApplyChannelUpdate func(*lnwire.ChannelUpdate, *wire.OutPoint,
+	ApplyChannelUpdate func(*lnwire.ChannelUpdate1, *wire.OutPoint,
 		bool) error
 
 	// DB stores the set of channels that are to be monitored.
@@ -195,7 +197,7 @@ func (m *ChanStatusManager) start() error {
 		// have been pruned from the channel graph but not yet from our
 		// set of channels. We'll skip it as we can't determine its
 		// initial state.
-		case errors.Is(err, channeldb.ErrEdgeNotFound):
+		case errors.Is(err, graphdb.ErrEdgeNotFound):
 			log.Warnf("Unable to find channel policies for %v, "+
 				"skipping. This is typical if the channel is "+
 				"in the process of closing.", c.FundingOutpoint)
@@ -580,7 +582,7 @@ func (m *ChanStatusManager) disableInactiveChannels() {
 			// that the channel has been closed. Thus we remove the
 			// outpoint from the set of tracked outpoints to prevent
 			// further attempts.
-			if errors.Is(err, channeldb.ErrEdgeNotFound) {
+			if errors.Is(err, graphdb.ErrEdgeNotFound) {
 				log.Debugf("Removing channel(%v) from "+
 					"consideration for passive disabling",
 					outpoint)
@@ -650,10 +652,12 @@ func (m *ChanStatusManager) signAndSendNextUpdate(outpoint wire.OutPoint,
 // in case our ChannelEdgePolicy is not found in the database. Also returns if
 // the channel is private by checking AuthProof for nil.
 func (m *ChanStatusManager) fetchLastChanUpdateByOutPoint(op wire.OutPoint) (
-	*lnwire.ChannelUpdate, bool, error) {
+	*lnwire.ChannelUpdate1, bool, error) {
 
 	// Get the edge info and policies for this channel from the graph.
-	info, edge1, edge2, err := m.cfg.Graph.FetchChannelEdgesByOutpoint(&op)
+	info, edge1, edge2, err := m.cfg.Graph.FetchChannelEdgesByOutpoint(
+		context.TODO(), &op,
+	)
 	if err != nil {
 		return nil, false, err
 	}

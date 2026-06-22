@@ -4,6 +4,7 @@
 package peersrpc
 
 import (
+	"context"
 	"net"
 
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -18,7 +19,7 @@ import (
 type Config struct {
 	// GetNodeAnnouncement is used to send our retrieve the current
 	// node announcement information.
-	GetNodeAnnouncement func() lnwire.NodeAnnouncement
+	GetNodeAnnouncement func() lnwire.NodeAnnouncement1
 
 	// ParseAddr parses an address from its string format to a net.Addr.
 	ParseAddr func(addr string) (net.Addr, error)
@@ -27,6 +28,7 @@ type Config struct {
 	// setting the feature vector provided and applying the
 	// NodeAnnModifiers. If no feature updates are required, a nil feature
 	// vector should be provided.
-	UpdateNodeAnnouncement func(features *lnwire.RawFeatureVector,
+	UpdateNodeAnnouncement func(ctx context.Context,
+		features *lnwire.RawFeatureVector,
 		mods ...netann.NodeAnnModifier) error
 }

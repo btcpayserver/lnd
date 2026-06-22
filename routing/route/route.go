@@ -94,6 +94,32 @@ func (v Vertex) String() string {
 	return fmt.Sprintf("%x", v[:])
 }
 
+// Record returns a TLV record that can be used to encode/decode a Vertex
+// to/from a TLV stream.
+func (v *Vertex) Record() tlv.Record {
+	return tlv.MakeStaticRecord(
+		0, v, VertexSize, encodeVertex, decodeVertex,
+	)
+}
+
+func encodeVertex(w io.Writer, val interface{}, _ *[8]byte) error {
+	if b, ok := val.(*Vertex); ok {
+		_, err := w.Write(b[:])
+		return err
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "Vertex")
+}
+
+func decodeVertex(r io.Reader, val interface{}, _ *[8]byte, l uint64) error {
+	if b, ok := val.(*Vertex); ok && l == VertexSize {
+		_, err := io.ReadFull(r, b[:])
+		return err
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "Vertex", l, VertexSize)
+}
+
 // Hop represents an intermediate or final node of the route. This naming
 // is in line with the definition given in BOLT #4: Onion Routing Protocol.
 // The struct houses the channel along which this hop can be reached and
@@ -138,6 +164,9 @@ type Hop struct {
 	// The only reason we are keeping this member is that it could be the
 	// case that we have serialised hops persisted to disk where
 	// LegacyPayload is true.
+	//
+	// TODO(ziggie): Remove this field once we phase out the kv backend
+	// for payments.
 	LegacyPayload bool
 
 	// Metadata is additional data that is sent along with the payment to
@@ -498,9 +527,10 @@ type Route struct {
 	]
 
 	// FirstHopWireCustomRecords is a set of custom records that should be
-	// included in the wire message sent to the first hop. This is only set
-	// on custom channels and is used to include additional information
-	// about the actual value of the payment.
+	// included in the wire message sent to the first hop. This is for
+	// example used in custom channels. Besides custom channels we use it
+	// also for the accountable bit. This data will be sent to the first
+	// hop in the UpdateAddHTLC message.
 	//
 	// NOTE: Since these records already represent TLV records, and we
 	// enforce them to be in the custom range (e.g. >= 65536), we don't use
@@ -746,4 +776,20 @@ func (r *Route) String() string {
 	return fmt.Sprintf("%v, cltv %v",
 		b.String(), r.TotalTimeLock,
 	)
+}
+
+// ChanIDString returns the route's channel IDs as a formatted string.
+func ChanIDString(r *Route) string {
+	var b strings.Builder
+
+	for i, hop := range r.Hops {
+		b.WriteString(fmt.Sprintf("%v",
+			strconv.FormatUint(hop.ChannelID, 10),
+		))
+		if i != len(r.Hops)-1 {
+			b.WriteString(" -> ")
+		}
+	}
+
+	return b.String()
 }

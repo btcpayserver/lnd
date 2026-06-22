@@ -35,7 +35,7 @@ func makeListener() (*Listener, *lnwire.NetAddress, error) {
 	addr := "localhost:0"
 
 	// Our listener will be local, and the connection remote.
-	listener, err := NewListener(localKeyECDH, addr)
+	listener, err := NewListener(localKeyECDH, addr, DisabledBanClosure)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -85,12 +85,12 @@ func establishTestConnection(t testing.TB) (net.Conn, net.Conn, error) {
 
 	remote := <-remoteConnChan
 	if remote.err != nil {
-		return nil, nil, err
+		return nil, nil, remote.err
 	}
 
 	local := <-localConnChan
 	if local.err != nil {
-		return nil, nil, err
+		return nil, nil, local.err
 	}
 
 	t.Cleanup(func() {

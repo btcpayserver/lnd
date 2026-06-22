@@ -1,12 +1,12 @@
 package itest
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
@@ -19,27 +19,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testWatchtower tests the behaviour of the watchtower client and server.
-func testWatchtower(ht *lntest.HarnessTest) {
-	ht.Run("revocation", func(t *testing.T) {
-		tt := ht.Subtest(t)
-		testRevokedCloseRetributionAltruistWatchtower(tt)
-	})
-
-	ht.Run("session deletion", func(t *testing.T) {
-		tt := ht.Subtest(t)
-		testTowerClientSessionDeletion(tt)
-	})
-
-	ht.Run("tower and session activation", func(t *testing.T) {
-		tt := ht.Subtest(t)
-		testTowerClientTowerAndSessionManagement(tt)
-	})
+// watchtowerTestCases defines a set of tests to check the behaviour of the
+// watchtower client and server.
+var watchtowerTestCases = []*lntest.TestCase{
+	{
+		Name:     "revoked close retribution altruist",
+		TestFunc: testRevokedCloseRetributionAltruistWatchtower,
+	},
+	{
+		Name:     "client session deletion",
+		TestFunc: testTowerClientSessionDeletion,
+	},
+	{
+		Name:     "client tower and session management",
+		TestFunc: testTowerClientTowerAndSessionManagement,
+	},
 }
 
 // testTowerClientTowerAndSessionManagement tests the various control commands
 // that a user has over the client's set of active towers and sessions.
 func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
+	alice := ht.NewNode("Alice", nil)
+
 	const (
 		chanAmt           = funding.MaxBtcFundingAmount
 		externalIP        = "1.2.3.4"
@@ -96,22 +97,23 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 	}
 
 	// Assert that there are a few sessions between Dave and Wallis. There
-	// should be one per client. There are currently 3 types of clients, so
-	// we expect 3 sessions.
-	assertNumSessions(wallisPk, 3, false)
+	// should be one per client. There are currently 4 types of clients
+	// (legacy, anchor, taproot-staging, taproot-final), so we expect 4
+	// sessions.
+	assertNumSessions(wallisPk, 4, false)
 
 	// Before we make a channel, we'll load up Dave with some coins sent
 	// directly from the miner.
 	ht.FundCoins(btcutil.SatoshiPerBitcoin, dave)
 
 	// Connect Dave and Alice.
-	ht.ConnectNodes(dave, ht.Alice)
+	ht.ConnectNodes(dave, alice)
 
 	// Open a channel between Dave and Alice.
 	params := lntest.OpenChannelParams{
 		Amt: chanAmt,
 	}
-	chanPoint := ht.OpenChannel(dave, ht.Alice, params)
+	chanPoint := ht.OpenChannel(dave, alice, params)
 
 	// Show that the Wallis tower is currently seen as an active session
 	// candidate.
@@ -123,7 +125,7 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 
 	// Make some back-ups and assert that they are added to a session with
 	// the tower.
-	generateBackups(ht, dave, ht.Alice, 4)
+	generateBackups(ht, dave, alice, 4)
 
 	// Assert that one of the sessions now has 4 backups.
 	assertNumBackups(ht, dave.RPC, wallisPk, 4, false)
@@ -140,7 +142,7 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 	require.False(ht, info.SessionInfo[0].ActiveSessionCandidate)
 
 	// Back up a few more states.
-	generateBackups(ht, dave, ht.Alice, 4)
+	generateBackups(ht, dave, alice, 4)
 
 	// These should _not_ be on the tower. Therefore, the number of
 	// back-ups on the tower should be the same as before.
@@ -152,7 +154,7 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 		Pubkey:  wilmaPk,
 		Address: wilmaListener,
 	})
-	assertNumSessions(wilmaPk, 3, false)
+	assertNumSessions(wilmaPk, 4, false)
 
 	// The updates from before should now appear on the new watchtower.
 	assertNumBackups(ht, dave.RPC, wilmaPk, 4, false)
@@ -164,13 +166,13 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 	})
 
 	// Generate some more back-ups.
-	generateBackups(ht, dave, ht.Alice, 4)
+	generateBackups(ht, dave, alice, 4)
 
 	// Assert that they get added to the first tower (Wallis) and that the
 	// number of sessions with Wallis has not changed - in other words, the
 	// previously used session was re-used.
 	assertNumBackups(ht, dave.RPC, wallisPk, 8, false)
-	assertNumSessions(wallisPk, 3, false)
+	assertNumSessions(wallisPk, 4, false)
 
 	findSession := func(towerPk []byte, numBackups uint32) []byte {
 		info := dave.RPC.GetTowerInfo(&wtclientrpc.GetTowerInfoRequest{
@@ -203,10 +205,10 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 	// This should force the client to negotiate a new session. The old
 	// session still remains in our session list since the channel for which
 	// it has updates for is still open.
-	assertNumSessions(wallisPk, 4, false)
+	assertNumSessions(wallisPk, 5, false)
 
 	// Any new back-ups should now be backed up on a different session.
-	generateBackups(ht, dave, ht.Alice, 2)
+	generateBackups(ht, dave, alice, 2)
 	assertNumBackups(ht, dave.RPC, wallisPk, 10, false)
 	findSession(wallisPk, 2)
 
@@ -224,7 +226,7 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 	// be checked on each new block. It could have been the case that all
 	// checks with the above mined blocks were completed before the
 	// closable session was queued.
-	assertNumSessions(wallisPk, 3, true)
+	assertNumSessions(wallisPk, 4, true)
 
 	// For the sake of completion, we call RemoveTower here for both towers
 	// to show that this should never error.
@@ -239,6 +241,8 @@ func testTowerClientTowerAndSessionManagement(ht *lntest.HarnessTest) {
 // testTowerClientSessionDeletion tests that sessions are correctly deleted
 // when they are deemed closable.
 func testTowerClientSessionDeletion(ht *lntest.HarnessTest) {
+	alice := ht.NewNode("Alice", nil)
+
 	const (
 		chanAmt           = funding.MaxBtcFundingAmount
 		numInvoices       = 5
@@ -291,18 +295,18 @@ func testTowerClientSessionDeletion(ht *lntest.HarnessTest) {
 	ht.FundCoins(btcutil.SatoshiPerBitcoin, dave)
 
 	// Connect Dave and Alice.
-	ht.ConnectNodes(dave, ht.Alice)
+	ht.ConnectNodes(dave, alice)
 
 	// Open a channel between Dave and Alice.
 	params := lntest.OpenChannelParams{
 		Amt: chanAmt,
 	}
-	chanPoint := ht.OpenChannel(dave, ht.Alice, params)
+	chanPoint := ht.OpenChannel(dave, alice, params)
 
 	// Since there are 2 updates made for every payment and the maximum
 	// number of updates per session has been set to 10, make 5 payments
 	// between the pair so that the session is exhausted.
-	generateBackups(ht, dave, ht.Alice, maxUpdates)
+	generateBackups(ht, dave, alice, maxUpdates)
 
 	// Assert that one of the sessions now has 10 backups.
 	assertNumBackups(ht, dave.RPC, wallisPk, 10, false)
@@ -335,6 +339,7 @@ func testRevokedCloseRetributionAltruistWatchtower(ht *lntest.HarnessTest) {
 		lnrpc.CommitmentType_LEGACY,
 		lnrpc.CommitmentType_ANCHORS,
 		lnrpc.CommitmentType_SIMPLE_TAPROOT,
+		lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL,
 	} {
 		testName := fmt.Sprintf("%v", commitType.String())
 		ct := commitType
@@ -392,7 +397,7 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	// protection logic automatically.
 	daveArgs := lntest.NodeArgsForCommitType(commitType)
 	daveArgs = append(daveArgs, "--nolisten", "--wtclient.active")
-	dave := ht.NewNode("Dave", daveArgs)
+	dave := ht.NewNodeWithCoins("Dave", daveArgs)
 
 	addTowerReq := &wtclientrpc.AddTowerRequest{
 		Pubkey:  willyInfoPk,
@@ -403,10 +408,6 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	// We must let Dave have an open channel before she can send a node
 	// announcement, so we open a channel with Carol,
 	ht.ConnectNodes(dave, carol)
-
-	// Before we make a channel, we'll load up Dave with some coins sent
-	// directly from the miner.
-	ht.FundCoins(btcutil.SatoshiPerBitcoin, dave)
 
 	// Send one more UTXOs if this is a neutrino backend.
 	if ht.IsNeutrinoBackend() {
@@ -450,7 +451,7 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	ht.EnsureConnected(dave, carol)
 
 	// Once connected, give Dave some time to enable the channel again.
-	ht.AssertTopologyChannelOpen(dave, chanPoint)
+	ht.AssertChannelInGraph(dave, chanPoint)
 
 	// Finally, send payments from Dave to Carol, consuming Carol's
 	// remaining payment hashes.
@@ -492,7 +493,7 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	// broadcasting his current channel state. This is actually the
 	// commitment transaction of a prior *revoked* state, so he'll soon
 	// feel the wrath of Dave's retribution.
-	closeUpdates, closeTxID := ht.CloseChannelAssertPending(
+	closeUpdates, pendingClose := ht.CloseChannelAssertPending(
 		carol, chanPoint, true,
 	)
 
@@ -505,7 +506,8 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	ht.AssertTxInBlock(block, breachTXID)
 
 	// The breachTXID should match the above closeTxID.
-	require.EqualValues(ht, breachTXID, closeTxID)
+	closeTxID := pendingClose.GetClosePending().Txid
+	require.EqualValues(ht, breachTXID[:], closeTxID)
 
 	// Query the mempool for Dave's justice transaction, this should be
 	// broadcast as Carol's contract breaching transaction gets confirmed
@@ -565,6 +567,15 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	// then been swept to his wallet by Willy.
 	require.NoError(ht, restart(), "unable to restart dave")
 
+	// For neutrino backend, we may need to mine one more block to trigger
+	// the chain watcher to act.
+	//
+	// TODO(yy): remove it once the blockbeat remembers the last block
+	// processed.
+	if ht.IsNeutrinoBackend() {
+		ht.MineEmptyBlocks(1)
+	}
+
 	err = wait.NoError(func() error {
 		daveBalResp := dave.RPC.ChannelBalance()
 		if daveBalResp.LocalBalance.Sat != 0 {
@@ -578,16 +589,6 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	require.NoError(ht, err, "timeout checking dave's channel balance")
 
 	ht.AssertNumPendingForceClose(dave, 0)
-
-	// If this is an anchor channel, Dave would offer his sweeper the
-	// anchor. However, due to no time-sensitive outputs involved, the
-	// anchor sweeping won't happen as it's uneconomical.
-	if lntest.CommitTypeHasAnchors(commitType) {
-		ht.AssertNumPendingSweeps(dave, 1)
-
-		// Mine a block to trigger the sweep.
-		ht.MineEmptyBlocks(1)
-	}
 
 	// Check that Dave's wallet balance is increased.
 	err = wait.NoError(func() error {
@@ -657,17 +658,11 @@ func generateBackups(ht *lntest.HarnessTest, srcNode,
 	)
 
 	send := func(node *node.HarnessNode, payReq string) {
-		stream := node.RPC.SendPayment(
-			&routerrpc.SendPaymentRequest{
-				PaymentRequest: payReq,
-				TimeoutSeconds: 60,
-				FeeLimitMsat:   noFeeLimitMsat,
-			},
-		)
-
-		ht.AssertPaymentStatusFromStream(
-			stream, lnrpc.Payment_SUCCEEDED,
-		)
+		req := &routerrpc.SendPaymentRequest{
+			PaymentRequest: payReq,
+			FeeLimitMsat:   noFeeLimitMsat,
+		}
+		ht.SendPaymentAssertSettled(node, req)
 	}
 
 	// Pay each invoice.

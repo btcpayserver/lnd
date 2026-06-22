@@ -1,7 +1,6 @@
 package itest
 
 import (
-	"context"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -32,10 +31,10 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 		{Local: bob, Remote: carol, Param: p},
 	}
 	resp := ht.OpenMultiChannelsAsync(reqs)
-	cpAB, cpBC := resp[0], resp[1]
+	cpBC := resp[1]
 
 	// Make sure Alice is aware of channel Bob=>Carol.
-	ht.AssertTopologyChannelOpen(alice, cpBC)
+	ht.AssertChannelInGraph(alice, cpBC)
 
 	// Initiate Carol's invoice HTLC modifier.
 	invoiceModifier, cancelModifier := carol.RPC.InvoiceHtlcModifier()
@@ -47,7 +46,7 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 	// Make sure we get an error if we try to register a second modifier and
 	// then try to use it (the error won't be returned on connect, only on
 	// the first _read_ interaction on the stream).
-	mod2, err := carol.RPC.Invoice.HtlcModifier(context.Background())
+	mod2, err := carol.RPC.Invoice.HtlcModifier(ht.Context())
 	require.NoError(ht, err)
 	_, err = mod2.Recv()
 	require.ErrorContains(
@@ -102,9 +101,12 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 		require.EqualValues(
 			ht, tc.sendAmountMsat, modifierRequest.ExitHtlcAmt,
 		)
+
+		// Expect custom records plus accountable signal.
 		require.Equal(
-			ht, tc.lastHopCustomRecords,
-			modifierRequest.ExitHtlcWireCustomRecords,
+			ht, lntest.CustomRecordsWithUnaccountable(
+				tc.lastHopCustomRecords,
+			), modifierRequest.ExitHtlcWireCustomRecords,
 		)
 
 		// For all other packets we resolve according to the test case.
@@ -113,6 +115,7 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 			&invoicesrpc.HtlcModifyResponse{
 				CircuitKey: modifierRequest.ExitHtlcCircuitKey,
 				AmtPaid:    &amtPaid,
+				CancelSet:  tc.cancelSet,
 			},
 		)
 		require.NoError(ht, err, "failed to send request")
@@ -125,7 +128,9 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 			require.Fail(ht, "timeout waiting for payment send")
 		}
 
-		ht.Log("Ensure invoice status is settled")
+		ht.Logf("Ensure invoice status is expected state %v",
+			tc.finalInvoiceState)
+
 		require.Eventually(ht, func() bool {
 			updatedInvoice := carol.RPC.LookupInvoice(
 				tc.invoice.RHash,
@@ -138,10 +143,18 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 			tc.invoice.RHash,
 		)
 
+		// If the HTLC modifier canceled the incoming HTLC set, we don't
+		// expect any HTLCs in the invoice.
+		if tc.cancelSet {
+			require.Len(ht, updatedInvoice.Htlcs, 0)
+			return
+		}
+
 		require.Len(ht, updatedInvoice.Htlcs, 1)
 		require.Equal(
-			ht, tc.lastHopCustomRecords,
-			updatedInvoice.Htlcs[0].CustomRecords,
+			ht, lntest.CustomRecordsWithUnaccountable(
+				tc.lastHopCustomRecords,
+			), updatedInvoice.Htlcs[0].CustomRecords,
 		)
 
 		// Make sure the custom channel data contains the encoded
@@ -204,10 +217,6 @@ func testInvoiceHtlcModifierBasic(ht *lntest.HarnessTest) {
 	}
 
 	cancelModifier()
-
-	// Finally, close channels.
-	ht.CloseChannel(alice, cpAB)
-	ht.CloseChannel(bob, cpBC)
 }
 
 // acceptorTestCase is a helper struct to hold test case data.
@@ -231,6 +240,10 @@ type acceptorTestCase struct {
 
 	// invoice is the invoice that will be paid.
 	invoice *lnrpc.Invoice
+
+	// cancelSet is a boolean which indicates whether the HTLC modifier
+	// canceled the incoming HTLC set.
+	cancelSet bool
 }
 
 // acceptorTestScenario is a helper struct to hold the test context and provides
@@ -247,7 +260,8 @@ type acceptorTestScenario struct {
 //
 // Among them, Alice and Bob are standby nodes and Carol is a new node.
 func newAcceptorTestScenario(ht *lntest.HarnessTest) *acceptorTestScenario {
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("bob", nil)
 	carol := ht.NewNode("carol", nil)
 
 	ht.EnsureConnected(alice, bob)
@@ -280,6 +294,12 @@ func (c *acceptorTestScenario) prepareTestCases() []*acceptorTestCase {
 			lastHopCustomRecords: map[uint64][]byte{
 				lnwire.MinCustomRecordsTlvType: {1, 2, 3},
 			},
+		},
+		{
+			invoiceAmountMsat: 9000,
+			sendAmountMsat:    1000,
+			finalInvoiceState: lnrpc.Invoice_OPEN,
+			cancelSet:         true,
 		},
 	}
 

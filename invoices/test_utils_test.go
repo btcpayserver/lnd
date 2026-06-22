@@ -100,6 +100,8 @@ const (
 var (
 	testTimeout = 5 * time.Second
 
+	testTimeoutLong = time.Minute
+
 	testTime = time.Date(2018, time.February, 2, 14, 0, 0, 0, time.UTC)
 
 	testInvoicePreimage = lntypes.Preimage{1}
@@ -207,7 +209,7 @@ func getCircuitKey(htlcID uint64) invpkg.CircuitKey {
 // Note that this invoice *does not* have a payment address set. It will
 // create a regular invoice with a preimage is hodl is false, and a hodl
 // invoice with no preimage otherwise.
-func newInvoice(t *testing.T, hodl bool) *invpkg.Invoice {
+func newInvoice(t *testing.T, hodl bool, ampInvoice bool) *invpkg.Invoice {
 	invoice := &invpkg.Invoice{
 		Terms: invpkg.ContractTerm{
 			Value:    testInvoiceAmount,
@@ -215,6 +217,23 @@ func newInvoice(t *testing.T, hodl bool) *invpkg.Invoice {
 			Features: testFeatures.Clone(),
 		},
 		CreationDate: testInvoiceCreationDate,
+	}
+
+	// This makes the invoice an AMP invoice. We do not support AMP hodl
+	// invoices.
+	if ampInvoice {
+		ampFeature := lnwire.NewRawFeatureVector(
+			lnwire.TLVOnionPayloadOptional,
+			lnwire.PaymentAddrOptional,
+			lnwire.AMPRequired,
+		)
+
+		ampFeatures := lnwire.NewFeatureVector(
+			ampFeature, lnwire.Features,
+		)
+		invoice.Terms.Features = ampFeatures
+
+		return invoice
 	}
 
 	// If creating a hodl invoice, we don't include a preimage.
@@ -238,7 +257,9 @@ func timeout() func() {
 
 	go func() {
 		select {
-		case <-time.After(10 * time.Second):
+		// Use a longer timeout to accommodate slow Postgres database
+		// setup and migrations when running tests in parallel.
+		case <-time.After(testTimeoutLong):
 			err := pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
 			if err != nil {
 				panic(fmt.Sprintf("error writing to std out "+

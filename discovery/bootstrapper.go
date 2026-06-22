@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tor"
 	"github.com/miekg/dns"
 )
@@ -36,8 +38,9 @@ type NetworkPeerBootstrapper interface {
 	// denotes how many valid peer addresses to return. The passed set of
 	// node nodes allows the caller to ignore a set of nodes perhaps
 	// because they already have connections established.
-	SampleNodeAddrs(numAddrs uint32,
-		ignore map[autopilot.NodeID]struct{}) ([]*lnwire.NetAddress, error)
+	SampleNodeAddrs(ctx context.Context, numAddrs uint32,
+		ignore map[autopilot.NodeID]struct{}) ([]*lnwire.NetAddress,
+		error)
 
 	// Name returns a human readable string which names the concrete
 	// implementation of the NetworkPeerBootstrapper.
@@ -50,7 +53,8 @@ type NetworkPeerBootstrapper interface {
 // bootstrapper will be queried successively until the target amount is met. If
 // the ignore map is populated, then the bootstrappers will be instructed to
 // skip those nodes.
-func MultiSourceBootstrap(ignore map[autopilot.NodeID]struct{}, numAddrs uint32,
+func MultiSourceBootstrap(ctx context.Context,
+	ignore map[autopilot.NodeID]struct{}, numAddrs uint32,
 	bootstrappers ...NetworkPeerBootstrapper) ([]*lnwire.NetAddress, error) {
 
 	// We'll randomly shuffle our bootstrappers before querying them in
@@ -73,7 +77,9 @@ func MultiSourceBootstrap(ignore map[autopilot.NodeID]struct{}, numAddrs uint32,
 		// the number of address remaining that we need to fetch.
 		numAddrsLeft := numAddrs - uint32(len(addrs))
 		log.Tracef("Querying for %v addresses", numAddrsLeft)
-		netAddrs, err := bootstrapper.SampleNodeAddrs(numAddrsLeft, ignore)
+		netAddrs, err := bootstrapper.SampleNodeAddrs(
+			ctx, numAddrsLeft, ignore,
+		)
 		if err != nil {
 			// If we encounter an error with a bootstrapper, then
 			// we'll continue on to the next available
@@ -116,11 +122,10 @@ func shuffleBootstrappers(candidates []NetworkPeerBootstrapper) []NetworkPeerBoo
 type ChannelGraphBootstrapper struct {
 	chanGraph autopilot.ChannelGraph
 
-	// hashAccumulator is a set of 32 random bytes that are read upon the
-	// creation of the channel graph bootstrapper. We use this value to
-	// randomly select nodes within the known graph to connect to. After
-	// each selection, we rotate the accumulator by hashing it with itself.
-	hashAccumulator [32]byte
+	// hashAccumulator is used to determine which nodes to use for
+	// bootstrapping. It allows us to potentially introduce some randomness
+	// into the selection process.
+	hashAccumulator hashAccumulator
 
 	tried map[autopilot.NodeID]struct{}
 }
@@ -133,18 +138,33 @@ var _ NetworkPeerBootstrapper = (*ChannelGraphBootstrapper)(nil)
 // backed by an active autopilot.ChannelGraph instance. This type of network
 // peer bootstrapper will use the authenticated nodes within the known channel
 // graph to bootstrap connections.
-func NewGraphBootstrapper(cg autopilot.ChannelGraph) (NetworkPeerBootstrapper, error) {
+func NewGraphBootstrapper(cg autopilot.ChannelGraph,
+	deterministicSampling bool) (NetworkPeerBootstrapper, error) {
 
-	c := &ChannelGraphBootstrapper{
-		chanGraph: cg,
-		tried:     make(map[autopilot.NodeID]struct{}),
+	var (
+		hashAccumulator hashAccumulator
+		err             error
+	)
+	if deterministicSampling {
+		// If we're using deterministic sampling, then we'll use a
+		// no-op hash accumulator that will always return false for
+		// skipNode.
+		hashAccumulator = newNoOpHashAccumulator()
+	} else {
+		// Otherwise, we'll use a random hash accumulator to sample
+		// nodes from the channel graph.
+		hashAccumulator, err = newRandomHashAccumulator()
+		if err != nil {
+			return nil, fmt.Errorf("unable to create hash "+
+				"accumulator: %w", err)
+		}
 	}
 
-	if _, err := rand.Read(c.hashAccumulator[:]); err != nil {
-		return nil, err
-	}
-
-	return c, nil
+	return &ChannelGraphBootstrapper{
+		chanGraph:       cg,
+		tried:           make(map[autopilot.NodeID]struct{}),
+		hashAccumulator: hashAccumulator,
+	}, nil
 }
 
 // SampleNodeAddrs uniformly samples a set of specified address from the
@@ -152,8 +172,11 @@ func NewGraphBootstrapper(cg autopilot.ChannelGraph) (NetworkPeerBootstrapper, e
 // many valid peer addresses to return.
 //
 // NOTE: Part of the NetworkPeerBootstrapper interface.
-func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
+func (c *ChannelGraphBootstrapper) SampleNodeAddrs(_ context.Context,
+	numAddrs uint32,
 	ignore map[autopilot.NodeID]struct{}) ([]*lnwire.NetAddress, error) {
+
+	ctx := context.TODO()
 
 	// We'll merge the ignore map with our currently selected map in order
 	// to ensure we don't return any duplicate nodes.
@@ -177,7 +200,9 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 			errFound = fmt.Errorf("found node")
 		)
 
-		err := c.chanGraph.ForEachNode(func(node autopilot.Node) error {
+		err := c.chanGraph.ForEachNode(ctx, func(_ context.Context,
+			node autopilot.Node) error {
+
 			nID := autopilot.NodeID(node.PubKey())
 			if _, ok := c.tried[nID]; ok {
 				return nil
@@ -189,16 +214,28 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 			// it's 50/50. If it isn't less, than then we'll
 			// continue forward.
 			nodePubKeyBytes := node.PubKey()
-			if bytes.Compare(c.hashAccumulator[:], nodePubKeyBytes[1:]) > 0 {
+			if c.hashAccumulator.skipNode(nodePubKeyBytes) {
 				return nil
 			}
 
+			foundAddr := false
 			for _, nodeAddr := range node.Addrs() {
 				// If we haven't yet reached our limit, then
 				// we'll copy over the details of this node
 				// into the set of addresses to be returned.
-				switch nodeAddr.(type) {
-				case *net.TCPAddr, *tor.OnionAddr:
+				switch onion := nodeAddr.(type) {
+				case *net.TCPAddr:
+				case *tor.OnionAddr:
+					// Skip persisted Tor v2 .onion
+					// entries: Tor stopped serving them
+					// in 2021 and the dial would never
+					// succeed. Other addresses of the
+					// same node may still be usable.
+					if len(onion.OnionService) ==
+						tor.V2Len {
+
+						continue
+					}
 				default:
 					// If this isn't a valid address
 					// supported by the protocol, then we'll
@@ -220,13 +257,18 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 					IdentityKey: nodePub,
 					Address:     nodeAddr,
 				})
+				foundAddr = true
 			}
 
-			c.tried[nID] = struct{}{}
+			if foundAddr {
+				return errFound
+			}
 
-			return errFound
+			return nil
+		}, func() {
+			clear(a)
 		})
-		if err != nil && err != errFound {
+		if err != nil && !errors.Is(err, errFound) {
 			return nil, err
 		}
 
@@ -249,12 +291,20 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 		tries++
 
 		// We'll now rotate our hash accumulator one value forwards.
-		c.hashAccumulator = sha256.Sum256(c.hashAccumulator[:])
+		c.hashAccumulator.rotate()
 
 		// If this attempt didn't yield any addresses, then we'll exit
 		// early.
 		if len(sampleAddrs) == 0 {
 			continue
+		}
+
+		for _, addr := range sampleAddrs {
+			nID := autopilot.NodeID(
+				addr.IdentityKey.SerializeCompressed(),
+			)
+
+			c.tried[nID] = struct{}{}
 		}
 
 		addrs = append(addrs, sampleAddrs...)
@@ -382,7 +432,8 @@ func (d *DNSSeedBootstrapper) fallBackSRVLookup(soaShim string,
 // network peer bootstrapper source. The num addrs field passed in denotes how
 // many valid peer addresses to return. The set of DNS seeds are used
 // successively to retrieve eligible target nodes.
-func (d *DNSSeedBootstrapper) SampleNodeAddrs(numAddrs uint32,
+func (d *DNSSeedBootstrapper) SampleNodeAddrs(_ context.Context,
+	numAddrs uint32,
 	ignore map[autopilot.NodeID]struct{}) ([]*lnwire.NetAddress, error) {
 
 	var netAddrs []*lnwire.NetAddress
@@ -535,3 +586,83 @@ search:
 func (d *DNSSeedBootstrapper) Name() string {
 	return fmt.Sprintf("BOLT-0010 DNS Seed: %v", d.dnsSeeds)
 }
+
+// hashAccumulator is an interface that defines the methods required for
+// a hash accumulator used to sample nodes from the channel graph.
+type hashAccumulator interface {
+	// rotate rotates the hash accumulator value.
+	rotate()
+
+	// skipNode returns true if the node with the given public key
+	// should be skipped based on the current hash accumulator state.
+	skipNode(pubKey route.Vertex) bool
+}
+
+// randomHashAccumulator is an implementation of the hashAccumulator
+// interface that uses a random hash to sample nodes from the channel graph.
+type randomHashAccumulator struct {
+	hash [32]byte
+}
+
+// A compile time assertion to ensure that randomHashAccumulator meets the
+// hashAccumulator interface.
+var _ hashAccumulator = (*randomHashAccumulator)(nil)
+
+// newRandomHashAccumulator returns a new instance of a randomHashAccumulator.
+// This accumulator is used to randomly sample nodes from the channel graph.
+func newRandomHashAccumulator() (*randomHashAccumulator, error) {
+	var r randomHashAccumulator
+
+	if _, err := rand.Read(r.hash[:]); err != nil {
+		return nil, fmt.Errorf("unable to read random bytes: %w", err)
+	}
+
+	return &r, nil
+}
+
+// rotate rotates the hash accumulator by hashing the current value
+// with itself. This ensures that we have a new random value to compare
+// against when we sample nodes from the channel graph.
+//
+// NOTE: this is part of the hashAccumulator interface.
+func (r *randomHashAccumulator) rotate() {
+	r.hash = sha256.Sum256(r.hash[:])
+}
+
+// skipNode returns true if the node with the given public key should be skipped
+// based on the current hash accumulator state. It will return false for the
+// pub key if it is lexicographically less than our current accumulator value.
+// It does so by comparing the current hash accumulator value with the passed
+// byte slice. When comparing, we skip the first byte as it's 50/50 between 02
+// and 03 for compressed pub keys.
+//
+// NOTE: this is part of the hashAccumulator interface.
+func (r *randomHashAccumulator) skipNode(pub route.Vertex) bool {
+	return bytes.Compare(r.hash[:], pub[1:]) > 0
+}
+
+// noOpHashAccumulator is a no-op implementation of the hashAccumulator
+// interface. This is used when we want deterministic behavior and don't
+// want to sample nodes randomly from the channel graph.
+type noOpHashAccumulator struct{}
+
+// newNoOpHashAccumulator returns a new instance of a noOpHashAccumulator.
+func newNoOpHashAccumulator() *noOpHashAccumulator {
+	return &noOpHashAccumulator{}
+}
+
+// rotate is a no-op for the noOpHashAccumulator.
+//
+// NOTE: this is part of the hashAccumulator interface.
+func (*noOpHashAccumulator) rotate() {}
+
+// skipNode always returns false, meaning that no nodes will be skipped.
+//
+// NOTE: this is part of the hashAccumulator interface.
+func (*noOpHashAccumulator) skipNode(route.Vertex) bool {
+	return false
+}
+
+// A compile-time assertion to ensure that noOpHashAccumulator meets the
+// hashAccumulator interface.
+var _ hashAccumulator = (*noOpHashAccumulator)(nil)

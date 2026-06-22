@@ -3,7 +3,7 @@ package contractcourt
 import (
 	"context"
 
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -28,6 +28,11 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 	circuitKey models.CircuitKey, hodlChan chan<- interface{},
 	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
+
+	// Exit early if the notification channel is nil.
+	if hodlChan == nil {
+		return r.notifyResolution, r.notifyErr
+	}
 
 	r.notifyChan <- notifyExitHopData{
 		hodlChan:      hodlChan,

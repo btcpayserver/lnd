@@ -1,12 +1,13 @@
 package msgmux
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -46,10 +47,10 @@ type Endpoint interface {
 
 	// SendMessage handles the target message, and returns true if the
 	// message was able being processed.
-	SendMessage(msg PeerMsg) bool
+	SendMessage(ctx context.Context, msg PeerMsg) bool
 }
 
-// MsgRouter is an interface that represents a message router, which is generic
+// Router is an interface that represents a message router, which is generic
 // sub-system capable of routing any incoming wire message to a set of
 // registered endpoints.
 type Router interface {
@@ -66,7 +67,7 @@ type Router interface {
 	RouteMsg(PeerMsg) error
 
 	// Start starts the peer message router.
-	Start()
+	Start(ctx context.Context)
 
 	// Stop stops the peer message router.
 	Stop()
@@ -91,8 +92,8 @@ func sendQueryErr[Q any](sendChan chan fn.Req[Q, error], queryArg Q,
 	quitChan chan struct{}) error {
 
 	return fn.ElimEither(
-		fn.Iden, fn.Iden,
 		sendQuery(sendChan, queryArg, quitChan).Either,
+		fn.Iden, fn.Iden,
 	)
 }
 
@@ -137,12 +138,12 @@ func NewMultiMsgRouter() *MultiMsgRouter {
 }
 
 // Start starts the peer message router.
-func (p *MultiMsgRouter) Start() {
+func (p *MultiMsgRouter) Start(ctx context.Context) {
 	log.Infof("Starting Router")
 
 	p.startOnce.Do(func() {
 		p.wg.Add(1)
-		go p.msgRouter()
+		go p.msgRouter(ctx)
 	})
 }
 
@@ -179,7 +180,7 @@ func (p *MultiMsgRouter) endpoints() fn.Result[EndpointsMap] {
 }
 
 // msgRouter is the main goroutine that handles all incoming messages.
-func (p *MultiMsgRouter) msgRouter() {
+func (p *MultiMsgRouter) msgRouter(ctx context.Context) {
 	defer p.wg.Done()
 
 	// endpoints is a map of all registered endpoints.
@@ -235,7 +236,7 @@ func (p *MultiMsgRouter) msgRouter() {
 						"msg %T to endpoint %s", msg,
 						endpoint.Name())
 
-					sent := endpoint.SendMessage(msg)
+					sent := endpoint.SendMessage(ctx, msg)
 					couldSend = couldSend || sent
 				}
 			}
@@ -243,7 +244,7 @@ func (p *MultiMsgRouter) msgRouter() {
 			var err error
 			if !couldSend {
 				log.Tracef("MsgRouter: unable to route "+
-					"msg %T", msg)
+					"msg %T", msg.Message)
 
 				err = ErrUnableToRouteMsg
 			}

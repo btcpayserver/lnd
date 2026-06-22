@@ -1,10 +1,11 @@
 package routing
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -12,25 +13,28 @@ import (
 // Graph is an abstract interface that provides information about nodes and
 // edges to pathfinding.
 type Graph interface {
-	// ForEachNodeChannel calls the callback for every channel of the given
-	// node.
-	ForEachNodeChannel(nodePub route.Vertex,
-		cb func(channel *channeldb.DirectedChannel) error) error
+	// ForEachNodeDirectedChannel calls the callback for every channel of
+	// the given node.
+	ForEachNodeDirectedChannel(ctx context.Context, nodePub route.Vertex,
+		cb func(channel *graphdb.DirectedChannel) error,
+		reset func()) error
 
 	// FetchNodeFeatures returns the features of the given node.
-	FetchNodeFeatures(nodePub route.Vertex) (*lnwire.FeatureVector, error)
+	FetchNodeFeatures(ctx context.Context,
+		nodePub route.Vertex) (*lnwire.FeatureVector, error)
 }
 
-// GraphSessionFactory can be used to produce a new Graph instance which can
-// then be used for a path-finding session. Depending on the implementation,
-// the Graph session will represent a DB connection where a read-lock is being
-// held across calls to the backing Graph.
+// GraphSessionFactory can be used to gain access to a graphdb.NodeTraverser
+// instance which can then be used for a path-finding session. Depending on the
+// implementation, the session will represent a DB connection where a read-lock
+// is being held across calls to the backing graph.
 type GraphSessionFactory interface {
-	// NewGraphSession will produce a new Graph to use for a path-finding
-	// session. It returns the Graph along with a call-back that must be
-	// called once Graph access is complete. This call-back will close any
-	// read-only transaction that was created at Graph construction time.
-	NewGraphSession() (Graph, func() error, error)
+	// GraphSession will provide the call-back with access to a
+	// graphdb.NodeTraverser instance which can be used to perform queries
+	// against the channel graph.
+	GraphSession(ctx context.Context,
+		cb func(graph graphdb.NodeTraverser) error,
+		reset func()) error
 }
 
 // FetchAmountPairCapacity determines the maximal public capacity between two

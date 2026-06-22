@@ -169,16 +169,12 @@ func (h *HarnessRPC) VerifyMessageWithAddr(
 }
 
 // ListSweeps makes a ListSweeps RPC call to the node's WalletKit client.
-func (h *HarnessRPC) ListSweeps(verbose bool,
-	startHeight int32) *walletrpc.ListSweepsResponse {
+func (h *HarnessRPC) ListSweeps(
+	req *walletrpc.ListSweepsRequest) *walletrpc.ListSweepsResponse {
 
 	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
 	defer cancel()
 
-	req := &walletrpc.ListSweepsRequest{
-		Verbose:     verbose,
-		StartHeight: startHeight,
-	}
 	resp, err := h.WalletKit.ListSweeps(ctxt, req)
 	h.NoError(err, "ListSweeps")
 
@@ -228,7 +224,7 @@ func (h *HarnessRPC) GetTransaction(
 // RemoveTransaction makes an RPC call to the node's WalletKitClient and
 // asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) RemoveTransaction(
 	req *walletrpc.GetTransactionRequest) *walletrpc.RemoveTransactionResponse {
 
@@ -250,6 +246,33 @@ func (h *HarnessRPC) BumpFee(
 
 	resp, err := h.WalletKit.BumpFee(ctxt, req)
 	h.NoError(err, "BumpFee")
+
+	return resp
+}
+
+// BumpFeeAssertErr makes a RPC call to the node's WalletKitClient and asserts
+// that an error is returned.
+func (h *HarnessRPC) BumpFeeAssertErr(req *walletrpc.BumpFeeRequest) error {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.WalletKit.BumpFee(ctxt, req)
+	require.Errorf(h, err, "%s: expect BumpFee to return an error", h.Name)
+
+	return err
+}
+
+// BumpForceCloseFee makes a RPC call to the node's WalletKitClient and asserts.
+//
+//nolint:ll
+func (h *HarnessRPC) BumpForceCloseFee(
+	req *walletrpc.BumpForceCloseFeeRequest) *walletrpc.BumpForceCloseFeeResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.WalletKit.BumpForceCloseFee(ctxt, req)
+	h.NoError(err, "BumpForceCloseFee")
 
 	return resp
 }
@@ -296,7 +319,7 @@ func (h *HarnessRPC) ImportAccountAssertErr(
 
 // ImportPublicKey makes a RPC call to the node's WalletKitClient and asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) ImportPublicKey(
 	req *walletrpc.ImportPublicKeyRequest) *walletrpc.ImportPublicKeyResponse {
 
@@ -337,7 +360,7 @@ func (h *HarnessRPC) SignPsbtErr(req *walletrpc.SignPsbtRequest) error {
 
 // ImportTapscript makes a RPC call to the node's WalletKitClient and asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) ImportTapscript(
 	req *walletrpc.ImportTapscriptRequest) *walletrpc.ImportTapscriptResponse {
 
@@ -352,7 +375,7 @@ func (h *HarnessRPC) ImportTapscript(
 
 // RequiredReserve makes a RPC call to the node's WalletKitClient and asserts.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) RequiredReserve(
 	req *walletrpc.RequiredReserveRequest) *walletrpc.RequiredReserveResponse {
 
@@ -361,6 +384,19 @@ func (h *HarnessRPC) RequiredReserve(
 
 	resp, err := h.WalletKit.RequiredReserve(ctxt, req)
 	h.NoError(err, "RequiredReserve")
+
+	return resp
+}
+
+// ListLeases makes a ListLeases RPC call to the node's WalletKit client.
+func (h *HarnessRPC) ListLeases() *walletrpc.ListLeasesResponse {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.WalletKit.ListLeases(
+		ctxt, &walletrpc.ListLeasesRequest{},
+	)
+	h.NoError(err, "ListLeases")
 
 	return resp
 }

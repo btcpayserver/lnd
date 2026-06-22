@@ -3,10 +3,9 @@ package chancloser
 import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -100,7 +99,7 @@ type Channel interface { //nolint:interfacebloat
 		localDeliveryScript []byte, remoteDeliveryScript []byte,
 		closeOpt ...lnwallet.ChanCloseOpt,
 	) (
-		input.Signature, *chainhash.Hash, btcutil.Amount, error)
+		input.Signature, *wire.MsgTx, btcutil.Amount, error)
 
 	// CompleteCooperativeClose persistently "completes" the cooperative
 	// close by producing a fully signed co-op close transaction.
@@ -133,4 +132,10 @@ type MusigSession interface {
 	// shutdown message so it can be used later to generate and verify
 	// signatures.
 	InitRemoteNonce(nonce *musig2.Nonces)
+
+	// InvalidateNonce clears the cached local nonce, forcing a fresh
+	// nonce to be generated on the next call to ClosingNonce. This
+	// must be called after each RBF round completes to prevent nonce
+	// reuse across iterations.
+	InvalidateNonce()
 }

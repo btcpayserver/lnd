@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -11,10 +13,9 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/aliasmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"golang.org/x/exp/maps"
 )
 
 var (
@@ -23,6 +24,9 @@ var (
 	ErrSatMsatMutualExclusive = errors.New(
 		"sat and msat arguments are mutually exclusive",
 	)
+
+	// ErrNegativeAmt is returned when a negative amount is specified.
+	ErrNegativeAmt = errors.New("amount cannot be negative")
 )
 
 // CalculateFeeLimit returns the fee limit in millisatoshis. If a percentage
@@ -54,6 +58,10 @@ func CalculateFeeLimit(feeLimit *FeeLimit,
 func UnmarshallAmt(amtSat, amtMsat int64) (lnwire.MilliSatoshi, error) {
 	if amtSat != 0 && amtMsat != 0 {
 		return 0, ErrSatMsatMutualExclusive
+	}
+
+	if amtSat < 0 || amtMsat < 0 {
+		return 0, ErrNegativeAmt
 	}
 
 	if amtSat != 0 {
@@ -214,12 +222,18 @@ func UnmarshallCoinSelectionStrategy(strategy CoinSelectionStrategy,
 // MarshalAliasMap converts a ScidAliasMap to its proto counterpart. This is
 // used in various RPCs that handle scid alias mappings.
 func MarshalAliasMap(scidMap aliasmgr.ScidAliasMap) []*AliasMap {
-	return fn.Map(func(base lnwire.ShortChannelID) *AliasMap {
-		return &AliasMap{
-			BaseScid: base.ToUint64(),
-			Aliases: fn.Map(func(a lnwire.ShortChannelID) uint64 {
-				return a.ToUint64()
-			}, scidMap[base]),
-		}
-	}, maps.Keys(scidMap))
+	return fn.Map(
+		slices.Collect(maps.Keys(scidMap)),
+		func(base lnwire.ShortChannelID) *AliasMap {
+			return &AliasMap{
+				BaseScid: base.ToUint64(),
+				Aliases: fn.Map(
+					scidMap[base],
+					func(a lnwire.ShortChannelID) uint64 {
+						return a.ToUint64()
+					},
+				),
+			}
+		},
+	)
 }

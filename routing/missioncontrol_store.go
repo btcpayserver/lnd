@@ -5,14 +5,13 @@ import (
 	"container/list"
 	"encoding/binary"
 	"fmt"
-	"math"
+	"io"
 	"sync"
 	"time"
 
-	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 var (
@@ -25,11 +24,20 @@ var (
 	byteOrder = binary.BigEndian
 )
 
-const (
-	// unknownFailureSourceIdx is the database encoding of an unknown error
-	// source.
-	unknownFailureSourceIdx = -1
-)
+// missionControlDB is an interface that defines the database methods that a
+// single missionControlStore has access to. It allows the missionControlStore
+// to be unaware of the overall DB structure and restricts its access to the DB
+// by only providing it the bucket that it needs to care about.
+type missionControlDB interface {
+	// update can be used to perform reads and writes on the given bucket.
+	update(f func(bkt kvdb.RwBucket) error, reset func()) error
+
+	// view can be used to perform reads on the given bucket.
+	view(f func(bkt kvdb.RBucket) error, reset func()) error
+
+	// purge will delete all the contents in this store.
+	purge() error
+}
 
 // missionControlStore is a bolt db based implementation of a mission control
 // store. It stores the raw payment attempt data from which the internal mission
@@ -40,8 +48,11 @@ const (
 type missionControlStore struct {
 	done chan struct{}
 	wg   sync.WaitGroup
-	db   kvdb.Backend
+	db   missionControlDB
 
+	// TODO(yy): Remove the usage of sync.Cond - we are better off using
+	// channes than a Cond as suggested in the official godoc.
+	//
 	// queueCond is signalled when items are put into the queue.
 	queueCond *sync.Cond
 
@@ -66,7 +77,7 @@ type missionControlStore struct {
 	flushInterval time.Duration
 }
 
-func newMissionControlStore(db kvdb.Backend, maxRecords int,
+func newMissionControlStore(db missionControlDB, maxRecords int,
 	flushInterval time.Duration) (*missionControlStore, error) {
 
 	var (
@@ -75,13 +86,7 @@ func newMissionControlStore(db kvdb.Backend, maxRecords int,
 	)
 
 	// Create buckets if not yet existing.
-	err := kvdb.Update(db, func(tx kvdb.RwTx) error {
-		resultsBucket, err := tx.CreateTopLevelBucket(resultsKey)
-		if err != nil {
-			return fmt.Errorf("cannot create results bucket: %w",
-				err)
-		}
-
+	err := db.update(func(resultsBucket kvdb.RwBucket) error {
 		// Collect all keys to be able to quickly calculate the
 		// difference when updating the DB state.
 		c := resultsBucket.ReadCursor()
@@ -118,47 +123,108 @@ func (b *missionControlStore) clear() error {
 	b.queueCond.L.Lock()
 	defer b.queueCond.L.Unlock()
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		if err := tx.DeleteTopLevelBucket(resultsKey); err != nil {
-			return err
-		}
-
-		_, err := tx.CreateTopLevelBucket(resultsKey)
-		return err
-	}, func() {})
-
-	if err != nil {
+	if err := b.db.purge(); err != nil {
 		return err
 	}
 
 	b.queue = list.New()
+
 	return nil
 }
 
 // fetchAll returns all results currently stored in the database.
+// It also removes any corrupted entries that fail to deserialize from both
+// the database and the in-memory tracking structures.
 func (b *missionControlStore) fetchAll() ([]*paymentResult, error) {
 	var results []*paymentResult
+	var corruptedKeys [][]byte
 
-	err := kvdb.View(b.db, func(tx kvdb.RTx) error {
-		resultBucket := tx.ReadBucket(resultsKey)
+	// Read all results and identify corrupted entries.
+	err := b.db.view(func(resultBucket kvdb.RBucket) error {
 		results = make([]*paymentResult, 0)
+		corruptedKeys = make([][]byte, 0)
 
-		return resultBucket.ForEach(func(k, v []byte) error {
+		err := resultBucket.ForEach(func(k, v []byte) error {
 			result, err := deserializeResult(k, v)
+
+			// In case of an error, track the key for removal.
 			if err != nil {
-				return err
+				log.Warnf("Failed to deserialize mission "+
+					"control entry (key=%x): %v", k, err)
+
+				// Make a copy of the key since ForEach reuses
+				// the slice.
+				keyCopy := make([]byte, len(k))
+				copy(keyCopy, k)
+				corruptedKeys = append(corruptedKeys, keyCopy)
+
+				return nil
 			}
 
 			results = append(results, result)
 
 			return nil
 		})
+		if err != nil {
+			return err
+		}
 
+		return nil
 	}, func() {
 		results = nil
+		corruptedKeys = nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Delete corrupted entries from the database which were identified
+	// when loading the results from the database.
+	//
+	// TODO: This code part should eventually be removed once we move the
+	// mission control store to a native sql database and have to do a
+	// full migration of the data.
+	if len(corruptedKeys) > 0 {
+		err = b.db.update(func(resultBucket kvdb.RwBucket) error {
+			for _, key := range corruptedKeys {
+				if err := resultBucket.Delete(key); err != nil {
+					return fmt.Errorf("failed to delete "+
+						"corrupted entry: %w", err)
+				}
+			}
+
+			return nil
+		}, func() {})
+		if err != nil {
+			return nil, err
+		}
+
+		// Build a set of corrupted keys.
+		corruptedSet := make(map[string]struct{}, len(corruptedKeys))
+		for _, key := range corruptedKeys {
+			corruptedSet[string(key)] = struct{}{}
+		}
+
+		// Remove corrupted keys from in-memory map.
+		for keyStr := range corruptedSet {
+			delete(b.keysMap, keyStr)
+		}
+
+		// Remove from the keys list in a single pass.
+		for e := b.keys.Front(); e != nil; {
+			next := e.Next()
+			keyVal, ok := e.Value.(string)
+			if ok {
+				_, isCorrupted := corruptedSet[keyVal]
+				if isCorrupted {
+					b.keys.Remove(e)
+				}
+			}
+			e = next
+		}
+
+		log.Infof("Removed %d corrupted mission control entries",
+			len(corruptedKeys))
 	}
 
 	return results, nil
@@ -167,48 +233,30 @@ func (b *missionControlStore) fetchAll() ([]*paymentResult, error) {
 // serializeResult serializes a payment result and returns a key and value byte
 // slice to insert into the bucket.
 func serializeResult(rp *paymentResult) ([]byte, []byte, error) {
-	// Write timestamps, success status, failure source index and route.
-	var b bytes.Buffer
-
-	var dbFailureSourceIdx int32
-	if rp.failureSourceIdx == nil {
-		dbFailureSourceIdx = unknownFailureSourceIdx
-	} else {
-		dbFailureSourceIdx = int32(*rp.failureSourceIdx)
+	recordProducers := []tlv.RecordProducer{
+		&rp.timeFwd,
+		&rp.timeReply,
+		&rp.route,
 	}
 
-	err := channeldb.WriteElements(
-		&b,
-		uint64(rp.timeFwd.UnixNano()),
-		uint64(rp.timeReply.UnixNano()),
-		rp.success, dbFailureSourceIdx,
+	rp.failure.WhenSome(
+		func(failure tlv.RecordT[tlv.TlvType3, paymentFailure]) {
+			recordProducers = append(recordProducers, &failure)
+		},
+	)
+
+	// Compose key that identifies this result.
+	key := getResultKey(rp)
+
+	var buff bytes.Buffer
+	err := lnwire.EncodeRecordsTo(
+		&buff, lnwire.ProduceRecordsSorted(recordProducers...),
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if err := channeldb.SerializeRoute(&b, *rp.route); err != nil {
-		return nil, nil, err
-	}
-
-	// Write failure. If there is no failure message, write an empty
-	// byte slice.
-	var failureBytes bytes.Buffer
-	if rp.failure != nil {
-		err := lnwire.EncodeFailureMessage(&failureBytes, rp.failure, 0)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	err = wire.WriteVarBytes(&b, 0, failureBytes.Bytes())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Compose key that identifies this result.
-	key := getResultKey(rp)
-
-	return key, b.Bytes(), nil
+	return key, buff.Bytes(), nil
 }
 
 // deserializeResult deserializes a payment result.
@@ -218,55 +266,113 @@ func deserializeResult(k, v []byte) (*paymentResult, error) {
 		id: byteOrder.Uint64(k[8:]),
 	}
 
+	failure := tlv.ZeroRecordT[tlv.TlvType3, paymentFailure]()
+	recordProducers := []tlv.RecordProducer{
+		&result.timeFwd,
+		&result.timeReply,
+		&result.route,
+		&failure,
+	}
+
 	r := bytes.NewReader(v)
-
-	// Read timestamps, success status and failure source index.
-	var (
-		timeFwd, timeReply uint64
-		dbFailureSourceIdx int32
-	)
-
-	err := channeldb.ReadElements(
-		r, &timeFwd, &timeReply, &result.success, &dbFailureSourceIdx,
+	typeMap, err := lnwire.DecodeRecords(
+		r, lnwire.ProduceRecordsSorted(recordProducers...)...,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert time stamps to local time zone for consistent logging.
-	result.timeFwd = time.Unix(0, int64(timeFwd)).Local()
-	result.timeReply = time.Unix(0, int64(timeReply)).Local()
-
-	// Convert from unknown index magic number to nil value.
-	if dbFailureSourceIdx != unknownFailureSourceIdx {
-		failureSourceIdx := int(dbFailureSourceIdx)
-		result.failureSourceIdx = &failureSourceIdx
-	}
-
-	// Read route.
-	route, err := channeldb.DeserializeRoute(r)
-	if err != nil {
-		return nil, err
-	}
-	result.route = &route
-
-	// Read failure.
-	failureBytes, err := wire.ReadVarBytes(
-		r, 0, math.MaxUint16, "failure",
-	)
-	if err != nil {
-		return nil, err
-	}
-	if len(failureBytes) > 0 {
-		result.failure, err = lnwire.DecodeFailureMessage(
-			bytes.NewReader(failureBytes), 0,
-		)
-		if err != nil {
-			return nil, err
-		}
+	if _, ok := typeMap[result.failure.TlvType()]; ok {
+		result.failure = tlv.SomeRecordT(failure)
 	}
 
 	return &result, nil
+}
+
+// serializeRoute serializes a mcRoute and writes the resulting bytes to the
+// given io.Writer.
+func serializeRoute(w io.Writer, r *mcRoute) error {
+	records := lnwire.ProduceRecordsSorted(
+		&r.sourcePubKey,
+		&r.totalAmount,
+		&r.hops,
+	)
+
+	return lnwire.EncodeRecordsTo(w, records)
+}
+
+// deserializeRoute deserializes the mcRoute from the given io.Reader.
+func deserializeRoute(r io.Reader) (*mcRoute, error) {
+	var rt mcRoute
+	records := lnwire.ProduceRecordsSorted(
+		&rt.sourcePubKey,
+		&rt.totalAmount,
+		&rt.hops,
+	)
+
+	_, err := lnwire.DecodeRecords(r, records...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &rt, nil
+}
+
+// deserializeHop deserializes the mcHop from the given io.Reader.
+func deserializeHop(r io.Reader) (*mcHop, error) {
+	var (
+		h        mcHop
+		blinding = tlv.ZeroRecordT[tlv.TlvType3, lnwire.TrueBoolean]()
+		custom   = tlv.ZeroRecordT[tlv.TlvType4, lnwire.TrueBoolean]()
+	)
+	records := lnwire.ProduceRecordsSorted(
+		&h.channelID,
+		&h.pubKeyBytes,
+		&h.amtToFwd,
+		&blinding,
+		&custom,
+	)
+
+	typeMap, err := lnwire.DecodeRecords(r, records...)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, ok := typeMap[h.hasBlindingPoint.TlvType()]; ok {
+		h.hasBlindingPoint = tlv.SomeRecordT(blinding)
+	}
+
+	if _, ok := typeMap[h.hasCustomRecords.TlvType()]; ok {
+		h.hasCustomRecords = tlv.SomeRecordT(custom)
+	}
+
+	return &h, nil
+}
+
+// serializeHop serializes a mcHop and writes the resulting bytes to the given
+// io.Writer.
+func serializeHop(w io.Writer, h *mcHop) error {
+	recordProducers := []tlv.RecordProducer{
+		&h.channelID,
+		&h.pubKeyBytes,
+		&h.amtToFwd,
+	}
+
+	h.hasBlindingPoint.WhenSome(func(
+		hasBlinding tlv.RecordT[tlv.TlvType3, lnwire.TrueBoolean]) {
+
+		recordProducers = append(recordProducers, &hasBlinding)
+	})
+
+	h.hasCustomRecords.WhenSome(func(
+		hasCustom tlv.RecordT[tlv.TlvType4, lnwire.TrueBoolean]) {
+
+		recordProducers = append(recordProducers, &hasCustom)
+	})
+
+	return lnwire.EncodeRecordsTo(
+		w, lnwire.ProduceRecordsSorted(recordProducers...),
+	)
 }
 
 // AddResult adds a new result to the db.
@@ -314,8 +420,14 @@ func (b *missionControlStore) run() {
 			// Wait for the queue to not be empty.
 			b.queueCond.L.Lock()
 			for b.queue.Front() == nil {
-				b.queueCond.Wait()
-
+				// To make sure we can properly stop, we must
+				// read the `done` channel first before
+				// attempting to call `Wait()`. This is due to
+				// the fact when `Signal` is called before the
+				// `Wait` call, the `Wait` call will block
+				// indefinitely.
+				//
+				// TODO(yy): replace this with channels.
 				select {
 				case <-b.done:
 					b.queueCond.L.Unlock()
@@ -323,6 +435,8 @@ func (b *missionControlStore) run() {
 					return
 				default:
 				}
+
+				b.queueCond.Wait()
 			}
 			b.queueCond.L.Unlock()
 
@@ -426,9 +540,7 @@ func (b *missionControlStore) storeResults() error {
 		}
 	}
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		bucket := tx.ReadWriteBucket(resultsKey)
-
+	err := b.db.update(func(bucket kvdb.RwBucket) error {
 		for e := l.Front(); e != nil; e = e.Next() {
 			pr, ok := e.Value.(*paymentResult)
 			if !ok {
@@ -497,9 +609,70 @@ func getResultKey(rp *paymentResult) []byte {
 	// key. This allows importing mission control data from an external
 	// source without key collisions and keeps the records sorted
 	// chronologically.
-	byteOrder.PutUint64(keyBytes[:], uint64(rp.timeReply.UnixNano()))
+	byteOrder.PutUint64(keyBytes[:], rp.timeReply.Val)
 	byteOrder.PutUint64(keyBytes[8:], rp.id)
-	copy(keyBytes[16:], rp.route.SourcePubKey[:])
+	copy(keyBytes[16:], rp.route.Val.sourcePubKey.Val[:])
 
 	return keyBytes[:]
+}
+
+// failureMessage wraps the lnwire.FailureMessage interface such that we can
+// apply a Record method and use the failureMessage in a TLV encoded type.
+type failureMessage struct {
+	lnwire.FailureMessage
+}
+
+// Record returns a TLV record that can be used to encode/decode a list of
+// failureMessage to/from a TLV stream.
+func (r *failureMessage) Record() tlv.Record {
+	recordSize := func() uint64 {
+		var (
+			b   bytes.Buffer
+			buf [8]byte
+		)
+		if err := encodeFailureMessage(&b, r, &buf); err != nil {
+			panic(err)
+		}
+
+		return uint64(len(b.Bytes()))
+	}
+
+	return tlv.MakeDynamicRecord(
+		0, r, recordSize, encodeFailureMessage, decodeFailureMessage,
+	)
+}
+
+func encodeFailureMessage(w io.Writer, val interface{}, _ *[8]byte) error {
+	if v, ok := val.(*failureMessage); ok {
+		var b bytes.Buffer
+		err := lnwire.EncodeFailureMessage(&b, v.FailureMessage, 0)
+		if err != nil {
+			return err
+		}
+
+		_, err = w.Write(b.Bytes())
+
+		return err
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "routing.failureMessage")
+}
+
+func decodeFailureMessage(r io.Reader, val interface{}, _ *[8]byte,
+	l uint64) error {
+
+	if v, ok := val.(*failureMessage); ok {
+		msg, err := lnwire.DecodeFailureMessage(r, 0)
+		if err != nil {
+			return err
+		}
+
+		*v = failureMessage{
+			FailureMessage: msg,
+		}
+
+		return nil
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "routing.failureMessage", l, l)
 }

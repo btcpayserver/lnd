@@ -3,6 +3,7 @@
 package sqldb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -27,14 +28,23 @@ const (
 )
 
 var (
-	// sqliteSchemaReplacements is a map of schema strings that need to be
-	// replaced for sqlite. This is needed because sqlite doesn't directly
-	// support the BIGINT type for primary keys, so we need to replace it
-	// with INTEGER.
-	sqliteSchemaReplacements = map[string]string{
-		"BIGINT PRIMARY KEY": "INTEGER PRIMARY KEY",
-	}
+	// sqliteSchemaReplacements maps schema strings to their SQLite
+	// compatible replacements. Currently, no replacements are needed as our
+	// SQL schema definition files are designed for SQLite compatibility.
+	sqliteSchemaReplacements = map[string]string{}
+
+	// Make sure SqliteStore implements the MigrationExecutor interface.
+	_ MigrationExecutor = (*SqliteStore)(nil)
+
+	// Make sure SqliteStore implements the DB interface.
+	_ DB = (*SqliteStore)(nil)
 )
+
+// pragmaOption holds a key-value pair for a SQLite pragma setting.
+type pragmaOption struct {
+	name  string
+	value string
+}
 
 // SqliteStore is a database store implementation that uses a sqlite backend.
 type SqliteStore struct {
@@ -49,10 +59,7 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 	// The set of pragma options are accepted using query options. For now
 	// we only want to ensure that foreign key constraints are properly
 	// enforced.
-	pragmaOptions := []struct {
-		name  string
-		value string
-	}{
+	pragmaOptions := []pragmaOption{
 		{
 			name:  "foreign_keys",
 			value: "on",
@@ -63,7 +70,7 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 		},
 		{
 			name:  "busy_timeout",
-			value: "5000",
+			value: fmt.Sprintf("%d", cfg.busyTimeoutMs()),
 		},
 		{
 			// With the WAL mode, this ensures that we also do an
@@ -80,6 +87,10 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 			name:  "fullfsync",
 			value: "true",
 		},
+		{
+			name:  "auto_vacuum",
+			value: "incremental",
+		},
 	}
 	sqliteOptions := make(url.Values)
 	for _, option := range pragmaOptions {
@@ -87,6 +98,12 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 			sqliteOptionPrefix,
 			fmt.Sprintf("%v=%v", option.name, option.value),
 		)
+	}
+
+	// Then we add any user specified pragma options. Note that these can
+	// be of the form: "key=value", "key(N)" or "key".
+	for _, option := range cfg.PragmaOptions {
+		sqliteOptions.Add(sqliteOptionPrefix, option)
 	}
 
 	// Construct the DSN which is just the database file name, appended
@@ -102,8 +119,25 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 		return nil, err
 	}
 
-	db.SetMaxOpenConns(defaultMaxConns)
-	db.SetMaxIdleConns(defaultMaxConns)
+	// Create the migration tracker table before starting migrations to
+	// ensure it can be used to track migration progress. Note that a
+	// corresponding SQLC migration also creates this table, making this
+	// operation a no-op in that context. Its purpose is to ensure
+	// compatibility with SQLC query generation.
+	migrationTrackerSQL := `
+	CREATE TABLE IF NOT EXISTS migration_tracker (
+		version INTEGER UNIQUE NOT NULL,
+		migration_time TIMESTAMP NOT NULL
+	);`
+
+	_, err = db.Exec(migrationTrackerSQL)
+	if err != nil {
+		return nil, fmt.Errorf("error creating migration tracker: %w",
+			err)
+	}
+
+	db.SetMaxOpenConns(cfg.MaxConns())
+	db.SetMaxIdleConns(cfg.MaxConns())
 	db.SetConnMaxLifetime(connIdleLifetime)
 	queries := sqlc.New(db)
 
@@ -115,16 +149,30 @@ func NewSqliteStore(cfg *SqliteConfig, dbPath string) (*SqliteStore, error) {
 		},
 	}
 
-	// Execute migrations unless configured to skip them.
-	if !cfg.SkipMigrations {
-		if err := s.ExecuteMigrations(TargetLatest); err != nil {
-			return nil, fmt.Errorf("error executing migrations: "+
-				"%w", err)
+	return s, nil
+}
 
-		}
+// GetBaseDB returns the underlying BaseDB instance for the SQLite store.
+// It is a trivial helper method to comply with the sqldb.DB interface.
+func (s *SqliteStore) GetBaseDB() *BaseDB {
+	return s.BaseDB
+}
+
+// ApplyAllMigrations applies both the SQLC and custom in-code migrations to the
+// SQLite database.
+func (s *SqliteStore) ApplyAllMigrations(ctx context.Context,
+	migrations []MigrationConfig) error {
+
+	// Execute migrations unless configured to skip them.
+	if s.cfg.SkipMigrations {
+		return nil
 	}
 
-	return s, nil
+	return ApplyMigrations(ctx, s.BaseDB, s, migrations)
+}
+
+func errSqliteMigration(err error) error {
+	return fmt.Errorf("error creating sqlite migration: %w", err)
 }
 
 // ExecuteMigrations runs migrations for the sqlite database, depending on the
@@ -134,7 +182,7 @@ func (s *SqliteStore) ExecuteMigrations(target MigrationTarget) error {
 		s.DB, &sqlite_migrate.Config{},
 	)
 	if err != nil {
-		return fmt.Errorf("error creating sqlite migration: %w", err)
+		return errSqliteMigration(err)
 	}
 
 	// Populate the database with our set of schemas based on our embedded
@@ -145,9 +193,40 @@ func (s *SqliteStore) ExecuteMigrations(target MigrationTarget) error {
 	)
 }
 
+// GetSchemaVersion returns the current schema version of the SQLite database.
+func (s *SqliteStore) GetSchemaVersion() (int, bool, error) {
+	driver, err := sqlite_migrate.WithInstance(
+		s.DB, &sqlite_migrate.Config{},
+	)
+	if err != nil {
+		return 0, false, errSqliteMigration(err)
+	}
+
+	version, dirty, err := driver.Version()
+	if err != nil {
+		return 0, dirty, err
+	}
+
+	return version, dirty, nil
+}
+
+// SetSchemaVersion sets the schema version of the SQLite database.
+//
+// NOTE: This alters the internal database schema tracker. USE WITH CAUTION!!!
+func (s *SqliteStore) SetSchemaVersion(version int, dirty bool) error {
+	driver, err := sqlite_migrate.WithInstance(
+		s.DB, &sqlite_migrate.Config{},
+	)
+	if err != nil {
+		return errSqliteMigration(err)
+	}
+
+	return driver.SetVersion(version, dirty)
+}
+
 // NewTestSqliteDB is a helper function that creates an SQLite database for
 // testing.
-func NewTestSqliteDB(t *testing.T) *SqliteStore {
+func NewTestSqliteDB(t testing.TB) *SqliteStore {
 	t.Helper()
 
 	t.Logf("Creating new SQLite DB for testing")
@@ -159,6 +238,10 @@ func NewTestSqliteDB(t *testing.T) *SqliteStore {
 		SkipMigrations: false,
 	}, dbFileName)
 	require.NoError(t, err)
+
+	require.NoError(t, sqlDB.ApplyAllMigrations(
+		context.Background(), GetMigrations()),
+	)
 
 	t.Cleanup(func() {
 		require.NoError(t, sqlDB.DB.Close())

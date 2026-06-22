@@ -41,9 +41,8 @@ func testSingleConfirmationNotification(miner *rpctest.Harness,
 	// function.
 	txid, pkScript, err := chainntnfs.GetTestTxidAndScript(miner)
 	require.NoError(t, err, "unable to create test tx")
-	if err := chainntnfs.WaitForMempoolTx(miner, txid); err != nil {
-		t.Fatalf("tx not relayed to miner: %v", err)
-	}
+	err = chainntnfs.WaitForMempoolTx(miner, txid)
+	require.NoError(t, err, "tx not relayed to miner")
 
 	_, currentHeight, err := miner.Client.GetBestBlock()
 	require.NoError(t, err, "unable to get current height")
@@ -67,6 +66,11 @@ func testSingleConfirmationNotification(miner *rpctest.Harness,
 	// should trigger a notification event.
 	blockHash, err := miner.Client.Generate(1)
 	require.NoError(t, err, "unable to generate single block")
+
+	// Assert the above tx is mined in the block.
+	block, err := miner.Client.GetBlock(blockHash[0])
+	require.NoError(t, err)
+	require.Len(t, block.Transactions, 2, "block does not contain tx")
 
 	select {
 	case confInfo := <-confIntent.Confirmed:
@@ -1906,10 +1910,8 @@ func TestInterfaces(t *testing.T, targetBackEnd string) {
 
 		// Initialize a height hint cache for each notifier.
 		tempDir := t.TempDir()
-		db, err := channeldb.Open(tempDir)
-		if err != nil {
-			t.Fatalf("unable to create db: %v", err)
-		}
+		db := channeldb.OpenForTesting(t, tempDir)
+
 		testCfg := channeldb.CacheConfig{
 			QueryDisable: false,
 		}
@@ -1930,7 +1932,7 @@ func TestInterfaces(t *testing.T, targetBackEnd string) {
 		case "bitcoind":
 			var bitcoindConn *chain.BitcoindConn
 			bitcoindConn = unittest.NewBitcoindBackend(
-				t, unittest.NetParams, p2pAddr, true, false,
+				t, unittest.NetParams, miner, true, false,
 			)
 			newNotifier = func() (chainntnfs.TestChainNotifier, error) {
 				return bitcoindnotify.New(
@@ -1942,7 +1944,7 @@ func TestInterfaces(t *testing.T, targetBackEnd string) {
 		case "bitcoind-rpc-polling":
 			var bitcoindConn *chain.BitcoindConn
 			bitcoindConn = unittest.NewBitcoindBackend(
-				t, unittest.NetParams, p2pAddr, true, true,
+				t, unittest.NetParams, miner, true, true,
 			)
 			newNotifier = func() (chainntnfs.TestChainNotifier, error) {
 				return bitcoindnotify.New(

@@ -1,6 +1,7 @@
 package invoices
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -10,9 +11,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -24,6 +24,28 @@ const (
 	// defaultQueryPaginationLimit is used in the LIMIT clause of the SQL
 	// queries to limit the number of rows returned.
 	defaultQueryPaginationLimit = 100
+
+	// invoiceProgressLogInterval is the interval we use limiting the
+	// logging output of invoice processing.
+	invoiceProgressLogInterval = 30 * time.Second
+)
+
+var (
+	// invoiceCreatedAfterDefault is the lower-bound sentinel for the
+	// created_at timestamp filter used by FilterInvoicesForward and
+	// FilterInvoicesReverse. time.Unix(0, 0) precedes any real invoice
+	// creation date, so passing this value tells the planner "no lower
+	// bound" while still providing a concrete, non-nullable parameter.
+	invoiceCreatedAfterDefault = time.Unix(0, 0).UTC()
+
+	// invoiceCreatedBeforeDefault is the upper-bound sentinel for the
+	// created_at timestamp filter. Year 9999 lies far beyond any
+	// foreseeable invoice creation date, so passing this value tells the
+	// planner "no upper bound" while still keeping the parameter
+	// non-nullable.
+	invoiceCreatedBeforeDefault = time.Date(
+		9999, 12, 31, 23, 59, 59, 0, time.UTC,
+	)
 )
 
 // SQLInvoiceQueries is an interface that defines the set of operations that can
@@ -31,6 +53,10 @@ const (
 type SQLInvoiceQueries interface { //nolint:interfacebloat
 	InsertInvoice(ctx context.Context, arg sqlc.InsertInvoiceParams) (int64,
 		error)
+
+	// TODO(bhandras): remove this once migrations have been separated out.
+	InsertMigratedInvoice(ctx context.Context,
+		arg sqlc.InsertMigratedInvoiceParams) (int64, error)
 
 	InsertInvoiceFeature(ctx context.Context,
 		arg sqlc.InsertInvoiceFeatureParams) error
@@ -41,11 +67,44 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 	InsertInvoiceHTLCCustomRecord(ctx context.Context,
 		arg sqlc.InsertInvoiceHTLCCustomRecordParams) error
 
-	FilterInvoices(ctx context.Context,
-		arg sqlc.FilterInvoicesParams) ([]sqlc.Invoice, error)
+	// FetchPendingInvoices returns all open/accepted invoices ordered by
+	// id ascending. It replaces the old catch-all FilterInvoices for the
+	// pending-only path and lets the planner use invoices_state_idx.
+	FetchPendingInvoices(ctx context.Context,
+		arg sqlc.FetchPendingInvoicesParams) ([]sqlc.Invoice, error)
 
-	GetInvoice(ctx context.Context,
-		arg sqlc.GetInvoiceParams) ([]sqlc.Invoice, error)
+	// FilterInvoicesBySettleIndex returns settled invoices whose
+	// settle_index is >= the given bound, ordered by id ascending. The
+	// caller must always supply a concrete lower bound so the planner can
+	// use invoices_settle_index_idx.
+	FilterInvoicesBySettleIndex(ctx context.Context,
+		arg sqlc.FilterInvoicesBySettleIndexParams) ([]sqlc.Invoice,
+		error)
+
+	// FilterInvoicesByAddIndex returns invoices whose primary-key id is >=
+	// the given bound, ordered by id ascending. Because id is the primary
+	// key, this is always a range scan on the clustered index.
+	FilterInvoicesByAddIndex(ctx context.Context,
+		arg sqlc.FilterInvoicesByAddIndexParams) ([]sqlc.Invoice, error)
+
+	// FilterInvoicesForward returns invoices in ascending id order. All
+	// parameters are non-nullable so the planner always sees plain range
+	// predicates. Callers must supply Go-side defaults for unused filters
+	// (see FilterInvoicesForwardParams).
+	FilterInvoicesForward(ctx context.Context,
+		arg sqlc.FilterInvoicesForwardParams) ([]sqlc.Invoice, error)
+
+	// FilterInvoicesReverse is the descending counterpart of
+	// FilterInvoicesForward. See FilterInvoicesForwardParams for the
+	// expected Go-side defaults.
+	FilterInvoicesReverse(ctx context.Context,
+		arg sqlc.FilterInvoicesReverseParams) ([]sqlc.Invoice, error)
+
+	GetInvoiceByHash(ctx context.Context, hash []byte) (sqlc.Invoice,
+		error)
+
+	GetInvoiceByAddr(ctx context.Context,
+		paymentAddr []byte) (sqlc.Invoice, error)
 
 	GetInvoiceBySetID(ctx context.Context, setID []byte) ([]sqlc.Invoice,
 		error)
@@ -78,6 +137,10 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 	// AMP sub invoice specific methods.
 	UpsertAMPSubInvoice(ctx context.Context,
 		arg sqlc.UpsertAMPSubInvoiceParams) (sql.Result, error)
+
+	// TODO(bhandras): remove this once migrations have been separated out.
+	InsertAMPSubInvoice(ctx context.Context,
+		arg sqlc.InsertAMPSubInvoiceParams) error
 
 	UpdateAMPSubInvoiceState(ctx context.Context,
 		arg sqlc.UpdateAMPSubInvoiceStateParams) error
@@ -119,30 +182,22 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 
 	OnAMPSubInvoiceSettled(ctx context.Context,
 		arg sqlc.OnAMPSubInvoiceSettledParams) error
+
+	// Migration specific methods.
+	// TODO(bhandras): remove this once migrations have been separated out.
+	InsertKVInvoiceKeyAndAddIndex(ctx context.Context,
+		arg sqlc.InsertKVInvoiceKeyAndAddIndexParams) error
+
+	SetKVInvoicePaymentHash(ctx context.Context,
+		arg sqlc.SetKVInvoicePaymentHashParams) error
+
+	GetKVInvoicePaymentHashByAddIndex(ctx context.Context, addIndex int64) (
+		[]byte, error)
+
+	ClearKVInvoiceHashIndex(ctx context.Context) error
 }
 
 var _ InvoiceDB = (*SQLStore)(nil)
-
-// SQLInvoiceQueriesTxOptions defines the set of db txn options the
-// SQLInvoiceQueries understands.
-type SQLInvoiceQueriesTxOptions struct {
-	// readOnly governs if a read only transaction is needed or not.
-	readOnly bool
-}
-
-// ReadOnly returns true if the transaction should be read only.
-//
-// NOTE: This implements the TxOptions.
-func (a *SQLInvoiceQueriesTxOptions) ReadOnly() bool {
-	return a.readOnly
-}
-
-// NewSQLInvoiceQueryReadTx creates a new read transaction option set.
-func NewSQLInvoiceQueryReadTx() SQLInvoiceQueriesTxOptions {
-	return SQLInvoiceQueriesTxOptions{
-		readOnly: true,
-	}
-}
 
 // BatchedSQLInvoiceQueries is a version of the SQLInvoiceQueries that's capable
 // of batched database operations.
@@ -200,6 +255,66 @@ func NewSQLStore(db BatchedSQLInvoiceQueries,
 	}
 }
 
+func makeInsertInvoiceParams(invoice *Invoice, paymentHash lntypes.Hash) (
+	sqlc.InsertInvoiceParams, error) {
+
+	// Precompute the payment request hash so we can use it in the query.
+	var paymentRequestHash []byte
+	if len(invoice.PaymentRequest) > 0 {
+		h := sha256.New()
+		h.Write(invoice.PaymentRequest)
+		paymentRequestHash = h.Sum(nil)
+	}
+
+	params := sqlc.InsertInvoiceParams{
+		Hash:       paymentHash[:],
+		AmountMsat: int64(invoice.Terms.Value),
+		CltvDelta: sqldb.SQLInt32(
+			invoice.Terms.FinalCltvDelta,
+		),
+		Expiry: int32(invoice.Terms.Expiry.Seconds()),
+		// Note: keysend invoices don't have a payment request.
+		PaymentRequest: sqldb.SQLStr(string(
+			invoice.PaymentRequest),
+		),
+		PaymentRequestHash: paymentRequestHash,
+		State:              int16(invoice.State),
+		AmountPaidMsat:     int64(invoice.AmtPaid),
+		IsAmp:              invoice.IsAMP(),
+		IsHodl:             invoice.HodlInvoice,
+		IsKeysend:          invoice.IsKeysend(),
+		CreatedAt:          invoice.CreationDate.UTC(),
+	}
+
+	if invoice.Memo != nil {
+		// Store the memo as a nullable string in the database. Note
+		// that for compatibility reasons, we store the value as a valid
+		// string even if it's empty.
+		params.Memo = sql.NullString{
+			String: string(invoice.Memo),
+			Valid:  true,
+		}
+	}
+
+	// Some invoices may not have a preimage, like in the case of HODL
+	// invoices.
+	if invoice.Terms.PaymentPreimage != nil {
+		preimage := *invoice.Terms.PaymentPreimage
+		if preimage == UnknownPreimage {
+			return sqlc.InsertInvoiceParams{},
+				errors.New("cannot use all-zeroes preimage")
+		}
+		params.Preimage = preimage[:]
+	}
+
+	// Some non MPP payments may have the default (invalid) value.
+	if invoice.Terms.PaymentAddr != BlankPayAddr {
+		params.PaymentAddr = invoice.Terms.PaymentAddr[:]
+	}
+
+	return params, nil
+}
+
 // AddInvoice inserts the targeted invoice into the database. If the invoice has
 // *any* payment hashes which already exists within the database, then the
 // insertion will be aborted and rejected due to the strict policy banning any
@@ -216,59 +331,20 @@ func (i *SQLStore) AddInvoice(ctx context.Context,
 	}
 
 	var (
-		writeTxOpts SQLInvoiceQueriesTxOptions
+		writeTxOpts = sqldb.WriteTxOpt()
 		invoiceID   int64
 	)
 
-	// Precompute the payment request hash so we can use it in the query.
-	var paymentRequestHash []byte
-	if len(newInvoice.PaymentRequest) > 0 {
-		h := sha256.New()
-		h.Write(newInvoice.PaymentRequest)
-		paymentRequestHash = h.Sum(nil)
+	insertInvoiceParams, err := makeInsertInvoiceParams(
+		newInvoice, paymentHash,
+	)
+	if err != nil {
+		return 0, err
 	}
 
-	err := i.db.ExecTx(ctx, &writeTxOpts, func(db SQLInvoiceQueries) error {
-		params := sqlc.InsertInvoiceParams{
-			Hash:       paymentHash[:],
-			Memo:       sqldb.SQLStr(string(newInvoice.Memo)),
-			AmountMsat: int64(newInvoice.Terms.Value),
-			// Note: BOLT12 invoices don't have a final cltv delta.
-			CltvDelta: sqldb.SQLInt32(
-				newInvoice.Terms.FinalCltvDelta,
-			),
-			Expiry: int32(newInvoice.Terms.Expiry.Seconds()),
-			// Note: keysend invoices don't have a payment request.
-			PaymentRequest: sqldb.SQLStr(string(
-				newInvoice.PaymentRequest),
-			),
-			PaymentRequestHash: paymentRequestHash,
-			State:              int16(newInvoice.State),
-			AmountPaidMsat:     int64(newInvoice.AmtPaid),
-			IsAmp:              newInvoice.IsAMP(),
-			IsHodl:             newInvoice.HodlInvoice,
-			IsKeysend:          newInvoice.IsKeysend(),
-			CreatedAt:          newInvoice.CreationDate.UTC(),
-		}
-
-		// Some invoices may not have a preimage, like in the case of
-		// HODL invoices.
-		if newInvoice.Terms.PaymentPreimage != nil {
-			preimage := *newInvoice.Terms.PaymentPreimage
-			if preimage == UnknownPreimage {
-				return errors.New("cannot use all-zeroes " +
-					"preimage")
-			}
-			params.Preimage = preimage[:]
-		}
-
-		// Some non MPP payments may have the default (invalid) value.
-		if newInvoice.Terms.PaymentAddr != BlankPayAddr {
-			params.PaymentAddr = newInvoice.Terms.PaymentAddr[:]
-		}
-
+	err = i.db.ExecTx(ctx, writeTxOpts, func(db SQLInvoiceQueries) error {
 		var err error
-		invoiceID, err = db.InsertInvoice(ctx, params)
+		invoiceID, err = db.InsertInvoice(ctx, insertInvoiceParams)
 		if err != nil {
 			return fmt.Errorf("unable to insert invoice: %w", err)
 		}
@@ -294,7 +370,7 @@ func (i *SQLStore) AddInvoice(ctx context.Context,
 			AddedAt:   newInvoice.CreationDate.UTC(),
 			InvoiceID: invoiceID,
 		})
-	}, func() {})
+	}, sqldb.NoOpReset)
 	if err != nil {
 		mappedSQLErr := sqldb.MapSQLError(err)
 		var uniqueConstraintErr *sqldb.ErrSQLUniqueConstraintViolation
@@ -312,69 +388,97 @@ func (i *SQLStore) AddInvoice(ctx context.Context,
 	return newInvoice.AddIndex, nil
 }
 
+// getInvoiceByRef fetches the invoice with the given reference. The reference
+// may be a payment hash, a payment address, or a set ID for an AMP sub invoice.
+func getInvoiceByRef(ctx context.Context,
+	db SQLInvoiceQueries, ref InvoiceRef) (sqlc.Invoice, error) {
+
+	// If the reference is empty, we can't look up the invoice.
+	if ref.PayHash() == nil && ref.PayAddr() == nil && ref.SetID() == nil {
+		return sqlc.Invoice{}, ErrInvoiceNotFound
+	}
+
+	// If the reference contains a payment hash we can look up the invoice
+	// directly by hash using the unique index, avoiding a full table scan.
+	// The hash alone uniquely identifies any invoice so additional fields
+	// in the ref (payment address, set ID) are not needed for the lookup.
+	if ref.PayHash() != nil {
+		invoice, err := db.GetInvoiceByHash(ctx, ref.PayHash()[:])
+		if errors.Is(err, sql.ErrNoRows) {
+			return sqlc.Invoice{}, ErrInvoiceNotFound
+		}
+		if err != nil {
+			return sqlc.Invoice{}, fmt.Errorf("unable to fetch "+
+				"invoice by hash: %w", err)
+		}
+
+		// If the ref also specifies a payment address, verify it
+		// matches the invoice found by hash. A mismatch means the ref
+		// is equivocating — the hash points to one invoice and the
+		// address points to another.
+		payAddr := ref.PayAddr()
+		if payAddr != nil && *payAddr != BlankPayAddr {
+			if !bytes.Equal(invoice.PaymentAddr, payAddr[:]) {
+				return sqlc.Invoice{}, ErrInvRefEquivocation
+			}
+		}
+
+		return invoice, nil
+	}
+
+	// If the reference contains a payment address (AMP payments), look up
+	// directly by payment address using the unique index.
+	//
+	// NOTE: Pre-0.8 invoices do not have a payment address, and blank
+	// payment addresses are a special case for legacy keysend invoices.
+	// Those are handled by the hash fast path above.
+	payAddr := ref.PayAddr()
+	if payAddr != nil && *payAddr != BlankPayAddr {
+		invoice, err := db.GetInvoiceByAddr(ctx, payAddr[:])
+		if errors.Is(err, sql.ErrNoRows) {
+			return sqlc.Invoice{}, ErrInvoiceNotFound
+		}
+		if err != nil {
+			return sqlc.Invoice{}, fmt.Errorf("unable to fetch "+
+				"invoice by payment address: %w", err)
+		}
+
+		return invoice, nil
+	}
+
+	// If only the set ID is given, look up via the AMP sub-invoice index.
+	if ref.SetID() != nil {
+		rows, err := db.GetInvoiceBySetID(ctx, ref.SetID()[:])
+		if err != nil {
+			return sqlc.Invoice{}, fmt.Errorf("unable to fetch "+
+				"invoice: %w", err)
+		}
+
+		if len(rows) == 0 {
+			return sqlc.Invoice{}, ErrInvoiceNotFound
+		}
+
+		if len(rows) > 1 {
+			return sqlc.Invoice{}, fmt.Errorf("ambiguous "+
+				"invoice ref: set_id=%x matches %d invoices",
+				ref.SetID(), len(rows))
+		}
+
+		return rows[0], nil
+	}
+
+	return sqlc.Invoice{}, ErrInvoiceNotFound
+}
+
 // fetchInvoice fetches the common invoice data and the AMP state for the
 // invoice with the given reference.
-func (i *SQLStore) fetchInvoice(ctx context.Context,
-	db SQLInvoiceQueries, ref InvoiceRef) (*Invoice, error) {
+func fetchInvoice(ctx context.Context, db SQLInvoiceQueries, ref InvoiceRef) (
+	*Invoice, error) {
 
-	if ref.PayHash() == nil && ref.PayAddr() == nil && ref.SetID() == nil {
-		return nil, ErrInvoiceNotFound
-	}
-
-	var (
-		invoice *Invoice
-		params  sqlc.GetInvoiceParams
-	)
-
-	// Given all invoices are uniquely identified by their payment hash,
-	// we can use it to query a specific invoice.
-	if ref.PayHash() != nil {
-		params.Hash = ref.PayHash()[:]
-	}
-
-	// Newer invoices (0.11 and up) are indexed by payment address in
-	// addition to payment hash, but pre 0.8 invoices do not have one at
-	// all. Only allow lookups for payment address if it is not a blank
-	// payment address, which is a special-cased value for legacy keysend
-	// invoices.
-	if ref.PayAddr() != nil && *ref.PayAddr() != BlankPayAddr {
-		params.PaymentAddr = ref.PayAddr()[:]
-	}
-
-	// If the reference has a set ID we'll fetch the invoice which has the
-	// corresponding AMP sub invoice.
-	if ref.SetID() != nil {
-		params.SetID = ref.SetID()[:]
-	}
-
-	var (
-		rows []sqlc.Invoice
-		err  error
-	)
-
-	// We need to split the query based on how we intend to look up the
-	// invoice. If only the set ID is given then we want to have an exact
-	// match on the set ID. If other fields are given, we want to match on
-	// those fields and the set ID but with a less strict join condition.
-	if params.Hash == nil && params.PaymentAddr == nil &&
-		params.SetID != nil {
-
-		rows, err = db.GetInvoiceBySetID(ctx, params.SetID)
-	} else {
-		rows, err = db.GetInvoice(ctx, params)
-	}
-	switch {
-	case len(rows) == 0:
-		return nil, ErrInvoiceNotFound
-
-	case len(rows) > 1:
-		// In case the reference is ambiguous, meaning it matches more
-		// than	one invoice, we'll return an error.
-		return nil, fmt.Errorf("ambiguous invoice ref: %s: %s",
-			ref.String(), spew.Sdump(rows))
-
-	case err != nil:
-		return nil, fmt.Errorf("unable to fetch invoice: %w", err)
+	// Fetch the invoice from the database.
+	sqlInvoice, err := getInvoiceByRef(ctx, db, ref)
+	if err != nil {
+		return nil, err
 	}
 
 	var (
@@ -391,8 +495,8 @@ func (i *SQLStore) fetchInvoice(ctx context.Context,
 		fetchAmpHtlcs = true
 
 	case HtlcSetOnlyModifier:
-		// In this case we'll fetch all AMP HTLCs for the
-		// specified set id.
+		// In this case we'll fetch all AMP HTLCs for the specified set
+		// id.
 		if ref.SetID() == nil {
 			return nil, fmt.Errorf("set ID is required to use " +
 				"the HTLC set only modifier")
@@ -412,8 +516,8 @@ func (i *SQLStore) fetchInvoice(ctx context.Context,
 	}
 
 	// Fetch the rest of the invoice data and fill the invoice struct.
-	_, invoice, err = fetchInvoiceData(
-		ctx, db, rows[0], setID, fetchAmpHtlcs,
+	_, invoice, err := fetchInvoiceData(
+		ctx, db, sqlInvoice, setID, fetchAmpHtlcs,
 	)
 	if err != nil {
 		return nil, err
@@ -616,7 +720,7 @@ func fetchAmpState(ctx context.Context, db SQLInvoiceQueries, invoiceID int64,
 
 				invoiceKeys[key] = struct{}{}
 
-				if htlc.State != HtlcStateCanceled { //nolint: lll
+				if htlc.State != HtlcStateCanceled {
 					amtPaid += htlc.Amt
 				}
 			}
@@ -644,12 +748,12 @@ func (i *SQLStore) LookupInvoice(ctx context.Context,
 		err     error
 	)
 
-	readTxOpt := NewSQLInvoiceQueryReadTx()
-	txErr := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		invoice, err = i.fetchInvoice(ctx, db, ref)
+	readTxOpt := sqldb.ReadTxOpt()
+	txErr := i.db.ExecTx(ctx, readTxOpt, func(db SQLInvoiceQueries) error {
+		invoice, err = fetchInvoice(ctx, db, ref)
 
 		return err
-	}, func() {})
+	}, sqldb.NoOpReset)
 	if txErr != nil {
 		return Invoice{}, txErr
 	}
@@ -665,19 +769,19 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 
 	var invoices map[lntypes.Hash]Invoice
 
-	readTxOpt := NewSQLInvoiceQueryReadTx()
-	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		return queryWithLimit(func(offset int) (int, error) {
-			params := sqlc.FilterInvoicesParams{
-				PendingOnly: true,
-				NumOffset:   int32(offset),
-				NumLimit:    int32(i.opts.paginationLimit),
-				Reverse:     false,
+	readTxOpt := sqldb.ReadTxOpt()
+	err := i.db.ExecTx(ctx, readTxOpt, func(db SQLInvoiceQueries) error {
+		var cursor int64
+		limit := int32(i.opts.paginationLimit)
+		for {
+			params := sqlc.FetchPendingInvoicesParams{
+				IDCursor: cursor,
+				NumLimit: limit,
 			}
 
-			rows, err := db.FilterInvoices(ctx, params)
+			rows, err := db.FetchPendingInvoices(ctx, params)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return 0, fmt.Errorf("unable to get invoices "+
+				return fmt.Errorf("unable to get invoices "+
 					"from db: %w", err)
 			}
 
@@ -687,14 +791,17 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 					ctx, db, row, nil, true,
 				)
 				if err != nil {
-					return 0, err
+					return err
 				}
 
 				invoices[*hash] = *invoice
+				cursor = row.ID
 			}
 
-			return len(rows), nil
-		}, i.opts.paginationLimit)
+			if int32(len(rows)) < limit {
+				return nil
+			}
+		}
 	}, func() {
 		invoices = make(map[lntypes.Hash]Invoice)
 	})
@@ -715,25 +822,33 @@ func (i *SQLStore) FetchPendingInvoices(ctx context.Context) (
 func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 	[]Invoice, error) {
 
-	var invoices []Invoice
+	var (
+		invoices       []Invoice
+		start          = time.Now()
+		lastLogTime    = time.Now()
+		processedCount int
+	)
 
 	if idx == 0 {
 		return invoices, nil
 	}
 
-	readTxOpt := NewSQLInvoiceQueryReadTx()
-	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		err := queryWithLimit(func(offset int) (int, error) {
-			params := sqlc.FilterInvoicesParams{
+	readTxOpt := sqldb.ReadTxOpt()
+	err := i.db.ExecTx(ctx, readTxOpt, func(db SQLInvoiceQueries) error {
+		var cursor int64
+		limit := int32(i.opts.paginationLimit)
+		for {
+			// settle_index is always provided here so the
+			// invoices_settle_index_idx index can be used.
+			params := sqlc.FilterInvoicesBySettleIndexParams{
 				SettleIndexGet: sqldb.SQLInt64(idx + 1),
-				NumOffset:      int32(offset),
-				NumLimit:       int32(i.opts.paginationLimit),
-				Reverse:        false,
+				IDCursor:       cursor,
+				NumLimit:       limit,
 			}
 
-			rows, err := db.FilterInvoices(ctx, params)
+			rows, err := db.FilterInvoicesBySettleIndex(ctx, params)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return 0, fmt.Errorf("unable to get invoices "+
+				return fmt.Errorf("unable to get invoices "+
 					"from db: %w", err)
 			}
 
@@ -743,18 +858,30 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 					ctx, db, row, nil, true,
 				)
 				if err != nil {
-					return 0, fmt.Errorf("unable to fetch "+
+					return fmt.Errorf("unable to fetch "+
 						"invoice(id=%d) from db: %w",
 						row.ID, err)
 				}
 
 				invoices = append(invoices, *invoice)
+				cursor = row.ID
+
+				processedCount++
+				if time.Since(lastLogTime) >=
+					invoiceProgressLogInterval {
+
+					log.Debugf("Processed %d settled "+
+						"invoices which have a settle "+
+						"index greater than %v",
+						processedCount, idx)
+
+					lastLogTime = time.Now()
+				}
 			}
 
-			return len(rows), nil
-		}, i.opts.paginationLimit)
-		if err != nil {
-			return err
+			if int32(len(rows)) < limit {
+				break
+			}
 		}
 
 		// Now fetch all the AMP sub invoices that were settled since
@@ -803,6 +930,18 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 			}
 
 			invoices = append(invoices, *invoice)
+
+			processedCount++
+			if time.Since(lastLogTime) >=
+				invoiceProgressLogInterval {
+
+				log.Debugf("Processed %d settled invoices "+
+					"including AMP sub invoices which "+
+					"have a settle index greater than %v",
+					processedCount, idx)
+
+				lastLogTime = time.Now()
+			}
 		}
 
 		return nil
@@ -813,6 +952,12 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 		return nil, fmt.Errorf("unable to get invoices settled since "+
 			"index (excluding) %d: %w", idx, err)
 	}
+
+	elapsed := time.Since(start)
+	log.Debugf("Completed scanning for settled invoices starting at "+
+		"index %v: total_processed=%d, found_invoices=%d, elapsed=%v",
+		idx, processedCount, len(invoices),
+		elapsed.Round(time.Millisecond))
 
 	return invoices, nil
 }
@@ -826,25 +971,34 @@ func (i *SQLStore) InvoicesSettledSince(ctx context.Context, idx uint64) (
 func (i *SQLStore) InvoicesAddedSince(ctx context.Context, idx uint64) (
 	[]Invoice, error) {
 
-	var result []Invoice
+	var (
+		result         []Invoice
+		start          = time.Now()
+		lastLogTime    = time.Now()
+		processedCount int
+	)
 
 	if idx == 0 {
 		return result, nil
 	}
 
-	readTxOpt := NewSQLInvoiceQueryReadTx()
-	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		return queryWithLimit(func(offset int) (int, error) {
-			params := sqlc.FilterInvoicesParams{
-				AddIndexGet: sqldb.SQLInt64(idx + 1),
-				NumOffset:   int32(offset),
-				NumLimit:    int32(i.opts.paginationLimit),
-				Reverse:     false,
+	readTxOpt := sqldb.ReadTxOpt()
+	err := i.db.ExecTx(ctx, readTxOpt, func(db SQLInvoiceQueries) error {
+		// id is always provided here so the primary-key index is used
+		// for this range scan. The cursor starts at idx+1 so the first
+		// page fetches invoices with id >= idx+1. After each page the
+		// cursor advances to last_id + 1.
+		cursor := int64(idx + 1)
+		limit := int32(i.opts.paginationLimit)
+		for {
+			params := sqlc.FilterInvoicesByAddIndexParams{
+				AddIndexGet: cursor,
+				NumLimit:    limit,
 			}
 
-			rows, err := db.FilterInvoices(ctx, params)
+			rows, err := db.FilterInvoicesByAddIndex(ctx, params)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return 0, fmt.Errorf("unable to get invoices "+
+				return fmt.Errorf("unable to get invoices "+
 					"from db: %w", err)
 			}
 
@@ -854,14 +1008,28 @@ func (i *SQLStore) InvoicesAddedSince(ctx context.Context, idx uint64) (
 					ctx, db, row, nil, true,
 				)
 				if err != nil {
-					return 0, err
+					return err
 				}
 
 				result = append(result, *invoice)
+				cursor = row.ID + 1
+
+				processedCount++
+				if time.Since(lastLogTime) >=
+					invoiceProgressLogInterval {
+
+					log.Debugf("Processed %d invoices "+
+						"which were added since add "+
+						"index %v", processedCount, idx)
+
+					lastLogTime = time.Now()
+				}
 			}
 
-			return len(rows), nil
-		}, i.opts.paginationLimit)
+			if int32(len(rows)) < limit {
+				return nil
+			}
+		}
 	}, func() {
 		result = nil
 	})
@@ -870,6 +1038,12 @@ func (i *SQLStore) InvoicesAddedSince(ctx context.Context, idx uint64) (
 		return nil, fmt.Errorf("unable to get invoices added since "+
 			"index %d: %w", idx, err)
 	}
+
+	elapsed := time.Since(start)
+	log.Debugf("Completed scanning for invoices added since index %v: "+
+		"total_processed=%d, found_invoices=%d, elapsed=%v",
+		idx, processedCount, len(result),
+		elapsed.Round(time.Millisecond))
 
 	return result, nil
 }
@@ -886,55 +1060,78 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 			"be non-zero")
 	}
 
-	readTxOpt := NewSQLInvoiceQueryReadTx()
-	err := i.db.ExecTx(ctx, &readTxOpt, func(db SQLInvoiceQueries) error {
-		return queryWithLimit(func(offset int) (int, error) {
-			params := sqlc.FilterInvoicesParams{
-				NumOffset:   int32(offset),
-				NumLimit:    int32(i.opts.paginationLimit),
-				PendingOnly: q.PendingOnly,
-				Reverse:     q.Reversed,
+	// Default date bounds: use the package-level sentinels so that the
+	// planner always receives a concrete, non-nullable value and can use
+	// the created_at index without OR-based fallbacks.
+	createdAfter := invoiceCreatedAfterDefault
+	if q.CreationDateStart != 0 {
+		createdAfter = time.Unix(q.CreationDateStart, 0).UTC()
+	}
+
+	createdBefore := invoiceCreatedBeforeDefault
+	if q.CreationDateEnd != 0 {
+		// Add 1 second so the end boundary is inclusive: the SQL
+		// predicate is strict less-than (created_at < createdBefore).
+		createdBefore = time.Unix(q.CreationDateEnd+1, 0).UTC()
+	}
+
+	readTxOpt := sqldb.ReadTxOpt()
+	err := i.db.ExecTx(ctx, readTxOpt, func(db SQLInvoiceQueries) error {
+		limit := int32(i.opts.paginationLimit)
+
+		// For reverse queries the cursor is an inclusive upper bound on
+		// id (id <= cursor); after each page it advances to
+		// last_returned_id - 1. Start at IndexOffset, or MaxInt64 to
+		// begin from the most recent invoice.
+		// For forward queries the cursor is an inclusive lower bound
+		// (id >= cursor); after each page it advances to
+		// last_returned_id + 1. Start at IndexOffset + 1 so the invoice
+		// at IndexOffset itself is excluded (matching the old
+		// behaviour).
+		var cursor int64
+		if q.Reversed {
+			cursor = int64(math.MaxInt64)
+			if q.IndexOffset != 0 {
+				cursor = int64(q.IndexOffset) - 1
 			}
+		} else {
+			cursor = int64(q.IndexOffset) + 1
+		}
+
+		for {
+			var (
+				rows []sqlc.Invoice
+				err  error
+			)
 
 			if q.Reversed {
-				// If the index offset was not set, we want to
-				// fetch from the lastest invoice.
-				if q.IndexOffset == 0 {
-					params.AddIndexLet = sqldb.SQLInt64(
-						int64(math.MaxInt64),
-					)
-				} else {
-					// The invoice with index offset id must
-					// not be included in the results.
-					params.AddIndexLet = sqldb.SQLInt64(
-						q.IndexOffset - 1,
-					)
+				params := sqlc.FilterInvoicesReverseParams{
+					AddIndexLet:   cursor,
+					PendingOnly:   q.PendingOnly,
+					CreatedAfter:  createdAfter,
+					CreatedBefore: createdBefore,
+					NumLimit:      limit,
 				}
+
+				rows, err = db.FilterInvoicesReverse(
+					ctx, params,
+				)
 			} else {
-				// The invoice with index offset id must not be
-				// included in the results.
-				params.AddIndexGet = sqldb.SQLInt64(
-					q.IndexOffset + 1,
+				params := sqlc.FilterInvoicesForwardParams{
+					AddIndexGet:   cursor,
+					PendingOnly:   q.PendingOnly,
+					CreatedAfter:  createdAfter,
+					CreatedBefore: createdBefore,
+					NumLimit:      limit,
+				}
+
+				rows, err = db.FilterInvoicesForward(
+					ctx, params,
 				)
 			}
 
-			if q.CreationDateStart != 0 {
-				params.CreatedAfter = sqldb.SQLTime(
-					time.Unix(q.CreationDateStart, 0).UTC(),
-				)
-			}
-
-			if q.CreationDateEnd != 0 {
-				// We need to add 1 to the end date as we're
-				// checking less than the end date in SQL.
-				params.CreatedBefore = sqldb.SQLTime(
-					time.Unix(q.CreationDateEnd+1, 0).UTC(),
-				)
-			}
-
-			rows, err := db.FilterInvoices(ctx, params)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return 0, fmt.Errorf("unable to get invoices "+
+				return fmt.Errorf("unable to get invoices "+
 					"from db: %w", err)
 			}
 
@@ -944,18 +1141,25 @@ func (i *SQLStore) QueryInvoices(ctx context.Context,
 					ctx, db, row, nil, true,
 				)
 				if err != nil {
-					return 0, err
+					return err
 				}
 
 				invoices = append(invoices, *invoice)
+				if q.Reversed {
+					cursor = row.ID - 1
+				} else {
+					cursor = row.ID + 1
+				}
 
 				if len(invoices) == int(q.NumMaxInvoices) {
-					return 0, nil
+					return nil
 				}
 			}
 
-			return len(rows), nil
-		}, i.opts.paginationLimit)
+			if int32(len(rows)) < limit {
+				return nil
+			}
+		}
 	}, func() {
 		invoices = nil
 	})
@@ -1054,7 +1258,7 @@ func (s *sqlInvoiceUpdater) AddHtlc(circuitKey models.CircuitKey,
 		)
 		if err != nil {
 			mappedSQLErr := sqldb.MapSQLError(err)
-			var uniqueConstraintErr *sqldb.ErrSQLUniqueConstraintViolation //nolint:lll
+			var uniqueConstraintErr *sqldb.ErrSQLUniqueConstraintViolation //nolint:ll
 			if errors.As(mappedSQLErr, &uniqueConstraintErr) {
 				return ErrDuplicateSetID{
 					SetID: setID,
@@ -1334,20 +1538,32 @@ func (i *SQLStore) UpdateInvoice(ctx context.Context, ref InvoiceRef,
 
 	var updatedInvoice *Invoice
 
-	txOpt := SQLInvoiceQueriesTxOptions{readOnly: false}
-	txErr := i.db.ExecTx(ctx, &txOpt, func(db SQLInvoiceQueries) error {
-		if setID != nil {
-			// Make sure to use the set ID if this is an AMP update.
+	txOpt := sqldb.WriteTxOpt()
+	txErr := i.db.ExecTx(ctx, txOpt, func(db SQLInvoiceQueries) error {
+		switch {
+		// For the default case we fetch all HTLCs.
+		case setID == nil:
+			ref.refModifier = DefaultModifier
+
+		// If the setID is the blank but NOT nil, we set the
+		// refModifier to HtlcSetBlankModifier to fetch no HTLC for the
+		// AMP invoice.
+		case *setID == BlankPayAddr:
+			ref.refModifier = HtlcSetBlankModifier
+
+		// A setID is provided, we use the refModifier to fetch only
+		// the HTLCs for the given setID and also make sure we add the
+		// setID to the ref.
+		default:
 			var setIDBytes [32]byte
 			copy(setIDBytes[:], setID[:])
 			ref.setID = &setIDBytes
 
-			// If we're updating an AMP invoice, we'll also only
-			// need to fetch the HTLCs for the given set ID.
+			// We only fetch the HTLCs for the given setID.
 			ref.refModifier = HtlcSetOnlyModifier
 		}
 
-		invoice, err := i.fetchInvoice(ctx, db, ref)
+		invoice, err := fetchInvoice(ctx, db, ref)
 		if err != nil {
 			return err
 		}
@@ -1366,7 +1582,7 @@ func (i *SQLStore) UpdateInvoice(ctx context.Context, ref InvoiceRef,
 		)
 
 		return err
-	}, func() {})
+	}, sqldb.NoOpReset)
 	if txErr != nil {
 		// If the invoice is already settled, we'll return the
 		// (unchanged) invoice and the ErrInvoiceAlreadySettled error.
@@ -1396,8 +1612,8 @@ func (i *SQLStore) DeleteInvoice(ctx context.Context,
 		}
 	}
 
-	var writeTxOpt SQLInvoiceQueriesTxOptions
-	err := i.db.ExecTx(ctx, &writeTxOpt, func(db SQLInvoiceQueries) error {
+	writeTxOpt := sqldb.WriteTxOpt()
+	err := i.db.ExecTx(ctx, writeTxOpt, func(db SQLInvoiceQueries) error {
 		for _, ref := range invoicesToDelete {
 			params := sqlc.DeleteInvoiceParams{
 				AddIndex: sqldb.SQLInt64(ref.AddIndex),
@@ -1430,7 +1646,7 @@ func (i *SQLStore) DeleteInvoice(ctx context.Context,
 		}
 
 		return nil
-	}, func() {})
+	}, sqldb.NoOpReset)
 
 	if err != nil {
 		return fmt.Errorf("unable to delete invoices: %w", err)
@@ -1441,8 +1657,8 @@ func (i *SQLStore) DeleteInvoice(ctx context.Context,
 
 // DeleteCanceledInvoices removes all canceled invoices from the database.
 func (i *SQLStore) DeleteCanceledInvoices(ctx context.Context) error {
-	var writeTxOpt SQLInvoiceQueriesTxOptions
-	err := i.db.ExecTx(ctx, &writeTxOpt, func(db SQLInvoiceQueries) error {
+	writeTxOpt := sqldb.WriteTxOpt()
+	err := i.db.ExecTx(ctx, writeTxOpt, func(db SQLInvoiceQueries) error {
 		_, err := db.DeleteCanceledInvoices(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to delete canceled "+
@@ -1450,7 +1666,7 @@ func (i *SQLStore) DeleteCanceledInvoices(ctx context.Context) error {
 		}
 
 		return nil
-	}, func() {})
+	}, sqldb.NoOpReset)
 	if err != nil {
 		return fmt.Errorf("unable to delete invoices: %w", err)
 	}
@@ -1506,13 +1722,6 @@ func fetchInvoiceData(ctx context.Context, db SQLInvoiceQueries,
 
 	if len(htlcs) > 0 {
 		invoice.Htlcs = htlcs
-		var amountPaid lnwire.MilliSatoshi
-		for _, htlc := range htlcs {
-			if htlc.State == HtlcStateSettled {
-				amountPaid += htlc.Amt
-			}
-		}
-		invoice.AmtPaid = amountPaid
 	}
 
 	return hash, invoice, nil
@@ -1706,23 +1915,4 @@ func unmarshalInvoiceHTLC(row sqlc.InvoiceHtlc) (CircuitKey,
 	}
 
 	return circuitKey, htlc, nil
-}
-
-// queryWithLimit is a helper method that can be used to query the database
-// using a limit and offset. The passed query function should return the number
-// of rows returned and an error if any.
-func queryWithLimit(query func(int) (int, error), limit int) error {
-	offset := 0
-	for {
-		rows, err := query(offset)
-		if err != nil {
-			return err
-		}
-
-		if rows < limit {
-			return nil
-		}
-
-		offset += limit
-	}
 }

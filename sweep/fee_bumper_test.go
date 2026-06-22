@@ -11,9 +11,10 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/stretchr/testify/mock"
@@ -55,7 +56,7 @@ func createTestInput(value int64,
 				PubKey: testPubKey,
 			},
 		},
-		0,
+		1,
 		nil,
 	)
 
@@ -73,7 +74,7 @@ func TestBumpResultValidate(t *testing.T) {
 	// Unknown event type will give an error.
 	b = BumpResult{
 		Tx:    &wire.MsgTx{},
-		Event: sentinalEvent,
+		Event: sentinelEvent,
 	}
 	require.ErrorIs(t, b.Validate(), ErrInvalidBumpResult)
 
@@ -91,6 +92,12 @@ func TestBumpResultValidate(t *testing.T) {
 	}
 	require.ErrorIs(t, b.Validate(), ErrInvalidBumpResult)
 
+	// A fatal event without a failure reason will give an error.
+	b = BumpResult{
+		Event: TxFailed,
+	}
+	require.ErrorIs(t, b.Validate(), ErrInvalidBumpResult)
+
 	// A confirmed event without fee info will give an error.
 	b = BumpResult{
 		Tx:    &wire.MsgTx{},
@@ -102,6 +109,20 @@ func TestBumpResultValidate(t *testing.T) {
 	b = BumpResult{
 		Tx:    &wire.MsgTx{},
 		Event: TxPublished,
+	}
+	require.NoError(t, b.Validate())
+
+	// Tx is allowed to be nil in a TxFailed event.
+	b = BumpResult{
+		Event: TxFailed,
+		Err:   errDummy,
+	}
+	require.NoError(t, b.Validate())
+
+	// Tx is allowed to be nil in a TxFatal event.
+	b = BumpResult{
+		Event: TxFatal,
+		Err:   errDummy,
 	}
 	require.NoError(t, b.Validate())
 }
@@ -293,9 +314,9 @@ func TestInitializeFeeFunction(t *testing.T) {
 	require.Equal(t, feerate, f.FeeRate())
 }
 
-// TestStoreRecord correctly increases the request counter and saves the
+// TestUpdateRecord correctly updates the fields fee and tx, and saves the
 // record.
-func TestStoreRecord(t *testing.T) {
+func TestUpdateRecord(t *testing.T) {
 	t.Parallel()
 
 	// Create a test input.
@@ -331,14 +352,25 @@ func TestStoreRecord(t *testing.T) {
 		op: 0,
 	}
 
-	// Call the method under test.
-	requestID := tp.storeRecord(tx, req, feeFunc, fee, utxoIndex)
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
 
-	// Check the request ID is as expected.
-	require.Equal(t, initialCounter+1, requestID)
+	// Create a test record.
+	record := &monitorRecord{
+		requestID:   initialCounter,
+		req:         req,
+		feeFunction: feeFunc,
+	}
+
+	// Call the method under test.
+	tp.updateRecord(record, sweepCtx)
 
 	// Read the saved record and compare.
-	record, ok := tp.records.Load(requestID)
+	record, ok := tp.records.Load(initialCounter)
 	require.True(t, ok)
 	require.Equal(t, tx, record.tx)
 	require.Equal(t, feeFunc, record.feeFunction)
@@ -426,7 +458,7 @@ func TestCreateAndCheckTx(t *testing.T) {
 	//
 	// NOTE: we are not testing the utility of creating valid txes here, so
 	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
+	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
 		mock.Anything).Return(script, nil)
@@ -473,9 +505,14 @@ func TestCreateAndCheckTx(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc
 
+		r := &monitorRecord{
+			req:         tc.req,
+			feeFunction: m.feeFunc,
+		}
+
 		t.Run(tc.name, func(t *testing.T) {
 			// Call the method under test.
-			_, err := tp.createAndCheckTx(tc.req, m.feeFunc)
+			_, err := tp.createAndCheckTx(r)
 
 			// Check the result is as expected.
 			require.ErrorIs(t, err, tc.expectedErr)
@@ -514,7 +551,7 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 	//
 	// NOTE: we are not testing the utility of creating valid txes here, so
 	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
+	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
 		mock.Anything).Return(script, nil)
@@ -635,23 +672,36 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 		},
 	}
 
+	var requestCounter atomic.Uint64
 	for _, tc := range testCases {
 		tc := tc
+
+		rid := requestCounter.Add(1)
+
+		// Create a test record.
+		record := &monitorRecord{
+			requestID:   rid,
+			req:         req,
+			feeFunction: m.feeFunc,
+		}
 
 		t.Run(tc.name, func(t *testing.T) {
 			tc.setupMock()
 
 			// Call the method under test.
-			id, err := tp.createRBFCompliantTx(req, m.feeFunc)
+			rec, err := tp.createRBFCompliantTx(record)
 
 			// Check the result is as expected.
 			require.ErrorIs(t, err, tc.expectedErr)
 
-			// If there's an error, expect the requestID to be
-			// empty.
 			if tc.expectedErr != nil {
-				require.Zero(t, id)
+				return
 			}
+
+			// Assert the returned record has the following fields
+			// populated.
+			require.NotEmpty(t, rec.tx)
+			require.NotEmpty(t, rec.fee)
 		})
 	}
 }
@@ -684,13 +734,22 @@ func TestTxPublisherBroadcast(t *testing.T) {
 
 	// Create a testing record and put it in the map.
 	fee := btcutil.Amount(1000)
-	requestID := tp.storeRecord(tx, req, m.feeFunc, fee, utxoIndex)
+	requestID := uint64(1)
 
-	// Quickly check when the requestID cannot be found, an error is
-	// returned.
-	result, err := tp.broadcast(uint64(1000))
-	require.Error(t, err)
-	require.Nil(t, result)
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
+
+	// Create a test record.
+	record := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+	}
+	rec := tp.updateRecord(record, sweepCtx)
 
 	testCases := []struct {
 		name           string
@@ -745,7 +804,7 @@ func TestTxPublisherBroadcast(t *testing.T) {
 			tc.setupMock()
 
 			// Call the method under test.
-			result, err := tp.broadcast(requestID)
+			result, err := tp.broadcast(rec)
 
 			// Check the result is as expected.
 			require.ErrorIs(t, err, tc.expectedErr)
@@ -779,6 +838,16 @@ func TestRemoveResult(t *testing.T) {
 		op: 0,
 	}
 
+	// Create a test request ID counter.
+	requestCounter := atomic.Uint64{}
+
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
+
 	testCases := []struct {
 		name        string
 		setupRecord func() uint64
@@ -790,12 +859,19 @@ func TestRemoveResult(t *testing.T) {
 			// removed.
 			name: "remove on TxConfirmed",
 			setupRecord: func() uint64 {
-				id := tp.storeRecord(
-					tx, req, m.feeFunc, fee, utxoIndex,
-				)
-				tp.subscriberChans.Store(id, nil)
+				rid := requestCounter.Add(1)
 
-				return id
+				// Create a test record.
+				record := &monitorRecord{
+					requestID:   rid,
+					req:         req,
+					feeFunction: m.feeFunc,
+				}
+
+				tp.updateRecord(record, sweepCtx)
+				tp.subscriberChans.Store(rid, nil)
+
+				return rid
 			},
 			result: &BumpResult{
 				Event: TxConfirmed,
@@ -807,12 +883,19 @@ func TestRemoveResult(t *testing.T) {
 			// When the tx is failed, the records will be removed.
 			name: "remove on TxFailed",
 			setupRecord: func() uint64 {
-				id := tp.storeRecord(
-					tx, req, m.feeFunc, fee, utxoIndex,
-				)
-				tp.subscriberChans.Store(id, nil)
+				rid := requestCounter.Add(1)
 
-				return id
+				// Create a test record.
+				record := &monitorRecord{
+					requestID:   rid,
+					req:         req,
+					feeFunction: m.feeFunc,
+				}
+
+				tp.updateRecord(record, sweepCtx)
+				tp.subscriberChans.Store(rid, nil)
+
+				return rid
 			},
 			result: &BumpResult{
 				Event: TxFailed,
@@ -825,12 +908,19 @@ func TestRemoveResult(t *testing.T) {
 			// Noop when the tx is neither confirmed or failed.
 			name: "noop when tx is not confirmed or failed",
 			setupRecord: func() uint64 {
-				id := tp.storeRecord(
-					tx, req, m.feeFunc, fee, utxoIndex,
-				)
-				tp.subscriberChans.Store(id, nil)
+				rid := requestCounter.Add(1)
 
-				return id
+				// Create a test record.
+				record := &monitorRecord{
+					requestID:   rid,
+					req:         req,
+					feeFunction: m.feeFunc,
+				}
+
+				tp.updateRecord(record, sweepCtx)
+				tp.subscriberChans.Store(rid, nil)
+
+				return rid
 			},
 			result: &BumpResult{
 				Event: TxPublished,
@@ -885,7 +975,22 @@ func TestNotifyResult(t *testing.T) {
 
 	// Create a testing record and put it in the map.
 	fee := btcutil.Amount(1000)
-	requestID := tp.storeRecord(tx, req, m.feeFunc, fee, utxoIndex)
+	requestID := uint64(1)
+
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
+	// Create a test record.
+	record := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+	}
+
+	tp.updateRecord(record, sweepCtx)
 
 	// Create a subscription to the event.
 	subscriber := make(chan *BumpResult, 1)
@@ -933,40 +1038,16 @@ func TestNotifyResult(t *testing.T) {
 	}
 }
 
-// TestBroadcastSuccess checks the public `Broadcast` method can successfully
-// broadcast a tx based on the request.
-func TestBroadcastSuccess(t *testing.T) {
+// TestBroadcast checks the public `Broadcast` method can successfully register
+// a broadcast request.
+func TestBroadcast(t *testing.T) {
 	t.Parallel()
 
 	// Create a publisher using the mocks.
-	tp, m := createTestPublisher(t)
+	tp, _ := createTestPublisher(t)
 
 	// Create a test feerate.
 	feerate := chainfee.SatPerKWeight(1000)
-
-	// Mock the fee estimator to return the testing fee rate.
-	//
-	// We are not testing `NewLinearFeeFunction` here, so the actual params
-	// used are irrelevant.
-	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
-		feerate, nil).Once()
-	m.estimator.On("RelayFeePerKW").Return(chainfee.FeePerKwFloor).Once()
-
-	// Mock the signer to always return a valid script.
-	//
-	// NOTE: we are not testing the utility of creating valid txes here, so
-	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
-	script := &input.Script{}
-	m.signer.On("ComputeInputScript", mock.Anything,
-		mock.Anything).Return(script, nil)
-
-	// Mock the testmempoolaccept to pass.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
-
-	// Mock the wallet to publish successfully.
-	m.wallet.On("PublishTransaction",
-		mock.Anything, mock.Anything).Return(nil).Once()
 
 	// Create a test request.
 	inp := createTestInput(1000, input.WitnessKeyHash)
@@ -981,27 +1062,24 @@ func TestBroadcastSuccess(t *testing.T) {
 	}
 
 	// Send the req and expect no error.
-	resultChan, err := tp.Broadcast(req)
-	require.NoError(t, err)
-
-	// Check the result is sent back.
-	select {
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for subscriber to receive result")
-
-	case result := <-resultChan:
-		// We expect the first result to be TxPublished.
-		require.Equal(t, TxPublished, result.Event)
-	}
+	resultChan := tp.Broadcast(req)
+	require.NotNil(t, resultChan)
 
 	// Validate the record was stored.
 	require.Equal(t, 1, tp.records.Len())
 	require.Equal(t, 1, tp.subscriberChans.Len())
+
+	// Validate the record.
+	rid := tp.requestCounter.Load()
+	record, found := tp.records.Load(rid)
+	require.True(t, found)
+	require.Equal(t, req, record.req)
 }
 
-// TestBroadcastFail checks the public `Broadcast` returns the error or a
-// failed result when the broadcast fails.
-func TestBroadcastFail(t *testing.T) {
+// TestBroadcastImmediate checks the public `Broadcast` method can successfully
+// register a broadcast request and publish the tx when `Immediate` flag is
+// set.
+func TestBroadcastImmediate(t *testing.T) {
 	t.Parallel()
 
 	// Create a publisher using the mocks.
@@ -1020,69 +1098,32 @@ func TestBroadcastFail(t *testing.T) {
 		Budget:          btcutil.Amount(1000),
 		MaxFeeRate:      feerate * 10,
 		DeadlineHeight:  10,
+		Immediate:       true,
 	}
 
-	// Mock the fee estimator to return the testing fee rate.
+	// Mock the fee estimator to return an error.
 	//
-	// We are not testing `NewLinearFeeFunction` here, so the actual params
-	// used are irrelevant.
+	// NOTE: We are not testing `handleInitialBroadcast` here, but only
+	// interested in checking that this method is indeed called when
+	// `Immediate` is true. Thus we mock the method to return an error to
+	// quickly abort. As long as this mocked method is called, we know the
+	// `Immediate` flag works.
 	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
-		feerate, nil).Twice()
-	m.estimator.On("RelayFeePerKW").Return(chainfee.FeePerKwFloor).Twice()
+		chainfee.SatPerKWeight(0), errDummy).Once()
 
-	// Mock the signer to always return a valid script.
-	//
-	// NOTE: we are not testing the utility of creating valid txes here, so
-	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
-	script := &input.Script{}
-	m.signer.On("ComputeInputScript", mock.Anything,
-		mock.Anything).Return(script, nil)
+	// Send the req and expect no error.
+	resultChan := tp.Broadcast(req)
+	require.NotNil(t, resultChan)
 
-	// Mock the testmempoolaccept to return an error.
-	m.wallet.On("CheckMempoolAcceptance",
-		mock.Anything).Return(errDummy).Once()
-
-	// Send the req and expect an error returned.
-	resultChan, err := tp.Broadcast(req)
-	require.ErrorIs(t, err, errDummy)
-	require.Nil(t, resultChan)
-
-	// Validate the record was NOT stored.
-	require.Equal(t, 0, tp.records.Len())
-	require.Equal(t, 0, tp.subscriberChans.Len())
-
-	// Mock the testmempoolaccept again, this time it passes.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
-
-	// Mock the wallet to fail on publish.
-	m.wallet.On("PublishTransaction",
-		mock.Anything, mock.Anything).Return(errDummy).Once()
-
-	// Send the req and expect no error returned.
-	resultChan, err = tp.Broadcast(req)
-	require.NoError(t, err)
-
-	// Check the result is sent back.
-	select {
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for subscriber to receive result")
-
-	case result := <-resultChan:
-		// We expect the result to be TxFailed and the error is set in
-		// the result.
-		require.Equal(t, TxFailed, result.Event)
-		require.ErrorIs(t, result.Err, errDummy)
-	}
-
-	// Validate the record was removed.
-	require.Equal(t, 0, tp.records.Len())
-	require.Equal(t, 0, tp.subscriberChans.Len())
+	// Validate the record was removed due to an error returned in initial
+	// broadcast.
+	require.Empty(t, tp.records.Len())
+	require.Empty(t, tp.subscriberChans.Len())
 }
 
-// TestCreateAnPublishFail checks all the error cases are handled properly in
-// the method createAndPublish.
-func TestCreateAnPublishFail(t *testing.T) {
+// TestCreateAndPublishFail checks all the error cases are handled properly in
+// the method createAndPublishTx.
+func TestCreateAndPublishFail(t *testing.T) {
 	t.Parallel()
 
 	// Create a publisher using the mocks.
@@ -1094,6 +1135,7 @@ func TestCreateAnPublishFail(t *testing.T) {
 	// Create a test feerate and return it from the mock fee function.
 	feerate := chainfee.SatPerKWeight(1000)
 	m.feeFunc.On("FeeRate").Return(feerate)
+	m.feeFunc.On("Increment").Return(true, nil).Once()
 
 	// Create a testing monitor record.
 	req := createTestBumpRequest()
@@ -1101,6 +1143,7 @@ func TestCreateAnPublishFail(t *testing.T) {
 	// Overwrite the budget to make it smaller than the fee.
 	req.Budget = 100
 	record := &monitorRecord{
+		requestID:   requestID,
 		req:         req,
 		feeFunction: m.feeFunc,
 		tx:          &wire.MsgTx{},
@@ -1110,13 +1153,13 @@ func TestCreateAnPublishFail(t *testing.T) {
 	//
 	// NOTE: we are not testing the utility of creating valid txes here, so
 	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
+	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
 		mock.Anything).Return(script, nil)
 
 	// Call the createAndPublish method.
-	resultOpt := tp.createAndPublishTx(requestID, record)
+	resultOpt := tp.createAndPublishTx(record)
 	result := resultOpt.UnwrapOrFail(t)
 
 	// We expect the result to be TxFailed and the error is set in the
@@ -1135,7 +1178,7 @@ func TestCreateAnPublishFail(t *testing.T) {
 		mock.Anything).Return(lnwallet.ErrMempoolFee).Once()
 
 	// Call the createAndPublish method and expect a none option.
-	resultOpt = tp.createAndPublishTx(requestID, record)
+	resultOpt = tp.createAndPublishTx(record)
 	require.True(t, resultOpt.IsNone())
 
 	// Mock the testmempoolaccept to return a fee related error that should
@@ -1144,13 +1187,13 @@ func TestCreateAnPublishFail(t *testing.T) {
 		mock.Anything).Return(chain.ErrInsufficientFee).Once()
 
 	// Call the createAndPublish method and expect a none option.
-	resultOpt = tp.createAndPublishTx(requestID, record)
+	resultOpt = tp.createAndPublishTx(record)
 	require.True(t, resultOpt.IsNone())
 }
 
-// TestCreateAnPublishSuccess checks the expected result is returned from the
-// method createAndPublish.
-func TestCreateAnPublishSuccess(t *testing.T) {
+// TestCreateAndPublishSuccess checks the expected result is returned from the
+// method createAndPublishTx.
+func TestCreateAndPublishSuccess(t *testing.T) {
 	t.Parallel()
 
 	// Create a publisher using the mocks.
@@ -1166,6 +1209,7 @@ func TestCreateAnPublishSuccess(t *testing.T) {
 	// Create a testing monitor record.
 	req := createTestBumpRequest()
 	record := &monitorRecord{
+		requestID:   requestID,
 		req:         req,
 		feeFunction: m.feeFunc,
 		tx:          &wire.MsgTx{},
@@ -1175,7 +1219,7 @@ func TestCreateAnPublishSuccess(t *testing.T) {
 	//
 	// NOTE: we are not testing the utility of creating valid txes here, so
 	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
+	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
 		mock.Anything).Return(script, nil)
@@ -1188,7 +1232,7 @@ func TestCreateAnPublishSuccess(t *testing.T) {
 		mock.Anything, mock.Anything).Return(errDummy).Once()
 
 	// Call the createAndPublish method and expect a failure result.
-	resultOpt := tp.createAndPublishTx(requestID, record)
+	resultOpt := tp.createAndPublishTx(record)
 	result := resultOpt.UnwrapOrFail(t)
 
 	// We expect the result to be TxFailed and the error is set.
@@ -1209,7 +1253,7 @@ func TestCreateAnPublishSuccess(t *testing.T) {
 		mock.Anything, mock.Anything).Return(nil).Once()
 
 	// Call the createAndPublish method and expect a success result.
-	resultOpt = tp.createAndPublishTx(requestID, record)
+	resultOpt = tp.createAndPublishTx(record)
 	result = resultOpt.UnwrapOrFail(t)
 	require.True(t, resultOpt.IsSome())
 
@@ -1250,7 +1294,23 @@ func TestHandleTxConfirmed(t *testing.T) {
 
 	// Create a testing record and put it in the map.
 	fee := btcutil.Amount(1000)
-	requestID := tp.storeRecord(tx, req, m.feeFunc, fee, utxoIndex)
+	requestID := uint64(1)
+
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
+
+	// Create a test record.
+	record := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+	}
+
+	tp.updateRecord(record, sweepCtx)
 	record, ok := tp.records.Load(requestID)
 	require.True(t, ok)
 
@@ -1268,7 +1328,7 @@ func TestHandleTxConfirmed(t *testing.T) {
 	tp.wg.Add(1)
 	done := make(chan struct{})
 	go func() {
-		tp.handleTxConfirmed(record, requestID)
+		tp.handleTxConfirmed(record)
 		close(done)
 	}()
 
@@ -1314,7 +1374,11 @@ func TestHandleFeeBumpTx(t *testing.T) {
 
 	// Create a testing monitor record.
 	req := createTestBumpRequest()
+
+	// Create a testing record and put it in the map.
+	requestID := uint64(1)
 	record := &monitorRecord{
+		requestID:   requestID,
 		req:         req,
 		feeFunction: m.feeFunc,
 		tx:          tx,
@@ -1327,10 +1391,16 @@ func TestHandleFeeBumpTx(t *testing.T) {
 	utxoIndex := map[wire.OutPoint]int{
 		op: 0,
 	}
-
-	// Create a testing record and put it in the map.
 	fee := btcutil.Amount(1000)
-	requestID := tp.storeRecord(tx, req, m.feeFunc, fee, utxoIndex)
+
+	// Create a sweepTxCtx.
+	sweepCtx := &sweepTxCtx{
+		tx:                tx,
+		fee:               fee,
+		outpointToTxIndex: utxoIndex,
+	}
+
+	tp.updateRecord(record, sweepCtx)
 
 	// Create a subscription to the event.
 	subscriber := make(chan *BumpResult, 1)
@@ -1346,7 +1416,7 @@ func TestHandleFeeBumpTx(t *testing.T) {
 
 	// Call the method and expect no result received.
 	tp.wg.Add(1)
-	go tp.handleFeeBumpTx(requestID, record, testHeight)
+	go tp.handleFeeBumpTx(record, testHeight)
 
 	// Check there's no result sent back.
 	select {
@@ -1360,7 +1430,7 @@ func TestHandleFeeBumpTx(t *testing.T) {
 
 	// Call the method and expect no result received.
 	tp.wg.Add(1)
-	go tp.handleFeeBumpTx(requestID, record, testHeight)
+	go tp.handleFeeBumpTx(record, testHeight)
 
 	// Check there's no result sent back.
 	select {
@@ -1376,7 +1446,7 @@ func TestHandleFeeBumpTx(t *testing.T) {
 	//
 	// NOTE: we are not testing the utility of creating valid txes here, so
 	// this is fine to be mocked. This behaves essentially as skipping the
-	// Signer check and alaways assume the tx has a valid sig.
+	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
 		mock.Anything).Return(script, nil)
@@ -1392,7 +1462,7 @@ func TestHandleFeeBumpTx(t *testing.T) {
 	//
 	// NOTE: must be called in a goroutine in case it blocks.
 	tp.wg.Add(1)
-	go tp.handleFeeBumpTx(requestID, record, testHeight)
+	go tp.handleFeeBumpTx(record, testHeight)
 
 	select {
 	case <-time.After(time.Second):
@@ -1418,58 +1488,163 @@ func TestHandleFeeBumpTx(t *testing.T) {
 	require.True(t, found)
 }
 
-// TestProcessRecords validates processRecords behaves as expected.
-func TestProcessRecords(t *testing.T) {
+// TestProcessRecordsInitial validates processRecords behaves as expected when
+// processing the initial broadcast.
+func TestProcessRecordsInitial(t *testing.T) {
 	t.Parallel()
 
 	// Create a publisher using the mocks.
 	tp, m := createTestPublisher(t)
 
 	// Create testing objects.
-	requestID1 := uint64(1)
-	req1 := createTestBumpRequest()
-	tx1 := &wire.MsgTx{LockTime: 1}
-	txid1 := tx1.TxHash()
+	requestID := uint64(1)
+	req := createTestBumpRequest()
+	op := req.Inputs[0].OutPoint()
 
-	requestID2 := uint64(2)
-	req2 := createTestBumpRequest()
-	tx2 := &wire.MsgTx{LockTime: 2}
-	txid2 := tx2.TxHash()
-
-	// Create a monitor record that's confirmed.
-	recordConfirmed := &monitorRecord{
-		req:         req1,
-		feeFunction: m.feeFunc,
-		tx:          tx1,
+	// Mock RegisterSpendNtfn.
+	//
+	// Create the spending event that doesn't send an event.
+	se := &chainntnfs.SpendEvent{
+		Cancel: func() {},
 	}
-	m.wallet.On("GetTransactionDetails", &txid1).Return(
-		&lnwallet.TransactionDetail{
-			NumConfirmations: 1,
-		}, nil,
-	).Once()
+	m.notifier.On("RegisterSpendNtfn",
+		&op, mock.Anything, mock.Anything).Return(se, nil).Once()
 
-	// Create a monitor record that's not confirmed. We know it's not
-	// confirmed because the num of confirms is zero.
-	recordFeeBump := &monitorRecord{
-		req:         req2,
-		feeFunction: m.feeFunc,
-		tx:          tx2,
+	// Create a monitor record that's broadcast the first time.
+	record := &monitorRecord{
+		requestID: requestID,
+		req:       req,
 	}
-	m.wallet.On("GetTransactionDetails", &txid2).Return(
-		&lnwallet.TransactionDetail{
-			NumConfirmations: 0,
-		}, nil,
-	).Once()
-	m.wallet.On("BackEnd").Return("test-backend").Once()
 
 	// Setup the initial publisher state by adding the records to the maps.
-	subscriberConfirmed := make(chan *BumpResult, 1)
-	tp.subscriberChans.Store(requestID1, subscriberConfirmed)
-	tp.records.Store(requestID1, recordConfirmed)
+	subscriber := make(chan *BumpResult, 1)
+	tp.subscriberChans.Store(requestID, subscriber)
+	tp.records.Store(requestID, record)
 
-	subscriberReplaced := make(chan *BumpResult, 1)
-	tp.subscriberChans.Store(requestID2, subscriberReplaced)
-	tp.records.Store(requestID2, recordFeeBump)
+	// The following methods should only be called once when creating the
+	// initial broadcast tx.
+	//
+	// Mock the signer to always return a valid script.
+	m.signer.On("ComputeInputScript", mock.Anything,
+		mock.Anything).Return(&input.Script{}, nil).Once()
+
+	// Mock the testmempoolaccept to return nil.
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+
+	// Mock the wallet to publish successfully.
+	m.wallet.On("PublishTransaction",
+		mock.Anything, mock.Anything).Return(nil).Once()
+
+	// Call processRecords and expect the results are notified back.
+	tp.processRecords()
+
+	// We expect the published tx to be notified back.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber")
+
+	case result := <-subscriber:
+		// We expect the result to be TxPublished.
+		require.Equal(t, TxPublished, result.Event)
+
+		// Expect the tx to be set but not the replaced tx.
+		require.NotNil(t, result.Tx)
+		require.Nil(t, result.ReplacedTx)
+
+		// No error should be set.
+		require.Nil(t, result.Err)
+		require.Equal(t, requestID, result.requestID)
+	}
+}
+
+// TestProcessRecordsInitialSpent validates processRecords behaves as expected
+// when processing the initial broadcast when the input is spent.
+func TestProcessRecordsInitialSpent(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create testing objects.
+	requestID := uint64(1)
+	req := createTestBumpRequest()
+	tx := &wire.MsgTx{LockTime: 1}
+	op := req.Inputs[0].OutPoint()
+
+	// Mock RegisterSpendNtfn.
+	se := createTestSpendEvent(tx)
+	m.notifier.On("RegisterSpendNtfn",
+		&op, mock.Anything, mock.Anything).Return(se, nil).Once()
+
+	// Create a monitor record that's broadcast the first time.
+	record := &monitorRecord{
+		requestID: requestID,
+		req:       req,
+	}
+
+	// Setup the initial publisher state by adding the records to the maps.
+	subscriber := make(chan *BumpResult, 1)
+	tp.subscriberChans.Store(requestID, subscriber)
+	tp.records.Store(requestID, record)
+
+	// Call processRecords and expect the results are notified back.
+	tp.processRecords()
+
+	// We expect the published tx to be notified back.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber")
+
+	case result := <-subscriber:
+		// We expect the result to be TxUnknownSpend.
+		require.Equal(t, TxUnknownSpend, result.Event)
+
+		// Expect the tx and the replaced tx to be nil.
+		require.Nil(t, result.Tx)
+		require.Nil(t, result.ReplacedTx)
+
+		// The error should be set.
+		require.ErrorIs(t, result.Err, ErrUnknownSpent)
+		require.Equal(t, requestID, result.requestID)
+	}
+}
+
+// TestProcessRecordsFeeBump validates processRecords behaves as expected when
+// processing fee bump records.
+func TestProcessRecordsFeeBump(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create testing objects.
+	requestID := uint64(1)
+	req := createTestBumpRequest()
+	tx := &wire.MsgTx{LockTime: 1}
+	op := req.Inputs[0].OutPoint()
+
+	// Mock RegisterSpendNtfn.
+	//
+	// Create the spending event that doesn't send an event.
+	se := &chainntnfs.SpendEvent{
+		Cancel: func() {},
+	}
+	m.notifier.On("RegisterSpendNtfn",
+		&op, mock.Anything, mock.Anything).Return(se, nil).Once()
+
+	// Create a monitor record that's not confirmed. We know it's not
+	// confirmed because the `SpendEvent` is empty.
+	record := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+		tx:          tx,
+	}
+
+	// Setup the initial publisher state by adding the records to the maps.
+	subscriber := make(chan *BumpResult, 1)
+	tp.subscriberChans.Store(requestID, subscriber)
+	tp.records.Store(requestID, record)
 
 	// Create a test feerate and return it from the mock fee function.
 	feerate := chainfee.SatPerKWeight(1000)
@@ -1495,39 +1670,640 @@ func TestProcessRecords(t *testing.T) {
 	// Call processRecords and expect the results are notified back.
 	tp.processRecords()
 
-	// We expect two results to be received. One for the confirmed tx and
-	// one for the replaced tx.
-	//
-	// Check the confirmed tx result.
-	select {
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for subscriberConfirmed")
-
-	case result := <-subscriberConfirmed:
-		// We expect the result to be TxConfirmed.
-		require.Equal(t, TxConfirmed, result.Event)
-		require.Equal(t, tx1, result.Tx)
-
-		// No error should be set.
-		require.Nil(t, result.Err)
-		require.Equal(t, requestID1, result.requestID)
-	}
-
-	// Now check the replaced tx result.
+	// We expect the replaced tx to be notified back.
 	select {
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for subscriberReplaced")
 
-	case result := <-subscriberReplaced:
+	case result := <-subscriber:
 		// We expect the result to be TxReplaced.
 		require.Equal(t, TxReplaced, result.Event)
 
 		// The new tx and old tx should be properly set.
-		require.NotEqual(t, tx2, result.Tx)
-		require.Equal(t, tx2, result.ReplacedTx)
+		require.NotEqual(t, tx, result.Tx)
+		require.Equal(t, tx, result.ReplacedTx)
 
 		// No error should be set.
 		require.Nil(t, result.Err)
-		require.Equal(t, requestID2, result.requestID)
+		require.Equal(t, requestID, result.requestID)
 	}
+}
+
+// TestProcessRecordsConfirmed validates processRecords behaves as expected when
+// processing confirmed records.
+func TestProcessRecordsConfirmed(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create testing objects.
+	requestID := uint64(1)
+	req := createTestBumpRequest()
+	tx := &wire.MsgTx{LockTime: 1}
+	op := req.Inputs[0].OutPoint()
+
+	// Mock RegisterSpendNtfn.
+	se := createTestSpendEvent(tx)
+	m.notifier.On("RegisterSpendNtfn",
+		&op, mock.Anything, mock.Anything).Return(se, nil).Once()
+
+	// Create a monitor record that's confirmed.
+	recordConfirmed := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+		tx:          tx,
+	}
+
+	// Setup the initial publisher state by adding the records to the maps.
+	subscriber := make(chan *BumpResult, 1)
+	tp.subscriberChans.Store(requestID, subscriber)
+	tp.records.Store(requestID, recordConfirmed)
+
+	// Create a test feerate and return it from the mock fee function.
+	feerate := chainfee.SatPerKWeight(1000)
+	m.feeFunc.On("FeeRate").Return(feerate)
+
+	// Call processRecords and expect the results are notified back.
+	tp.processRecords()
+
+	// Check the confirmed tx result.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber")
+
+	case result := <-subscriber:
+		// We expect the result to be TxConfirmed.
+		require.Equal(t, TxConfirmed, result.Event)
+		require.Equal(t, tx, result.Tx)
+
+		// No error should be set.
+		require.Nil(t, result.Err)
+		require.Equal(t, requestID, result.requestID)
+	}
+}
+
+// TestProcessRecordsSpent validates processRecords behaves as expected when
+// processing unknown spent records.
+func TestProcessRecordsSpent(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create testing objects.
+	requestID := uint64(1)
+	req := createTestBumpRequest()
+	tx := &wire.MsgTx{LockTime: 1}
+	op := req.Inputs[0].OutPoint()
+
+	// Create a unknown tx.
+	txUnknown := &wire.MsgTx{LockTime: 2}
+
+	// Mock RegisterSpendNtfn.
+	se := createTestSpendEvent(txUnknown)
+	m.notifier.On("RegisterSpendNtfn",
+		&op, mock.Anything, mock.Anything).Return(se, nil).Once()
+
+	// Create a monitor record that's spent by txUnknown.
+	recordConfirmed := &monitorRecord{
+		requestID:   requestID,
+		req:         req,
+		feeFunction: m.feeFunc,
+		tx:          tx,
+	}
+
+	// Setup the initial publisher state by adding the records to the maps.
+	subscriber := make(chan *BumpResult, 1)
+	tp.subscriberChans.Store(requestID, subscriber)
+	tp.records.Store(requestID, recordConfirmed)
+
+	// Mock the fee function to increase feerate.
+	m.feeFunc.On("Increment").Return(true, nil).Once()
+
+	// Create a test feerate and return it from the mock fee function.
+	feerate := chainfee.SatPerKWeight(1000)
+	m.feeFunc.On("FeeRate").Return(feerate)
+
+	// Call processRecords and expect the results are notified back.
+	tp.processRecords()
+
+	// Check the unknown tx result.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber")
+
+	case result := <-subscriber:
+		// We expect the result to be TxUnknownSpend.
+		require.Equal(t, TxUnknownSpend, result.Event)
+		require.Equal(t, tx, result.Tx)
+
+		// We expect the fee rate to be updated.
+		require.Equal(t, feerate, result.FeeRate)
+
+		// No error should be set.
+		require.ErrorIs(t, result.Err, ErrUnknownSpent)
+		require.Equal(t, requestID, result.requestID)
+	}
+}
+
+// TestHandleInitialBroadcastSuccess checks `handleInitialBroadcast` method can
+// successfully broadcast a tx based on the request.
+func TestHandleInitialBroadcastSuccess(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create a test feerate.
+	feerate := chainfee.SatPerKWeight(1000)
+
+	// Mock the fee estimator to return the testing fee rate.
+	//
+	// We are not testing `NewLinearFeeFunction` here, so the actual params
+	// used are irrelevant.
+	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
+		feerate, nil).Once()
+	m.estimator.On("RelayFeePerKW").Return(chainfee.FeePerKwFloor).Once()
+
+	// Mock the signer to always return a valid script.
+	//
+	// NOTE: we are not testing the utility of creating valid txes here, so
+	// this is fine to be mocked. This behaves essentially as skipping the
+	// Signer check and always assume the tx has a valid sig.
+	script := &input.Script{}
+	m.signer.On("ComputeInputScript", mock.Anything,
+		mock.Anything).Return(script, nil)
+
+	// Mock the testmempoolaccept to pass.
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+
+	// Mock the wallet to publish successfully.
+	m.wallet.On("PublishTransaction",
+		mock.Anything, mock.Anything).Return(nil).Once()
+
+	// Create a test request.
+	inp := createTestInput(1000, input.WitnessKeyHash)
+
+	// Create a testing bump request.
+	req := &BumpRequest{
+		DeliveryAddress: changePkScript,
+		Inputs:          []input.Input{&inp},
+		Budget:          btcutil.Amount(1000),
+		MaxFeeRate:      feerate * 10,
+		DeadlineHeight:  10,
+	}
+
+	// Register the testing record use `Broadcast`.
+	resultChan := tp.Broadcast(req)
+
+	// Grab the monitor record from the map.
+	rid := tp.requestCounter.Load()
+	rec, ok := tp.records.Load(rid)
+	require.True(t, ok)
+
+	// Call the method under test.
+	tp.wg.Add(1)
+	tp.handleInitialBroadcast(rec)
+
+	// Check the result is sent back.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber to receive result")
+
+	case result := <-resultChan:
+		// We expect the first result to be TxPublished.
+		require.Equal(t, TxPublished, result.Event)
+	}
+
+	// Validate the record was stored.
+	require.Equal(t, 1, tp.records.Len())
+	require.Equal(t, 1, tp.subscriberChans.Len())
+}
+
+// TestHandleInitialBroadcastFail checks `handleInitialBroadcast` returns the
+// error or a failed result when the broadcast fails.
+func TestHandleInitialBroadcastFail(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create a test feerate.
+	feerate := chainfee.SatPerKWeight(1000)
+
+	// Create a test request.
+	inp := createTestInput(1000, input.WitnessKeyHash)
+
+	// Create a testing bump request.
+	req := &BumpRequest{
+		DeliveryAddress: changePkScript,
+		Inputs:          []input.Input{&inp},
+		Budget:          btcutil.Amount(1000),
+		MaxFeeRate:      feerate * 10,
+		DeadlineHeight:  10,
+	}
+
+	// Mock the fee estimator to return the testing fee rate.
+	//
+	// We are not testing `NewLinearFeeFunction` here, so the actual params
+	// used are irrelevant.
+	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
+		feerate, nil).Twice()
+	m.estimator.On("RelayFeePerKW").Return(chainfee.FeePerKwFloor).Twice()
+
+	// Mock the signer to always return a valid script.
+	//
+	// NOTE: we are not testing the utility of creating valid txes here, so
+	// this is fine to be mocked. This behaves essentially as skipping the
+	// Signer check and always assume the tx has a valid sig.
+	script := &input.Script{}
+	m.signer.On("ComputeInputScript", mock.Anything,
+		mock.Anything).Return(script, nil)
+
+	// Mock the testmempoolaccept to return an error.
+	m.wallet.On("CheckMempoolAcceptance",
+		mock.Anything).Return(errDummy).Once()
+
+	// Register the testing record use `Broadcast`.
+	resultChan := tp.Broadcast(req)
+
+	// Grab the monitor record from the map.
+	rid := tp.requestCounter.Load()
+	rec, ok := tp.records.Load(rid)
+	require.True(t, ok)
+
+	// Call the method under test and expect an error returned.
+	tp.wg.Add(1)
+	tp.handleInitialBroadcast(rec)
+
+	// Check the result is sent back.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber to receive result")
+
+	case result := <-resultChan:
+		// We expect the first result to be TxFatal.
+		require.Equal(t, TxFatal, result.Event)
+	}
+
+	// Validate the record was NOT stored.
+	require.Equal(t, 0, tp.records.Len())
+	require.Equal(t, 0, tp.subscriberChans.Len())
+
+	// Mock the testmempoolaccept again, this time it passes.
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+
+	// Mock the wallet to fail on publish.
+	m.wallet.On("PublishTransaction",
+		mock.Anything, mock.Anything).Return(errDummy).Once()
+
+	// Register the testing record use `Broadcast`.
+	resultChan = tp.Broadcast(req)
+
+	// Grab the monitor record from the map.
+	rid = tp.requestCounter.Load()
+	rec, ok = tp.records.Load(rid)
+	require.True(t, ok)
+
+	// Call the method under test.
+	tp.wg.Add(1)
+	tp.handleInitialBroadcast(rec)
+
+	// Check the result is sent back.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber to receive result")
+
+	case result := <-resultChan:
+		// We expect the result to be TxFailed and the error is set in
+		// the result.
+		require.Equal(t, TxFailed, result.Event)
+		require.ErrorIs(t, result.Err, errDummy)
+	}
+
+	// Validate the record was removed.
+	require.Equal(t, 0, tp.records.Len())
+	require.Equal(t, 0, tp.subscriberChans.Len())
+}
+
+// TestHasInputsSpent checks the expected outpoint:tx map is returned.
+func TestHasInputsSpent(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create mock inputs.
+	op1 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 1,
+	}
+	inp1 := &input.MockInput{}
+	heightHint1 := uint32(1)
+	defer inp1.AssertExpectations(t)
+
+	op2 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 2,
+	}
+	inp2 := &input.MockInput{}
+	heightHint2 := uint32(2)
+	defer inp2.AssertExpectations(t)
+
+	op3 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 3,
+	}
+	walletInp := &input.MockInput{}
+	heightHint3 := uint32(0)
+	defer walletInp.AssertExpectations(t)
+
+	// We expect all the inputs to call OutPoint and HeightHint.
+	inp1.On("OutPoint").Return(op1).Once()
+	inp2.On("OutPoint").Return(op2).Once()
+	walletInp.On("OutPoint").Return(op3).Once()
+	inp1.On("HeightHint").Return(heightHint1).Once()
+	inp2.On("HeightHint").Return(heightHint2).Once()
+	walletInp.On("HeightHint").Return(heightHint3).Once()
+
+	// We expect the normal inputs to call SignDesc.
+	pkScript1 := []byte{1}
+	sd1 := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: pkScript1,
+		},
+	}
+	inp1.On("SignDesc").Return(sd1).Once()
+
+	pkScript2 := []byte{1}
+	sd2 := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: pkScript2,
+		},
+	}
+	inp2.On("SignDesc").Return(sd2).Once()
+
+	pkScript3 := []byte{3}
+	sd3 := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: pkScript3,
+		},
+	}
+	walletInp.On("SignDesc").Return(sd3).Once()
+
+	// Mock RegisterSpendNtfn.
+	//
+	// spendingTx1 is the tx spending op1.
+	spendingTx1 := &wire.MsgTx{}
+	se1 := createTestSpendEvent(spendingTx1)
+	m.notifier.On("RegisterSpendNtfn",
+		&op1, pkScript1, heightHint1).Return(se1, nil).Once()
+
+	// Create the spending event that doesn't send an event.
+	se2 := &chainntnfs.SpendEvent{
+		Cancel: func() {},
+	}
+	m.notifier.On("RegisterSpendNtfn",
+		&op2, pkScript2, heightHint2).Return(se2, nil).Once()
+
+	se3 := &chainntnfs.SpendEvent{
+		Cancel: func() {},
+	}
+	m.notifier.On("RegisterSpendNtfn",
+		&op3, pkScript3, heightHint3).Return(se3, nil).Once()
+
+	// Prepare the test inputs.
+	inputs := []input.Input{inp1, inp2, walletInp}
+
+	// Prepare the test record.
+	record := &monitorRecord{
+		req: &BumpRequest{
+			Inputs: inputs,
+		},
+	}
+
+	// Call the method under test.
+	result := tp.getSpentInputs(record)
+
+	// Assert the expected map is created.
+	expected := map[wire.OutPoint]*wire.MsgTx{
+		op1: spendingTx1,
+	}
+	require.Equal(t, expected, result)
+}
+
+// createTestSpendEvent creates a SpendEvent which places the specified tx in
+// the channel, which can be read by a spending subscriber.
+func createTestSpendEvent(tx *wire.MsgTx) *chainntnfs.SpendEvent {
+	// Create a monitor record that's confirmed.
+	spendDetails := chainntnfs.SpendDetail{
+		SpendingTx: tx,
+	}
+	spendChan1 := make(chan *chainntnfs.SpendDetail, 1)
+	spendChan1 <- &spendDetails
+
+	// Create the spend events.
+	return &chainntnfs.SpendEvent{
+		Spend:  spendChan1,
+		Cancel: func() {},
+	}
+}
+
+// TestPrepareSweepTx tests the prepareSweepTx function behavior.
+func TestPrepareSweepTx(t *testing.T) {
+	t.Parallel()
+
+	// Create test inputs with different values.
+	inp1 := createTestInput(1000000, input.WitnessKeyHash)
+	inp2 := createTestInput(2000000, input.WitnessKeyHash)
+
+	// Test fee rate and height.
+	feeRate := chainfee.SatPerKWeight(1000)
+	currentHeight := int32(800000)
+
+	testCases := []struct {
+		name           string
+		inputs         []input.Input
+		changePkScript lnwallet.AddrWithKey
+		feeRate        chainfee.SatPerKWeight
+		currentHeight  int32
+		auxSweeper     fn.Option[AuxSweeper]
+		expectedErr    error
+		checkResults   func(t *testing.T, fee btcutil.Amount,
+			changeOuts fn.Option[[]SweepOutput],
+			locktime fn.Option[int32])
+	}{
+		{
+			name: "successful sweep with change - no " +
+				"extra output",
+			inputs:         []input.Input{&inp1, &inp2},
+			changePkScript: changePkScript,
+			feeRate:        feeRate,
+			currentHeight:  currentHeight,
+			auxSweeper:     fn.None[AuxSweeper](),
+			expectedErr:    nil,
+			checkResults: func(t *testing.T, fee btcutil.Amount,
+				changeOuts fn.Option[[]SweepOutput],
+				locktime fn.Option[int32]) {
+
+				// Calculate expected weight - only regular
+				// change output, no extra.
+				expectedWeight, err := calcSweepTxWeight(
+					[]input.Input{&inp1, &inp2},
+					[][]byte{
+						changePkScript.DeliveryAddress,
+					},
+				)
+				require.NoError(t, err)
+
+				// Expected fee based on fee rate and weight.
+				expectedFee := feeRate.FeeForWeight(
+					expectedWeight,
+				)
+
+				require.Equal(t, fee, expectedFee)
+			},
+		},
+		{
+			name:           "successful sweep with extra output",
+			inputs:         []input.Input{&inp1, &inp2},
+			changePkScript: changePkScript,
+			feeRate:        feeRate,
+			currentHeight:  currentHeight,
+			auxSweeper:     fn.Some[AuxSweeper](&MockAuxSweeper{}),
+			expectedErr:    nil,
+			checkResults: func(t *testing.T, fee btcutil.Amount,
+				changeOuts fn.Option[[]SweepOutput],
+				locktime fn.Option[int32]) {
+
+				// Calculate expected weight - includes both
+				// regular change and extra output.
+				expectedWeight, err := calcSweepTxWeight(
+					[]input.Input{&inp1, &inp2},
+					[][]byte{changePkScript.DeliveryAddress,
+						changePkScript.DeliveryAddress},
+				)
+				require.NoError(t, err)
+
+				// Expected fee based on fee rate and weight.
+				expectedFee := feeRate.FeeForWeight(
+					expectedWeight,
+				)
+
+				require.Equal(t, fee, expectedFee)
+
+				// Should have change outputs (both regular
+				// and extra).
+				require.True(t, changeOuts.IsSome())
+				outputs := changeOuts.UnwrapOr([]SweepOutput{})
+				require.Equal(t, 2, len(outputs))
+
+				// Check if extra output is present.
+				hasExtra := false
+				for _, out := range outputs {
+					if out.IsExtra {
+						hasExtra = true
+						break
+					}
+				}
+				require.True(
+					t, hasExtra, "Should have extra output",
+				)
+
+				// Locktime should be None since no inputs
+				// require locktime.
+				require.True(t, locktime.IsNone())
+			},
+		},
+		{
+			name:           "insufficient inputs",
+			inputs:         []input.Input{},
+			changePkScript: changePkScript,
+			feeRate:        feeRate,
+			currentHeight:  currentHeight,
+			auxSweeper:     fn.None[AuxSweeper](),
+			expectedErr:    ErrNotEnoughInputs,
+		},
+		{
+			name: "high fee rate causes insufficient " +
+				"inputs",
+			inputs:         []input.Input{&inp1},
+			changePkScript: changePkScript,
+			feeRate:        chainfee.SatPerKWeight(10000000),
+			currentHeight:  currentHeight,
+			auxSweeper:     fn.None[AuxSweeper](),
+			expectedErr:    ErrNotEnoughInputs,
+		},
+		{
+			name: "immature locktime",
+			inputs: []input.Input{
+				createTestInputWithLocktime(
+					1000000, input.WitnessKeyHash,
+					uint32(currentHeight+100),
+				),
+			},
+			changePkScript: changePkScript,
+			feeRate:        feeRate,
+			currentHeight:  currentHeight,
+			auxSweeper:     fn.None[AuxSweeper](),
+			expectedErr:    ErrLocktimeImmature,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fee, changeOuts, locktime, err := prepareSweepTx(
+				tc.inputs,
+				tc.changePkScript,
+				tc.feeRate,
+				tc.currentHeight,
+				tc.auxSweeper,
+			)
+
+			// Check error expectations.
+			if tc.expectedErr != nil {
+				require.ErrorIs(t, err, tc.expectedErr)
+				return
+			}
+
+			// For successful cases, run additional checks.
+			require.NoError(t, err)
+			if tc.checkResults != nil {
+				tc.checkResults(t, fee, changeOuts, locktime)
+			}
+		})
+	}
+}
+
+// createTestInputWithLocktime creates a test input with a specific locktime
+// requirement.
+func createTestInputWithLocktime(value int64, witnessType input.WitnessType,
+	locktime uint32) *input.BaseInput {
+
+	// Create a unique test identifier based on input count.
+	hash := chainhash.Hash{}
+	hash[lntypes.HashSize-1] = byte(testInputCount.Add(1))
+
+	// Use NewCsvInputWithCltv to create an input with locktime requirement.
+	inp := input.NewCsvInputWithCltv(
+		&wire.OutPoint{
+			Hash: hash,
+		},
+		witnessType,
+		&input.SignDescriptor{
+			Output: &wire.TxOut{
+				Value: value,
+			},
+			KeyDesc: keychain.KeyDescriptor{
+				PubKey: testPubKey,
+			},
+		},
+		1, 0, locktime,
+	)
+
+	return inp
 }

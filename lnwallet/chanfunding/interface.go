@@ -8,7 +8,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
@@ -46,7 +46,7 @@ type OutputLeaser interface {
 	// LeaseOutput leases a target output, rendering it unusable for coin
 	// selection.
 	LeaseOutput(i wtxmgr.LockID, o wire.OutPoint, d time.Duration) (
-		time.Time, []byte, btcutil.Amount, error)
+		time.Time, error)
 
 	// ReleaseOutput releases a target output, allowing it to be used for
 	// coin selection once again.

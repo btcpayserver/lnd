@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,10 @@ type chanWatchRequest struct {
 	advertisingNode    string
 	policy             *lnrpc.RoutingPolicy
 	includeUnannounced bool
+
+	// handled is a channel that will be closed once the request has been
+	// handled by the topologyWatcher goroutine.
+	handled chan struct{}
 }
 
 // nodeWatcher is a topology watcher for a HarnessNode. It keeps track of all
@@ -154,6 +159,7 @@ func (nw *nodeWatcher) WaitForChannelOpen(chanPoint *lnrpc.ChannelPoint) error {
 		chanPoint:     op,
 		eventChan:     eventChan,
 		chanWatchType: watchOpenChannel,
+		handled:       make(chan struct{}),
 	}
 
 	timer := time.After(wait.DefaultTimeout)
@@ -185,6 +191,7 @@ func (nw *nodeWatcher) WaitForChannelClose(
 		chanPoint:     op,
 		eventChan:     eventChan,
 		chanWatchType: watchCloseChannel,
+		handled:       make(chan struct{}),
 	}
 
 	timer := time.After(wait.DefaultTimeout)
@@ -216,7 +223,27 @@ func (nw *nodeWatcher) WaitForChannelPolicyUpdate(
 	timer := time.After(wait.DefaultTimeout)
 	defer ticker.Stop()
 
-	eventChan := make(chan struct{})
+	// onTimeout is a helper function that will be called in case the
+	// expected policy is not found before the timeout.
+	onTimeout := func() error {
+		expected, err := json.MarshalIndent(policy, "", "\t")
+		if err != nil {
+			return fmt.Errorf("encode policy err: %w", err)
+		}
+
+		policies, err := syncMapToJSON(&nw.state.policyUpdates.Map)
+		if err != nil {
+			return err
+		}
+
+		return fmt.Errorf("policy not updated before timeout:"+
+			"\nchannel: %v \nadvertisingNode: %s:%v"+
+			"\nwant policy:%s\nhave updates:%s", op,
+			advertisingNode.Name(), advertisingNode.PubKeyStr,
+			expected, policies)
+	}
+
+	var eventChan = make(chan struct{})
 	for {
 		select {
 		// Send a watch request every second.
@@ -230,6 +257,7 @@ func (nw *nodeWatcher) WaitForChannelPolicyUpdate(
 			default:
 			}
 
+			var handled = make(chan struct{})
 			nw.chanWatchRequests <- &chanWatchRequest{
 				chanPoint:          op,
 				eventChan:          eventChan,
@@ -237,28 +265,25 @@ func (nw *nodeWatcher) WaitForChannelPolicyUpdate(
 				policy:             policy,
 				advertisingNode:    advertisingNode.PubKeyStr,
 				includeUnannounced: includeUnannounced,
+				handled:            handled,
+			}
+
+			// We wait for the topologyWatcher to signal that
+			// it has completed the handling of the request so that
+			// we don't send a new request before the previous one
+			// has been processed as this could lead to a double
+			// closure of the eventChan channel.
+			select {
+			case <-handled:
+			case <-timer:
+				return onTimeout()
 			}
 
 		case <-eventChan:
 			return nil
 
 		case <-timer:
-			expected, err := json.MarshalIndent(policy, "", "\t")
-			if err != nil {
-				return fmt.Errorf("encode policy err: %w", err)
-			}
-			policies, err := syncMapToJSON(
-				&nw.state.policyUpdates.Map,
-			)
-			if err != nil {
-				return err
-			}
-
-			return fmt.Errorf("policy not updated before timeout:"+
-				"\nchannel: %v \nadvertisingNode: %s:%v"+
-				"\nwant policy:%s\nhave updates:%s", op,
-				advertisingNode.Name(),
-				advertisingNode.PubKeyStr, expected, policies)
+			return onTimeout()
 		}
 	}
 }
@@ -340,6 +365,10 @@ func (nw *nodeWatcher) topologyWatcher(ctxb context.Context,
 			case watchPolicyUpdate:
 				nw.handlePolicyUpdateWatchRequest(watchRequest)
 			}
+
+			// Signal to the caller that the request has been
+			// handled.
+			close(watchRequest.handled)
 
 		case <-ctxb.Done():
 			return
@@ -695,6 +724,28 @@ func CheckChannelPolicy(policy, expectedPolicy *lnrpc.RoutingPolicy) error {
 	}
 	if policy.Disabled != expectedPolicy.Disabled {
 		return errors.New("edge should be disabled but isn't")
+	}
+
+	// We now validate custom records.
+	records := policy.CustomRecords
+
+	if len(records) != len(expectedPolicy.CustomRecords) {
+		return fmt.Errorf("expected %v CustomRecords, got %v, "+
+			"records: %v", len(expectedPolicy.CustomRecords),
+			len(records), records)
+	}
+
+	expectedRecords := expectedPolicy.CustomRecords
+	for k, record := range records {
+		expected, found := expectedRecords[k]
+		if !found {
+			return fmt.Errorf("CustomRecords %v not found", k)
+		}
+
+		if !bytes.Equal(record, expected) {
+			return fmt.Errorf("want CustomRecords(%v) %s, got %s",
+				k, expected, record)
+		}
 	}
 
 	return nil

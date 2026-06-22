@@ -168,6 +168,8 @@ func (n *NeutrinoNotifier) Started() bool {
 }
 
 func (n *NeutrinoNotifier) startNotifier() error {
+	chainntnfs.Log.Infof("neutrino notifier starting...")
+
 	// Start our concurrent queues before starting the rescan, to ensure
 	// onFilteredBlockConnected and onRelavantTx callbacks won't be
 	// blocked.
@@ -233,6 +235,8 @@ func (n *NeutrinoNotifier) startNotifier() error {
 	// Set the active flag now that we've completed the full
 	// startup.
 	atomic.StoreInt32(&n.active, 1)
+
+	chainntnfs.Log.Debugf("neutrino notifier started")
 
 	return nil
 }
@@ -439,7 +443,7 @@ func (n *NeutrinoNotifier) notificationDispatcher() {
 				// potentially long rescans.
 				n.wg.Add(1)
 
-				//nolint:lll
+				//nolint:ll
 				go func(msg *chainntnfs.HistoricalConfDispatch) {
 					defer n.wg.Done()
 
@@ -689,10 +693,16 @@ func (n *NeutrinoNotifier) handleBlockConnected(newBlock *filteredBlock) error {
 	n.bestBlock.Height = int32(newBlock.height)
 	n.bestBlock.BlockHeader = newBlock.header
 
+	err = n.txNotifier.NotifyHeight(newBlock.height)
+	if err != nil {
+		return fmt.Errorf("unable to notify height: %w", err)
+	}
+
 	n.notifyBlockEpochs(
 		int32(newBlock.height), &newBlock.hash, newBlock.header,
 	)
-	return n.txNotifier.NotifyHeight(newBlock.height)
+
+	return nil
 }
 
 // getFilteredBlock is a utility to retrieve the full filtered block from a block epoch.

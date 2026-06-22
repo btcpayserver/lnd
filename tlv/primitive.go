@@ -257,7 +257,7 @@ func EBytes33(w io.Writer, val interface{}, _ *[8]byte) error {
 // DBytes33 is a Decoder for 33-byte arrays. An error is returned if val is not
 // a *[33]byte.
 func DBytes33(r io.Reader, val interface{}, _ *[8]byte, l uint64) error {
-	if b, ok := val.(*[33]byte); ok {
+	if b, ok := val.(*[33]byte); ok && l == 33 {
 		_, err := io.ReadFull(r, b[:])
 		return err
 	}
@@ -375,16 +375,22 @@ func DBigSize(r io.Reader, val interface{}, buf *[8]byte, l uint64) error {
 	return NewTypeForDecodingErr(val, "BigSize", l, 8)
 }
 
+// constraintUint32Or64 is a type constraint for uint32 or uint64 types.
+type constraintUint32Or64 interface {
+	uint32 | uint64
+}
+
 // SizeBigSize returns a SizeFunc that can compute the length of BigSize.
-func SizeBigSize(val interface{}) SizeFunc {
+func SizeBigSize[T constraintUint32Or64](val *T) SizeFunc {
 	var size uint64
 
-	if i, ok := val.(*uint32); ok {
+	switch i := any(val).(type) {
+	case *uint32:
 		size = VarIntSize(uint64(*i))
-	}
-
-	if i, ok := val.(*uint64); ok {
-		size = VarIntSize(uint64(*i))
+	case *uint64:
+		size = VarIntSize(*i)
+	default:
+		panic(fmt.Sprintf("unexpected type %T for SizeBigSize", val))
 	}
 
 	return func() uint64 {

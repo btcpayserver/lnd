@@ -3,19 +3,20 @@ package sweep
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
-	"golang.org/x/exp/maps"
 )
 
 var (
@@ -152,8 +153,9 @@ func (f FeeEstimateInfo) Estimate(estimator chainfee.Estimator,
 // UtxoSource is an interface that allows a caller to access a source of UTXOs
 // to use when crafting sweep transactions.
 type UtxoSource interface {
-	// ListUnspentWitness returns all UTXOs from the default wallet account
-	// that have between minConfs and maxConfs number of confirmations.
+	// ListUnspentWitnessFromDefaultAccount returns all UTXOs from the
+	// default wallet account that have between minConfs and maxConfs
+	// number of confirmations.
 	ListUnspentWitnessFromDefaultAccount(minConfs, maxConfs int32) (
 		[]*lnwallet.Utxo, error)
 }
@@ -179,7 +181,7 @@ type OutputLeaser interface {
 	// LeaseOutput leases a target output, rendering it unusable for coin
 	// selection.
 	LeaseOutput(i wtxmgr.LockID, o wire.OutPoint, d time.Duration) (
-		time.Time, []byte, btcutil.Amount, error)
+		time.Time, error)
 
 	// ReleaseOutput releases a target output, allowing it to be used for
 	// coin selection once again.
@@ -284,7 +286,7 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 			log.Tracef("[WithCoinSelectLock] leasing utxo: %v",
 				utxo.OutPoint)
 
-			_, _, _, err = outputLeaser.LeaseOutput(
+			_, err = outputLeaser.LeaseOutput(
 				chanfunding.LndInternalLockID, utxo.OutPoint,
 				chanfunding.DefaultLockDuration,
 			)
@@ -424,7 +426,7 @@ func fetchUtxosFromOutpoints(utxos []*lnwallet.Utxo,
 		return nil, fmt.Errorf("%w: %v", ErrUnknownUTXO, err.Error())
 	}
 
-	fetchedUtxos := maps.Values(subMap)
+	fetchedUtxos := slices.Collect(maps.Values(subMap))
 
 	return fetchedUtxos, nil
 }

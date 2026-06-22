@@ -164,11 +164,12 @@ type WalletKitClient interface {
 	// allows the caller to create a transaction that sends to several outputs at
 	// once. This is ideal when wanting to batch create a set of transactions.
 	SendOutputs(ctx context.Context, in *SendOutputsRequest, opts ...grpc.CallOption) (*SendOutputsResponse, error)
+	// lncli: `wallet estimatefeerate`
 	// EstimateFee attempts to query the internal fee estimator of the wallet to
 	// determine the fee (in sat/kw) to attach to a transaction in order to
 	// achieve the confirmation target.
 	EstimateFee(ctx context.Context, in *EstimateFeeRequest, opts ...grpc.CallOption) (*EstimateFeeResponse, error)
-	// lncli: `pendingsweeps`
+	// lncli: `wallet pendingsweeps`
 	// PendingSweeps returns lists of on-chain outputs that lnd is currently
 	// attempting to sweep within its central batching engine. Outputs with similar
 	// fee rates are batched together in order to sweep them within a single
@@ -208,6 +209,10 @@ type WalletKitClient interface {
 	// done by specifying an outpoint within the low fee transaction that is under
 	// the control of the wallet.
 	BumpFee(ctx context.Context, in *BumpFeeRequest, opts ...grpc.CallOption) (*BumpFeeResponse, error)
+	// lncli: `wallet bumpforceclosefee`
+	// BumpForceCloseFee is an endpoint that allows users to bump the fee of a
+	// channel force close. This only works for channels with option_anchors.
+	BumpForceCloseFee(ctx context.Context, in *BumpForceCloseFeeRequest, opts ...grpc.CallOption) (*BumpForceCloseFeeResponse, error)
 	// lncli: `wallet listsweeps`
 	// ListSweeps returns a list of the sweep transactions our node has produced.
 	// Note that these sweeps may not be confirmed yet, as we record sweeps on
@@ -249,6 +254,7 @@ type WalletKitClient interface {
 	// publishing the transaction) or to unlock/release the locked UTXOs in case of
 	// an error on the caller's side.
 	FundPsbt(ctx context.Context, in *FundPsbtRequest, opts ...grpc.CallOption) (*FundPsbtResponse, error)
+	// lncli: `wallet psbt sign`
 	// SignPsbt expects a partial transaction with all inputs and outputs fully
 	// declared and tries to sign all unsigned inputs that have all required fields
 	// (UTXO information, BIP32 derivation information, witness or sig scripts)
@@ -482,6 +488,15 @@ func (c *walletKitClient) BumpFee(ctx context.Context, in *BumpFeeRequest, opts 
 	return out, nil
 }
 
+func (c *walletKitClient) BumpForceCloseFee(ctx context.Context, in *BumpForceCloseFeeRequest, opts ...grpc.CallOption) (*BumpForceCloseFeeResponse, error) {
+	out := new(BumpForceCloseFeeResponse)
+	err := c.cc.Invoke(ctx, "/walletrpc.WalletKit/BumpForceCloseFee", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *walletKitClient) ListSweeps(ctx context.Context, in *ListSweepsRequest, opts ...grpc.CallOption) (*ListSweepsResponse, error) {
 	out := new(ListSweepsResponse)
 	err := c.cc.Invoke(ctx, "/walletrpc.WalletKit/ListSweeps", in, out, opts...)
@@ -675,11 +690,12 @@ type WalletKitServer interface {
 	// allows the caller to create a transaction that sends to several outputs at
 	// once. This is ideal when wanting to batch create a set of transactions.
 	SendOutputs(context.Context, *SendOutputsRequest) (*SendOutputsResponse, error)
+	// lncli: `wallet estimatefeerate`
 	// EstimateFee attempts to query the internal fee estimator of the wallet to
 	// determine the fee (in sat/kw) to attach to a transaction in order to
 	// achieve the confirmation target.
 	EstimateFee(context.Context, *EstimateFeeRequest) (*EstimateFeeResponse, error)
-	// lncli: `pendingsweeps`
+	// lncli: `wallet pendingsweeps`
 	// PendingSweeps returns lists of on-chain outputs that lnd is currently
 	// attempting to sweep within its central batching engine. Outputs with similar
 	// fee rates are batched together in order to sweep them within a single
@@ -719,6 +735,10 @@ type WalletKitServer interface {
 	// done by specifying an outpoint within the low fee transaction that is under
 	// the control of the wallet.
 	BumpFee(context.Context, *BumpFeeRequest) (*BumpFeeResponse, error)
+	// lncli: `wallet bumpforceclosefee`
+	// BumpForceCloseFee is an endpoint that allows users to bump the fee of a
+	// channel force close. This only works for channels with option_anchors.
+	BumpForceCloseFee(context.Context, *BumpForceCloseFeeRequest) (*BumpForceCloseFeeResponse, error)
 	// lncli: `wallet listsweeps`
 	// ListSweeps returns a list of the sweep transactions our node has produced.
 	// Note that these sweeps may not be confirmed yet, as we record sweeps on
@@ -760,6 +780,7 @@ type WalletKitServer interface {
 	// publishing the transaction) or to unlock/release the locked UTXOs in case of
 	// an error on the caller's side.
 	FundPsbt(context.Context, *FundPsbtRequest) (*FundPsbtResponse, error)
+	// lncli: `wallet psbt sign`
 	// SignPsbt expects a partial transaction with all inputs and outputs fully
 	// declared and tries to sign all unsigned inputs that have all required fields
 	// (UTXO information, BIP32 derivation information, witness or sig scripts)
@@ -857,6 +878,9 @@ func (UnimplementedWalletKitServer) PendingSweeps(context.Context, *PendingSweep
 }
 func (UnimplementedWalletKitServer) BumpFee(context.Context, *BumpFeeRequest) (*BumpFeeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BumpFee not implemented")
+}
+func (UnimplementedWalletKitServer) BumpForceCloseFee(context.Context, *BumpForceCloseFeeRequest) (*BumpForceCloseFeeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BumpForceCloseFee not implemented")
 }
 func (UnimplementedWalletKitServer) ListSweeps(context.Context, *ListSweepsRequest) (*ListSweepsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListSweeps not implemented")
@@ -1282,6 +1306,24 @@ func _WalletKit_BumpFee_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WalletKit_BumpForceCloseFee_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BumpForceCloseFeeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WalletKitServer).BumpForceCloseFee(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/walletrpc.WalletKit/BumpForceCloseFee",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WalletKitServer).BumpForceCloseFee(ctx, req.(*BumpForceCloseFeeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WalletKit_ListSweeps_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListSweepsRequest)
 	if err := dec(in); err != nil {
@@ -1466,6 +1508,10 @@ var WalletKit_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BumpFee",
 			Handler:    _WalletKit_BumpFee_Handler,
+		},
+		{
+			MethodName: "BumpForceCloseFee",
+			Handler:    _WalletKit_BumpForceCloseFee_Handler,
 		},
 		{
 			MethodName: "ListSweeps",

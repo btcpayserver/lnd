@@ -369,14 +369,25 @@ func TestParse32Bytes(t *testing.T) {
 func TestParseDescription(t *testing.T) {
 	t.Parallel()
 
+	testNonUTF8StrData, _ := bech32.ConvertBits(
+		[]byte(testNonUTF8Str), 8, 5, true,
+	)
+
 	testCupOfCoffeeData, _ := bech32.ConvertBits([]byte(testCupOfCoffee), 8, 5, true)
 	testPleaseConsiderData, _ := bech32.ConvertBits([]byte(testPleaseConsider), 8, 5, true)
 
 	tests := []struct {
-		data   []byte
-		valid  bool
-		result *string
+		data        []byte
+		valid       bool
+		result      *string
+		expectedErr error
 	}{
+		{
+			data:        testNonUTF8StrData,
+			valid:       false,
+			expectedErr: ErrInvalidUTF8Description,
+			result:      nil,
+		},
 		{
 			data:   []byte{},
 			valid:  true,
@@ -400,6 +411,7 @@ func TestParseDescription(t *testing.T) {
 			t.Errorf("description decoding test %d failed: %v", i, err)
 			return
 		}
+		require.ErrorIs(t, err, test.expectedErr)
 		if test.valid && !reflect.DeepEqual(description, test.result) {
 			t.Fatalf("test %d failed decoding description: "+
 				"expected \"%s\", got \"%s\"",
@@ -581,19 +593,34 @@ func TestParseFallbackAddr(t *testing.T) {
 	t.Parallel()
 
 	testAddrTestnetData, _ := bech32.ConvertBits(testAddrTestnet.ScriptAddress(), 8, 5, true)
-	testAddrTestnetDataWithVersion := append([]byte{17}, testAddrTestnetData...)
+	testAddrTestnetDataWithVersion := append(
+		[]byte{fallbackVersionPubkeyHash}, testAddrTestnetData...,
+	)
 
 	testRustyAddrData, _ := bech32.ConvertBits(testRustyAddr.ScriptAddress(), 8, 5, true)
-	testRustyAddrDataWithVersion := append([]byte{17}, testRustyAddrData...)
+	testRustyAddrDataWithVersion := append(
+		[]byte{fallbackVersionPubkeyHash}, testRustyAddrData...,
+	)
 
 	testAddrMainnetP2SHData, _ := bech32.ConvertBits(testAddrMainnetP2SH.ScriptAddress(), 8, 5, true)
-	testAddrMainnetP2SHDataWithVersion := append([]byte{18}, testAddrMainnetP2SHData...)
+	testAddrMainnetP2SHDataWithVersion := append(
+		[]byte{fallbackVersionScriptHash}, testAddrMainnetP2SHData...,
+	)
 
 	testAddrMainnetP2WPKHData, _ := bech32.ConvertBits(testAddrMainnetP2WPKH.ScriptAddress(), 8, 5, true)
-	testAddrMainnetP2WPKHDataWithVersion := append([]byte{0}, testAddrMainnetP2WPKHData...)
+	testAddrMainnetP2WPKHDataWithVersion := append(
+		[]byte{fallbackVersionWitness}, testAddrMainnetP2WPKHData...,
+	)
 
 	testAddrMainnetP2WSHData, _ := bech32.ConvertBits(testAddrMainnetP2WSH.ScriptAddress(), 8, 5, true)
-	testAddrMainnetP2WSHDataWithVersion := append([]byte{0}, testAddrMainnetP2WSHData...)
+	testAddrMainnetP2WSHDataWithVersion := append(
+		[]byte{fallbackVersionWitness}, testAddrMainnetP2WSHData...,
+	)
+
+	testAddrMainnetP2TRData, _ := bech32.ConvertBits(
+		testAddrMainnetP2TR.ScriptAddress(), 8, 5, true)
+	testAddrMainnetP2TRDataWithVersion := append(
+		[]byte{fallbackVersionTaproot}, testAddrMainnetP2TRData...)
 
 	tests := []struct {
 		data   []byte
@@ -638,6 +665,17 @@ func TestParseFallbackAddr(t *testing.T) {
 			net:    &chaincfg.MainNetParams,
 			valid:  true,
 			result: testAddrMainnetP2WSH,
+		},
+		{
+			data:   testAddrMainnetP2TRDataWithVersion,
+			net:    &chaincfg.MainNetParams,
+			valid:  true,
+			result: testAddrMainnetP2TR,
+		},
+		{
+			data:  testAddrMainnetP2TRDataWithVersion[:10],
+			net:   &chaincfg.MainNetParams,
+			valid: false, // data too short for P2TR address
 		},
 	}
 
@@ -685,18 +723,22 @@ func TestParseRouteHint(t *testing.T) {
 	testDoubleHopData, _ = bech32.ConvertBits(testDoubleHopData, 8, 5, true)
 
 	tests := []struct {
-		data   []byte
-		valid  bool
-		result []HopHint
+		data        []byte
+		valid       bool
+		result      []HopHint
+		expectedErr error
 	}{
 		{
-			data:  []byte{0x0, 0x0, 0x0, 0x0},
-			valid: false, // data too short, not multiple of 51 bytes
+			data: []byte{0x0, 0x0, 0x0, 0x0},
+			// data too short, not multiple of 51 bytes
+			valid:       false,
+			expectedErr: ErrLengthNotMultipleOfHopHint,
 		},
 		{
-			data:   []byte{},
-			valid:  true,
-			result: []HopHint{},
+			data:        []byte{},
+			valid:       false,
+			result:      []HopHint{},
+			expectedErr: ErrEmptyRouteHint,
 		},
 		{
 			data:   testSingleHopData,
@@ -704,8 +746,11 @@ func TestParseRouteHint(t *testing.T) {
 			result: testSingleHop,
 		},
 		{
-			data:  append(testSingleHopData, 0x0),
-			valid: false, // data too long, not multiple of 51 bytes
+			data: append(testSingleHopData,
+				[]byte{0x0, 0x0}...),
+			// data too long, not multiple of 51 bytes
+			valid:       false,
+			expectedErr: ErrLengthNotMultipleOfHopHint,
 		},
 		{
 			data:   testDoubleHopData,
@@ -720,6 +765,7 @@ func TestParseRouteHint(t *testing.T) {
 			t.Errorf("routing info decoding test %d failed: %v", i, err)
 			return
 		}
+		require.ErrorIs(t, err, test.expectedErr)
 		if test.valid {
 			if err := compareRouteHints(test.result, routeHint); err != nil {
 				t.Fatalf("test %d failed decoding routing info: %v", i, err)

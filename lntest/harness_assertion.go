@@ -18,6 +18,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
@@ -28,6 +29,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -60,9 +62,9 @@ func (h *HarnessTest) WaitForBlockchainSync(hn *node.HarnessNode) {
 
 // WaitForBlockchainSyncTo waits until the node is synced to bestBlock.
 func (h *HarnessTest) WaitForBlockchainSyncTo(hn *node.HarnessNode,
-	bestBlock *wire.MsgBlock) {
+	bestBlock chainhash.Hash) {
 
-	bestBlockHash := bestBlock.BlockHash().String()
+	bestBlockHash := bestBlock.String()
 	err := wait.NoError(func() error {
 		resp := hn.RPC.GetInfo()
 		if resp.SyncedToChain {
@@ -118,7 +120,7 @@ func (h *HarnessTest) ConnectNodes(a, b *node.HarnessNode) {
 		},
 	}
 	a.RPC.ConnectPeer(req)
-	h.AssertPeerConnected(a, b)
+	h.AssertConnected(a, b)
 }
 
 // ConnectNodesPerm creates a persistent connection between the two nodes and
@@ -239,6 +241,24 @@ func (h *HarnessTest) EnsureConnected(a, b *node.HarnessNode) {
 	h.AssertPeerConnected(b, a)
 }
 
+// ConnectNodesNoAssert creates a connection from node A to node B.
+func (h *HarnessTest) ConnectNodesNoAssert(a, b *node.HarnessNode) (
+	*lnrpc.ConnectPeerResponse, error) {
+
+	bobInfo := b.RPC.GetInfo()
+
+	req := &lnrpc.ConnectPeerRequest{
+		Addr: &lnrpc.LightningAddress{
+			Pubkey: bobInfo.IdentityPubkey,
+			Host:   b.Cfg.P2PAddr(),
+		},
+	}
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	return a.RPC.LN.ConnectPeer(ctxt, req)
+}
+
 // AssertNumEdges checks that an expected number of edges can be found in the
 // node specified.
 func (h *HarnessTest) AssertNumEdges(hn *node.HarnessNode,
@@ -255,15 +275,15 @@ func (h *HarnessTest) AssertNumEdges(hn *node.HarnessNode,
 		req := &lnrpc.ChannelGraphRequest{
 			IncludeUnannounced: includeUnannounced,
 		}
-		chanGraph := hn.RPC.DescribeGraph(req)
-		total := len(chanGraph.Edges)
+		resp := hn.RPC.DescribeGraph(req)
+		total := len(resp.Edges)
 
 		if total-old == expected {
 			if expected != 0 {
 				// NOTE: assume edges come in ascending order
 				// that the old edges are at the front of the
 				// slice.
-				edges = chanGraph.Edges[old:]
+				edges = resp.Edges[old:]
 			}
 
 			return nil
@@ -349,15 +369,6 @@ func (h HarnessTest) WaitForChannelOpenEvent(
 	return resp.ChanOpen.ChannelPoint
 }
 
-// AssertTopologyChannelOpen asserts that a given channel outpoint is seen by
-// the passed node's network topology.
-func (h *HarnessTest) AssertTopologyChannelOpen(hn *node.HarnessNode,
-	chanPoint *lnrpc.ChannelPoint) {
-
-	err := hn.Watcher.WaitForChannelOpen(chanPoint)
-	require.NoErrorf(h, err, "%s didn't report channel", hn.Name())
-}
-
 // AssertChannelExists asserts that an active channel identified by the
 // specified channel point exists from the point-of-view of the node.
 func (h *HarnessTest) AssertChannelExists(hn *node.HarnessNode,
@@ -409,9 +420,23 @@ func (h *HarnessTest) assertChannelStatus(hn *node.HarnessNode,
 	}, DefaultTimeout)
 
 	require.NoErrorf(h, err, "%s: timeout checking for channel point: %v",
-		hn.Name(), cp)
+		hn.Name(), h.OutPointFromChannelPoint(cp))
 
 	return channel
+}
+
+// AssertChannelEventType consumes one event from a client and asserts the event
+// type is matched.
+func (h *HarnessTest) AssertChannelEventType(sub rpc.ChannelEventsClient,
+	updateType lnrpc.ChannelEventUpdate_UpdateType,
+) *lnrpc.ChannelEventUpdate {
+
+	update := h.ReceiveChannelEvent(sub)
+
+	require.Equalf(h, updateType, update.Type, "wrong event type, "+
+		"want %v got %v", updateType, update.Type)
+
+	return update
 }
 
 // AssertOutputScriptClass checks that the specified transaction output has the
@@ -452,7 +477,8 @@ func (h *HarnessTest) findChannel(hn *node.HarnessNode,
 		}
 	}
 
-	return nil, fmt.Errorf("channel not found using %s", chanPoint)
+	return nil, fmt.Errorf("%s: channel not found using %s", hn.Name(),
+		fp.String())
 }
 
 // ReceiveCloseChannelUpdate waits until a message or an error is received on
@@ -541,8 +567,10 @@ func (h HarnessTest) WaitForChannelCloseEvent(
 	require.NoError(h, err)
 
 	resp, ok := event.Update.(*lnrpc.CloseStatusUpdate_ChanClose)
-	require.Truef(h, ok, "expected channel open update, instead got %v",
-		resp)
+	require.Truef(
+		h, ok, "expected channel close update, instead got %T: %v",
+		event.Update, spew.Sdump(event.Update),
+	)
 
 	txid, err := chainhash.NewHash(resp.ChanClose.ClosingTxid)
 	require.NoErrorf(h, err, "wrong format found in closing txid: %v",
@@ -692,15 +720,19 @@ func (h *HarnessTest) AssertStreamChannelForceClosed(hn *node.HarnessNode,
 		channeldb.ChanStatusLocalCloseInitiator.String(),
 		"channel not coop broadcasted")
 
+	// Get the closing txid.
+	closeTxid, err := chainhash.NewHashFromStr(resp.ClosingTxid)
+	require.NoError(h, err)
+
 	// We'll now, generate a single block, wait for the final close status
 	// update, then ensure that the closing transaction was included in the
 	// block.
-	block := h.MineBlocksAndAssertNumTxes(1, 1)[0]
+	closeTx := h.AssertTxInMempool(*closeTxid)
+	h.MineBlockWithTx(closeTx)
 
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels and 1 pending force close
 	// channels now.
@@ -714,8 +746,11 @@ func (h *HarnessTest) AssertStreamChannelForceClosed(hn *node.HarnessNode,
 	}
 
 	// Assert there's a pending anchor sweep.
+	//
+	// NOTE: We may have a local sweep here, that's why we use
+	// AssertAtLeastNumPendingSweeps instead of AssertNumPendingSweeps.
 	if anchorSweep {
-		h.AssertNumPendingSweeps(hn, 1)
+		h.AssertAtLeastNumPendingSweeps(hn, 1)
 	}
 
 	return closingTxid
@@ -751,20 +786,12 @@ func (h *HarnessTest) WaitForGraphSync(hn *node.HarnessNode) {
 // AssertNumUTXOsWithConf waits for the given number of UTXOs with the
 // specified confirmations range to be available or fails if that isn't the
 // case before the default timeout.
-//
-// NOTE: for standby nodes(Alice and Bob), this method takes account of the
-// previous state of the node's UTXOs. The previous state is snapshotted when
-// finishing a previous test case via the cleanup function in `Subtest`. In
-// other words, this assertion only checks the new changes made in the current
-// test.
 func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 	expectedUtxos int, max, min int32) []*lnrpc.Utxo {
 
 	var unconfirmed bool
 
-	old := hn.State.UTXO.Confirmed
 	if max == 0 {
-		old = hn.State.UTXO.Unconfirmed
 		unconfirmed = true
 	}
 
@@ -779,8 +806,8 @@ func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 		resp := hn.RPC.ListUnspent(req)
 		total := len(resp.Utxos)
 
-		if total-old == expectedUtxos {
-			utxos = resp.Utxos[old:]
+		if total == expectedUtxos {
+			utxos = resp.Utxos
 
 			return nil
 		}
@@ -790,8 +817,8 @@ func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 			desc += fmt.Sprintf("%v\n", utxo)
 		}
 
-		return errNumNotMatched(hn.Name(), "num of UTXOs",
-			expectedUtxos, total-old, total, old, desc)
+		return fmt.Errorf("%s: assert num of UTXOs failed: want %d, "+
+			"got: %d, %s", hn.Name(), expectedUtxos, total, desc)
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout waiting for UTXOs")
 
@@ -800,10 +827,6 @@ func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 
 // AssertNumUTXOsUnconfirmed asserts the expected num of unconfirmed utxos are
 // seen.
-//
-// NOTE: for standby nodes(Alice and Bob), this method takes account of the
-// previous state of the node's UTXOs. Check `AssertNumUTXOsWithConf` for
-// details.
 func (h *HarnessTest) AssertNumUTXOsUnconfirmed(hn *node.HarnessNode,
 	num int) []*lnrpc.Utxo {
 
@@ -812,10 +835,6 @@ func (h *HarnessTest) AssertNumUTXOsUnconfirmed(hn *node.HarnessNode,
 
 // AssertNumUTXOsConfirmed asserts the expected num of confirmed utxos are
 // seen, which means the returned utxos have at least one confirmation.
-//
-// NOTE: for standby nodes(Alice and Bob), this method takes account of the
-// previous state of the node's UTXOs. Check `AssertNumUTXOsWithConf` for
-// details.
 func (h *HarnessTest) AssertNumUTXOsConfirmed(hn *node.HarnessNode,
 	num int) []*lnrpc.Utxo {
 
@@ -824,10 +843,6 @@ func (h *HarnessTest) AssertNumUTXOsConfirmed(hn *node.HarnessNode,
 
 // AssertNumUTXOs asserts the expected num of utxos are seen, including
 // confirmed and unconfirmed outputs.
-//
-// NOTE: for standby nodes(Alice and Bob), this method takes account of the
-// previous state of the node's UTXOs. Check `AssertNumUTXOsWithConf` for
-// details.
 func (h *HarnessTest) AssertNumUTXOs(hn *node.HarnessNode,
 	num int) []*lnrpc.Utxo {
 
@@ -1242,6 +1257,9 @@ func (h *HarnessTest) AssertNumActiveHtlcs(hn *node.HarnessNode, num int) {
 	old := hn.State.HTLC
 
 	err := wait.NoError(func() error {
+		// pendingHTLCs is used to print unacked HTLCs, if found.
+		var pendingHTLCs []string
+
 		// We require the RPC call to be succeeded and won't wait for
 		// it as it's an unexpected behavior.
 		req := &lnrpc.ListChannelsRequest{}
@@ -1249,10 +1267,20 @@ func (h *HarnessTest) AssertNumActiveHtlcs(hn *node.HarnessNode, num int) {
 
 		total := 0
 		for _, channel := range nodeChans.Channels {
-			total += len(channel.PendingHtlcs)
+			for _, htlc := range channel.PendingHtlcs {
+				if htlc.LockedIn {
+					total++
+				}
+
+				rHash := fmt.Sprintf("%x", htlc.HashLock)
+				pendingHTLCs = append(pendingHTLCs, rHash)
+			}
 		}
 		if total-old != num {
-			return errNumNotMatched(hn.Name(), "active HTLCs",
+			desc := fmt.Sprintf("active HTLCs: unacked HTLCs: %v",
+				pendingHTLCs)
+
+			return errNumNotMatched(hn.Name(), desc,
 				num, total-old, total, old)
 		}
 
@@ -1261,58 +1289,6 @@ func (h *HarnessTest) AssertNumActiveHtlcs(hn *node.HarnessNode, num int) {
 
 	require.NoErrorf(h, err, "%s timeout checking num active htlcs",
 		hn.Name())
-}
-
-// AssertActiveHtlcs makes sure the node has the _exact_ HTLCs matching
-// payHashes on _all_ their channels.
-func (h *HarnessTest) AssertActiveHtlcs(hn *node.HarnessNode,
-	payHashes ...[]byte) {
-
-	err := wait.NoError(func() error {
-		// We require the RPC call to be succeeded and won't wait for
-		// it as it's an unexpected behavior.
-		req := &lnrpc.ListChannelsRequest{}
-		nodeChans := hn.RPC.ListChannels(req)
-
-		for _, ch := range nodeChans.Channels {
-			// Record all payment hashes active for this channel.
-			htlcHashes := make(map[string]struct{})
-
-			for _, htlc := range ch.PendingHtlcs {
-				h := hex.EncodeToString(htlc.HashLock)
-				_, ok := htlcHashes[h]
-				if ok {
-					return fmt.Errorf("duplicate HashLock "+
-						"in PendingHtlcs: %v",
-						ch.PendingHtlcs)
-				}
-				htlcHashes[h] = struct{}{}
-			}
-
-			// Channel should have exactly the payHashes active.
-			if len(payHashes) != len(htlcHashes) {
-				return fmt.Errorf("node [%s:%x] had %v "+
-					"htlcs active, expected %v",
-					hn.Name(), hn.PubKey[:],
-					len(htlcHashes), len(payHashes))
-			}
-
-			// Make sure all the payHashes are active.
-			for _, payHash := range payHashes {
-				h := hex.EncodeToString(payHash)
-				if _, ok := htlcHashes[h]; ok {
-					continue
-				}
-
-				return fmt.Errorf("node [%s:%x] didn't have: "+
-					"the payHash %v active", hn.Name(),
-					hn.PubKey[:], h)
-			}
-		}
-
-		return nil
-	}, DefaultTimeout)
-	require.NoError(h, err, "timeout checking active HTLCs")
 }
 
 // AssertIncomingHTLCActive asserts the node has a pending incoming HTLC in the
@@ -1346,17 +1322,22 @@ func (h *HarnessTest) assertHTLCActive(hn *node.HarnessNode,
 
 		// Check all payment hashes active for this channel.
 		for _, htlc := range ch.PendingHtlcs {
-			h := hex.EncodeToString(htlc.HashLock)
-			if h != target {
+			rHash := hex.EncodeToString(htlc.HashLock)
+			if rHash != target {
 				continue
 			}
 
 			// If the payment hash is found, check the incoming
 			// field.
 			if htlc.Incoming == incoming {
-				// Found it and return.
-				result = htlc
-				return nil
+				// Return the result if it's locked in.
+				if htlc.LockedIn {
+					result = htlc
+					return nil
+				}
+
+				return fmt.Errorf("htlc(%x) not locked in",
+					payHash)
 			}
 
 			// Otherwise we do have the HTLC but its direction is
@@ -1366,14 +1347,13 @@ func (h *HarnessTest) assertHTLCActive(hn *node.HarnessNode,
 				have, want = "incoming", "outgoing"
 			}
 
-			return fmt.Errorf("node[%s] have htlc(%v), want: %s, "+
-				"have: %s", hn.Name(), payHash, want, have)
+			return fmt.Errorf("htlc(%x) has wrong direction - "+
+				"want: %s, have: %s", payHash, want, have)
 		}
 
-		return fmt.Errorf("node [%s:%x] didn't have: the payHash %x",
-			hn.Name(), hn.PubKey[:], payHash)
+		return fmt.Errorf("htlc not found using payHash %x", payHash)
 	}, DefaultTimeout)
-	require.NoError(h, err, "timeout checking pending HTLC")
+	require.NoError(h, err, "%s: timeout checking pending HTLC", hn.Name())
 
 	return result
 }
@@ -1563,17 +1543,19 @@ func (h *HarnessTest) AssertNumHTLCsAndStage(hn *node.HarnessNode,
 		}
 
 		if len(target.PendingHtlcs) != num {
-			return fmt.Errorf("got %d pending htlcs, want %d",
-				len(target.PendingHtlcs), num)
+			return fmt.Errorf("got %d pending htlcs, want %d, %s",
+				len(target.PendingHtlcs), num,
+				lnutils.SpewLogClosure(target.PendingHtlcs)())
 		}
 
-		for i, htlc := range target.PendingHtlcs {
+		for _, htlc := range target.PendingHtlcs {
 			if htlc.Stage == stage {
 				continue
 			}
 
-			return fmt.Errorf("HTLC %d got stage: %v, "+
-				"want stage: %v", i, htlc.Stage, stage)
+			return fmt.Errorf("HTLC %s got stage: %v, "+
+				"want stage: %v", htlc.Outpoint, htlc.Stage,
+				stage)
 		}
 
 		return nil
@@ -1586,41 +1568,39 @@ func (h *HarnessTest) AssertNumHTLCsAndStage(hn *node.HarnessNode,
 // findPayment queries the payment from the node's ListPayments which matches
 // the specified preimage hash.
 func (h *HarnessTest) findPayment(hn *node.HarnessNode,
-	paymentHash string) *lnrpc.Payment {
+	paymentHash string) (*lnrpc.Payment, error) {
 
 	req := &lnrpc.ListPaymentsRequest{IncludeIncomplete: true}
 	paymentsResp := hn.RPC.ListPayments(req)
 
 	for _, p := range paymentsResp.Payments {
-		if p.PaymentHash != paymentHash {
-			continue
+		if p.PaymentHash == paymentHash {
+			return p, nil
 		}
-
-		return p
 	}
 
-	require.Failf(h, "payment not found", "payment %v cannot be found",
-		paymentHash)
-
-	return nil
+	return nil, fmt.Errorf("payment %v cannot be found", paymentHash)
 }
 
 // PaymentCheck is a function that checks a payment for a specific condition.
 type PaymentCheck func(*lnrpc.Payment) error
 
-// AssertPaymentStatus asserts that the given node list a payment with the
-// given preimage has the expected status. It also checks that the payment has
-// the expected preimage, which is empty when it's not settled and matches the
-// given preimage when it's succeeded.
+// AssertPaymentStatus asserts that the given node list a payment with the given
+// payment hash has the expected status. It also checks that the payment has the
+// expected preimage, which is empty when it's not settled and matches the given
+// preimage when it's succeeded.
 func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
-	preimage lntypes.Preimage, status lnrpc.Payment_PaymentStatus,
+	payHash lntypes.Hash, status lnrpc.Payment_PaymentStatus,
 	checks ...PaymentCheck) *lnrpc.Payment {
 
 	var target *lnrpc.Payment
-	payHash := preimage.Hash()
 
 	err := wait.NoError(func() error {
-		p := h.findPayment(hn, payHash.String())
+		p, err := h.findPayment(hn, payHash.String())
+		if err != nil {
+			return err
+		}
+
 		if status == p.Status {
 			target = p
 			return nil
@@ -1635,8 +1615,11 @@ func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
 	// If this expected status is SUCCEEDED, we expect the final
 	// preimage.
 	case lnrpc.Payment_SUCCEEDED:
-		require.Equal(h, preimage.String(), target.PaymentPreimage,
-			"preimage not match")
+		preimage, err := lntypes.MakePreimageFromStr(
+			target.PaymentPreimage,
+		)
+		require.NoError(h, err, "fail to make preimage")
+		require.Equal(h, payHash, preimage.Hash(), "preimage not match")
 
 	// Otherwise we expect an all-zero preimage.
 	default:
@@ -1654,20 +1637,66 @@ func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
 
 // AssertPaymentFailureReason asserts that the given node lists a payment with
 // the given preimage which has the expected failure reason.
-func (h *HarnessTest) AssertPaymentFailureReason(hn *node.HarnessNode,
-	preimage lntypes.Preimage, reason lnrpc.PaymentFailureReason) {
+func (h *HarnessTest) AssertPaymentFailureReason(
+	hn *node.HarnessNode, preimage lntypes.Preimage,
+	reason lnrpc.PaymentFailureReason) *lnrpc.Payment {
+
+	var payment *lnrpc.Payment
 
 	payHash := preimage.Hash()
 	err := wait.NoError(func() error {
-		p := h.findPayment(hn, payHash.String())
+		p, err := h.findPayment(hn, payHash.String())
+		if err != nil {
+			return err
+		}
+
+		payment = p
+
 		if reason == p.FailureReason {
 			return nil
 		}
 
 		return fmt.Errorf("payment: %v failure reason not match, "+
-			"want %s got %s", payHash, reason, p.Status)
+			"want %s(%d) got %s(%d)", payHash, reason, reason,
+			p.FailureReason, p.FailureReason)
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout checking payment failure reason")
+
+	return payment
+}
+
+// AssertPaymentFailureReasonAny asserts that the given node lists a payment
+// with the given preimage which has one of the expected failure reasons.
+func (h *HarnessTest) AssertPaymentFailureReasonAny(
+	hn *node.HarnessNode, preimage lntypes.Preimage,
+	reasons ...lnrpc.PaymentFailureReason) *lnrpc.Payment {
+
+	var payment *lnrpc.Payment
+
+	payHash := preimage.Hash()
+	err := wait.NoError(func() error {
+		p, err := h.findPayment(hn, payHash.String())
+		if err != nil {
+			return err
+		}
+
+		payment = p
+
+		// Check if the payment failure reason matches any of the
+		// expected reasons.
+		for _, reason := range reasons {
+			if reason == p.FailureReason {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("payment: %v failure reason not match, "+
+			"want one of %v, got %s(%d)", payHash, reasons,
+			p.FailureReason, p.FailureReason)
+	}, DefaultTimeout)
+	require.NoError(h, err, "timeout checking payment failure reason")
+
+	return payment
 }
 
 // AssertActiveNodesSynced asserts all active nodes have synced to the chain.
@@ -1679,7 +1708,7 @@ func (h *HarnessTest) AssertActiveNodesSynced() {
 
 // AssertActiveNodesSyncedTo asserts all active nodes have synced to the
 // provided bestBlock.
-func (h *HarnessTest) AssertActiveNodesSyncedTo(bestBlock *wire.MsgBlock) {
+func (h *HarnessTest) AssertActiveNodesSyncedTo(bestBlock chainhash.Hash) {
 	for _, node := range h.manager.activeNodes {
 		h.WaitForBlockchainSyncTo(node, bestBlock)
 	}
@@ -1709,6 +1738,11 @@ func (h *HarnessTest) AssertPeerNotConnected(a, b *node.HarnessNode) {
 
 // AssertNotConnected asserts that two peers are not connected.
 func (h *HarnessTest) AssertNotConnected(a, b *node.HarnessNode) {
+	// Sleep one second before the assertion to make sure that when there's
+	// a RPC call to connect, that RPC call is finished before the
+	// assertion.
+	time.Sleep(1 * time.Second)
+
 	h.AssertPeerNotConnected(a, b)
 	h.AssertPeerNotConnected(b, a)
 }
@@ -1886,6 +1920,107 @@ func (h *HarnessTest) AssertNotInGraph(hn *node.HarnessNode, chanID uint64) {
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout while checking that channel is not "+
 		"found in graph")
+}
+
+// AssertChannelInGraphDB asserts that a given channel is found in the graph db.
+func (h *HarnessTest) AssertChannelInGraphDB(hn *node.HarnessNode,
+	chanPoint *lnrpc.ChannelPoint) *lnrpc.ChannelEdge {
+
+	ctxt, cancel := context.WithCancel(h.runCtx)
+	defer cancel()
+
+	var edge *lnrpc.ChannelEdge
+
+	op := h.OutPointFromChannelPoint(chanPoint)
+	err := wait.NoError(func() error {
+		resp, err := hn.RPC.LN.GetChanInfo(
+			ctxt, &lnrpc.ChanInfoRequest{
+				ChanPoint: op.String(),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("channel %s not found in graph: %w",
+				op, err)
+		}
+
+		// Make sure the policies are populated, otherwise this edge
+		// cannot be used for routing.
+		if resp.Node1Policy == nil {
+			return fmt.Errorf("channel %s has no policy1", op)
+		}
+
+		if resp.Node2Policy == nil {
+			return fmt.Errorf("channel %s has no policy2", op)
+		}
+
+		edge = resp
+
+		return nil
+	}, DefaultTimeout)
+
+	require.NoError(h, err, "%s: timeout finding channel in graph",
+		hn.Name())
+
+	return edge
+}
+
+// AssertChannelInGraphCache asserts a given channel is found in the graph
+// cache.
+func (h *HarnessTest) AssertChannelInGraphCache(hn *node.HarnessNode,
+	chanPoint *lnrpc.ChannelPoint) *lnrpc.ChannelEdge {
+
+	var edge *lnrpc.ChannelEdge
+
+	req := &lnrpc.ChannelGraphRequest{IncludeUnannounced: true}
+	cpStr := channelPointStr(chanPoint)
+
+	err := wait.NoError(func() error {
+		chanGraph := hn.RPC.DescribeGraph(req)
+
+		// Iterate all the known edges, and make sure the edge policies
+		// are populated when a matched edge is found.
+		for _, e := range chanGraph.Edges {
+			if e.ChanPoint != cpStr {
+				continue
+			}
+
+			if e.Node1Policy == nil {
+				return fmt.Errorf("no policy for node1 %v",
+					e.Node1Pub)
+			}
+
+			if e.Node2Policy == nil {
+				return fmt.Errorf("no policy for node2 %v",
+					e.Node1Pub)
+			}
+
+			edge = e
+
+			return nil
+		}
+
+		// If we've iterated over all the known edges and we weren't
+		// able to find this specific one, then we'll fail.
+		return fmt.Errorf("no edge found for channel point: %s", cpStr)
+	}, DefaultTimeout)
+
+	require.NoError(h, err, "%s: timeout finding channel %v in graph cache",
+		cpStr, hn.Name())
+
+	return edge
+}
+
+// AssertChannelInGraphDB asserts that a given channel is found both in the
+// graph db (GetChanInfo) and the graph cache (DescribeGraph).
+func (h *HarnessTest) AssertChannelInGraph(hn *node.HarnessNode,
+	chanPoint *lnrpc.ChannelPoint) *lnrpc.ChannelEdge {
+
+	// Make sure the channel is found in the db first.
+	h.AssertChannelInGraphDB(hn, chanPoint)
+
+	// Assert the channel is also found in the graph cache, which refreshes
+	// every `--caches.rpc-graph-cache-duration`.
+	return h.AssertChannelInGraphCache(hn, chanPoint)
 }
 
 // AssertTxAtHeight gets all of the transactions that a node's wallet has a
@@ -2268,7 +2403,8 @@ func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
 		event := h.ReceiveHtlcEvent(client)
 
 		require.Containsf(h, eventTypes, event.EventType,
-			"wrong event type, got %v", userType, event.EventType)
+			"wrong event type, want %v, got %v", userType,
+			event.EventType)
 
 		events = append(events, event)
 
@@ -2414,38 +2550,6 @@ func (h *HarnessTest) AssertNumInvoices(hn *node.HarnessNode,
 	require.NoError(h, err, "timeout checking num of invoices")
 
 	return invoices
-}
-
-// ReceiveSendToRouteUpdate waits until a message is received on the
-// SendToRoute client stream or the timeout is reached.
-func (h *HarnessTest) ReceiveSendToRouteUpdate(
-	stream rpc.SendToRouteClient) (*lnrpc.SendResponse, error) {
-
-	chanMsg := make(chan *lnrpc.SendResponse, 1)
-	errChan := make(chan error, 1)
-	go func() {
-		// Consume one message. This will block until the message is
-		// received.
-		resp, err := stream.Recv()
-		if err != nil {
-			errChan <- err
-
-			return
-		}
-		chanMsg <- resp
-	}()
-
-	select {
-	case <-time.After(DefaultTimeout):
-		require.Fail(h, "timeout", "timeout waiting for send resp")
-		return nil, nil
-
-	case err := <-errChan:
-		return nil, err
-
-	case updateMsg := <-chanMsg:
-		return updateMsg, nil
-	}
 }
 
 // AssertInvoiceEqual asserts that two lnrpc.Invoices are equivalent. A custom
@@ -2664,9 +2768,10 @@ func (h *HarnessTest) AssertNumPendingSweeps(hn *node.HarnessNode,
 		numDesc := "\n"
 		for _, s := range resp.PendingSweeps {
 			desc := fmt.Sprintf("op=%v:%v, amt=%v, type=%v, "+
-				"deadline=%v\n", s.Outpoint.TxidStr,
-				s.Outpoint.OutputIndex, s.AmountSat,
-				s.WitnessType, s.DeadlineHeight)
+				"deadline=%v, maturityHeight=%v\n",
+				s.Outpoint.TxidStr, s.Outpoint.OutputIndex,
+				s.AmountSat, s.WitnessType, s.DeadlineHeight,
+				s.MaturityHeight)
 			numDesc += desc
 
 			// The deadline height must be set, otherwise the
@@ -2690,6 +2795,95 @@ func (h *HarnessTest) AssertNumPendingSweeps(hn *node.HarnessNode,
 	return results
 }
 
+// AssertAtLeastNumPendingSweeps asserts there are at least n pending sweeps for
+// the given node.
+func (h *HarnessTest) AssertAtLeastNumPendingSweeps(hn *node.HarnessNode,
+	n int) []*walletrpc.PendingSweep {
+
+	results := make([]*walletrpc.PendingSweep, 0, n)
+
+	err := wait.NoError(func() error {
+		resp := hn.RPC.PendingSweeps()
+		num := len(resp.PendingSweeps)
+
+		numDesc := "\n"
+		for _, s := range resp.PendingSweeps {
+			desc := fmt.Sprintf("op=%v:%v, amt=%v, type=%v, "+
+				"deadline=%v, maturityHeight=%v\n",
+				s.Outpoint.TxidStr, s.Outpoint.OutputIndex,
+				s.AmountSat, s.WitnessType, s.DeadlineHeight,
+				s.MaturityHeight)
+			numDesc += desc
+
+			// The deadline height must be set, otherwise the
+			// pending input response is not update-to-date.
+			if s.DeadlineHeight == 0 {
+				return fmt.Errorf("input not updated: %s", desc)
+			}
+		}
+
+		if num >= n {
+			results = resp.PendingSweeps
+			return nil
+		}
+
+		return fmt.Errorf("want %d , got %d, sweeps: %s", n, num,
+			numDesc)
+	}, DefaultTimeout)
+
+	require.NoErrorf(h, err, "%s: check pending sweeps timeout", hn.Name())
+
+	return results
+}
+
+// AssertNumSweeps asserts the number of sweeps for the given node.
+func (h *HarnessTest) AssertNumSweeps(hn *node.HarnessNode,
+	req *walletrpc.ListSweepsRequest,
+	n int) *walletrpc.ListSweepsResponse {
+
+	var result *walletrpc.ListSweepsResponse
+
+	// The ListSweeps call is wrapped in wait.NoError to handle potential
+	// timing issues. Sweep transactions might not be immediately reflected
+	// or processed by the node after an event (e.g., channel closure or
+	// block mining) due to propagation or processing delays. This ensures
+	// the system retries the call until the expected sweep is found,
+	// preventing test flakes caused by race conditions.
+	err := wait.NoError(func() error {
+		resp := hn.RPC.ListSweeps(req)
+
+		var txIDs []string
+		if req.Verbose {
+			details := resp.GetTransactionDetails()
+			if details != nil {
+				for _, tx := range details.Transactions {
+					txIDs = append(txIDs, tx.TxHash)
+				}
+			}
+		} else {
+			ids := resp.GetTransactionIds()
+			if ids != nil {
+				txIDs = ids.TransactionIds
+			}
+		}
+
+		num := len(txIDs)
+
+		// Exit early if the num matches.
+		if num == n {
+			result = resp
+			return nil
+		}
+
+		return fmt.Errorf("want %d, got %d, sweeps: %v, req: %v", n,
+			num, txIDs, req)
+	}, DefaultTimeout)
+
+	require.NoErrorf(h, err, "%s: check num of sweeps timeout", hn.Name())
+
+	return result
+}
+
 // FindSweepingTxns asserts the expected number of sweeping txns are found in
 // the txns specified and return them.
 func (h *HarnessTest) FindSweepingTxns(txns []*wire.MsgTx,
@@ -2705,4 +2899,111 @@ func (h *HarnessTest) FindSweepingTxns(txns []*wire.MsgTx,
 	require.Len(h, sweepTxns, expectedNumSweeps, "unexpected num of sweeps")
 
 	return sweepTxns
+}
+
+// AssertForceCloseAndAnchorTxnsInMempool asserts that the force close and
+// anchor sweep txns are found in the mempool and returns the force close tx
+// and the anchor sweep tx.
+func (h *HarnessTest) AssertForceCloseAndAnchorTxnsInMempool() (*wire.MsgTx,
+	*wire.MsgTx) {
+
+	// Assert there are two txns in the mempool.
+	txns := h.GetNumTxsFromMempool(2)
+
+	// isParentAndChild checks whether there is an input used in the
+	// assumed child tx by checking every input's previous outpoint against
+	// the assumed parentTxid.
+	isParentAndChild := func(parent, child *wire.MsgTx) bool {
+		parentTxid := parent.TxHash()
+
+		for _, inp := range child.TxIn {
+			if inp.PreviousOutPoint.Hash == parentTxid {
+				// Found a match, this is indeed the anchor
+				// sweeping tx so we return it here.
+				return true
+			}
+		}
+
+		return false
+	}
+
+	switch {
+	// Assume the first one is the closing tx and the second one is the
+	// anchor sweeping tx.
+	case isParentAndChild(txns[0], txns[1]):
+		return txns[0], txns[1]
+
+	// Assume the first one is the anchor sweeping tx and the second one is
+	// the closing tx.
+	case isParentAndChild(txns[1], txns[0]):
+		return txns[1], txns[0]
+
+	// Unrelated txns found, fail the test.
+	default:
+		h.Fatalf("the two txns not related: %v", txns)
+
+		return nil, nil
+	}
+}
+
+// ReceiveSendToRouteUpdate waits until a message is received on the
+// PeerEventsClient stream or the timeout is reached.
+func (h *HarnessTest) ReceivePeerEvent(
+	stream rpc.PeerEventsClient) (*lnrpc.PeerEvent, error) {
+
+	eventChan := make(chan *lnrpc.PeerEvent, 1)
+	errChan := make(chan error, 1)
+	go func() {
+		// Consume one message. This will block until the message is
+		// received.
+		resp, err := stream.Recv()
+		if err != nil {
+			errChan <- err
+
+			return
+		}
+		eventChan <- resp
+	}()
+
+	select {
+	case <-time.After(DefaultTimeout):
+		require.Fail(h, "timeout", "timeout waiting for peer event")
+		return nil, nil
+
+	case err := <-errChan:
+		return nil, err
+
+	case event := <-eventChan:
+		return event, nil
+	}
+}
+
+// AssertPeerOnlineEvent reads an event from the PeerEventsClient stream and
+// asserts it's an online event.
+func (h HarnessTest) AssertPeerOnlineEvent(stream rpc.PeerEventsClient) {
+	event, err := h.ReceivePeerEvent(stream)
+	require.NoError(h, err)
+
+	require.Equal(h, lnrpc.PeerEvent_PEER_ONLINE, event.Type)
+}
+
+// AssertPeerOfflineEvent reads an event from the PeerEventsClient stream and
+// asserts it's an offline event.
+func (h HarnessTest) AssertPeerOfflineEvent(stream rpc.PeerEventsClient) {
+	event, err := h.ReceivePeerEvent(stream)
+	require.NoError(h, err)
+
+	require.Equal(h, lnrpc.PeerEvent_PEER_OFFLINE, event.Type)
+}
+
+// AssertPeerReconnected reads two events from the PeerEventsClient stream. The
+// first event must be an offline event, and the second event must be an online
+// event. This is a typical reconnection scenario, where the peer is
+// disconnected then connected again.
+//
+// NOTE: It's important to make the subscription before the disconnection
+// happens, otherwise the events can be missed.
+func (h HarnessTest) AssertPeerReconnected(stream rpc.PeerEventsClient) {
+	h.AssertPeerOfflineEvent(stream)
+	h.AssertPeerOnlineEvent(stream)
 }

@@ -2,6 +2,7 @@ package htlcswitch
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -12,13 +13,12 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -125,6 +125,9 @@ type ChanClose struct {
 
 	// Err is used by request creator to receive request execution error.
 	Err chan error
+
+	// Ctx is a context linked to the lifetime of the caller.
+	Ctx context.Context //nolint:containedctx
 }
 
 // Config defines the configuration for the service. ALL elements within the
@@ -173,7 +176,8 @@ type Config struct {
 	// specified when we receive an incoming HTLC.  This will be used to
 	// provide payment senders our latest policy when sending encrypted
 	// error messages.
-	FetchLastChannelUpdate func(lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error)
+	FetchLastChannelUpdate func(lnwire.ShortChannelID) (
+		*lnwire.ChannelUpdate1, error)
 
 	// Notifier is an instance of a chain notifier that we'll use to signal
 	// the switch when a new block has arrived.
@@ -220,7 +224,7 @@ type Config struct {
 	// option_scid_alias channels. This avoids a potential privacy leak by
 	// replacing the public, confirmed SCID with the alias in the
 	// ChannelUpdate.
-	SignAliasUpdate func(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+	SignAliasUpdate func(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 		error)
 
 	// IsAlias returns whether or not a given SCID is an alias.
@@ -875,7 +879,6 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 	// Try to find links by node destination.
 	s.indexMtx.RLock()
 	link, err := s.getLinkByShortID(pkt.outgoingChanID)
-	defer s.indexMtx.RUnlock()
 	if err != nil {
 		// If the link was not found for the outgoingChanID, an outside
 		// subsystem may be using the confirmed SCID of a zero-conf
@@ -887,6 +890,7 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 		// do that upon receiving the packet.
 		baseScid, ok := s.baseIndex[pkt.outgoingChanID]
 		if !ok {
+			s.indexMtx.RUnlock()
 			log.Errorf("Link %v not found", pkt.outgoingChanID)
 			return nil, NewLinkError(&lnwire.FailUnknownNextPeer{})
 		}
@@ -895,10 +899,15 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 		// link.
 		link, err = s.getLinkByShortID(baseScid)
 		if err != nil {
+			s.indexMtx.RUnlock()
 			log.Errorf("Link %v not found", baseScid)
 			return nil, NewLinkError(&lnwire.FailUnknownNextPeer{})
 		}
 	}
+	// We finished looking up the indexes, so we can unlock the mutex before
+	// performing the link operations which might also acquire the lock
+	// in case e.g. failAliasUpdate is called.
+	s.indexMtx.RUnlock()
 
 	if !link.EligibleToForward() {
 		log.Errorf("Link %v is not available to forward",
@@ -923,6 +932,7 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 			"satisfied", pkt.outgoingChanID)
 		return nil, htlcErr
 	}
+
 	return link, nil
 }
 
@@ -1144,6 +1154,9 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 func (s *Switch) checkCircularForward(incoming, outgoing lnwire.ShortChannelID,
 	allowCircular bool, paymentHash lntypes.Hash) *LinkError {
 
+	log.Tracef("Checking for circular route: incoming=%v, outgoing=%v "+
+		"(payment hash: %x)", incoming, outgoing, paymentHash[:])
+
 	// If they are equal, we can skip the alias mapping checks.
 	if incoming == outgoing {
 		// The switch may be configured to allow circular routes, so
@@ -1184,6 +1197,10 @@ func (s *Switch) checkCircularForward(incoming, outgoing lnwire.ShortChannelID,
 
 	// Check base SCID equality.
 	if incomingBaseScid != outgoingBaseScid {
+		log.Tracef("Incoming base SCID %v does not match outgoing "+
+			"base SCID %v (payment hash: %x)", incomingBaseScid,
+			outgoingBaseScid, paymentHash[:])
+
 		// The base SCIDs are not equal so these are not the same
 		// channel.
 		return nil
@@ -1412,7 +1429,7 @@ func (s *Switch) teardownCircuit(pkt *htlcPacket) error {
 // targetFeePerKw parameter should be the ideal fee-per-kw that will be used as
 // a starting point for close negotiation. The deliveryScript parameter is an
 // optional parameter which sets a user specified script to close out to.
-func (s *Switch) CloseLink(chanPoint *wire.OutPoint,
+func (s *Switch) CloseLink(ctx context.Context, chanPoint *wire.OutPoint,
 	closeType contractcourt.ChannelCloseType,
 	targetFeePerKw, maxFee chainfee.SatPerKWeight,
 	deliveryScript lnwire.DeliveryAddress) (chan interface{}, chan error) {
@@ -1426,9 +1443,10 @@ func (s *Switch) CloseLink(chanPoint *wire.OutPoint,
 		ChanPoint:      chanPoint,
 		Updates:        updateChan,
 		TargetFeePerKw: targetFeePerKw,
-		MaxFee:         maxFee,
 		DeliveryScript: deliveryScript,
 		Err:            errChan,
+		MaxFee:         maxFee,
+		Ctx:            ctx,
 	}
 
 	select {
@@ -1555,7 +1573,7 @@ out:
 			s.indexMtx.RUnlock()
 
 			peerPub := link.PeerPubKey()
-			log.Debugf("Requesting local channel close: peer=%v, "+
+			log.Debugf("Requesting local channel close: peer=%x, "+
 				"chan_id=%x", link.PeerPubKey(), chanID[:])
 
 			go s.cfg.LocalChannelClose(peerPub[:], req)
@@ -1605,8 +1623,8 @@ out:
 				}
 			}
 
-			log.Infof("Received outside contract resolution, "+
-				"mapping to: %v", spew.Sdump(pkt))
+			log.Debugf("Received outside contract resolution, "+
+				"mapping to: %v", lnutils.SpewLogClosure(pkt))
 
 			// We don't check the error, as the only failure we can
 			// encounter is due to the circuit already being
@@ -1632,7 +1650,7 @@ out:
 				defer s.wg.Done()
 
 				if err := s.FlushForwardingEvents(); err != nil {
-					log.Errorf("unable to flush "+
+					log.Errorf("Unable to flush "+
 						"forwarding events: %v", err)
 				}
 			}()
@@ -2210,6 +2228,9 @@ func (s *Switch) GetLinkByShortID(chanID lnwire.ShortChannelID) (ChannelLink,
 func (s *Switch) getLinkByShortID(chanID lnwire.ShortChannelID) (ChannelLink, error) {
 	link, ok := s.forwardingIndex[chanID]
 	if !ok {
+		log.Debugf("Link not found in forwarding index using "+
+			"chanID=%v", chanID)
+
 		return nil, ErrChannelLinkNotFound
 	}
 
@@ -2237,6 +2258,9 @@ func (s *Switch) getLinkByMapping(pkt *htlcPacket) (ChannelLink, error) {
 	chanID := pkt.outgoingChanID
 	aliasID := s.cfg.IsAlias(chanID)
 
+	log.Debugf("Querying outgoing link using chanID=%v, aliasID=%v", chanID,
+		aliasID)
+
 	// Set the originalOutgoingChanID so the proper channel_update can be
 	// sent back if the option-scid-alias feature bit was negotiated.
 	pkt.originalOutgoingChanID = chanID
@@ -2254,6 +2278,9 @@ func (s *Switch) getLinkByMapping(pkt *htlcPacket) (ChannelLink, error) {
 		// forwardingIndex.
 		link, ok := s.forwardingIndex[baseScid]
 		if !ok {
+			log.Debugf("Forwarding index not found using "+
+				"baseScid=%v", baseScid)
+
 			// Link not found, bail.
 			return nil, ErrChannelLinkNotFound
 		}
@@ -2275,6 +2302,9 @@ func (s *Switch) getLinkByMapping(pkt *htlcPacket) (ChannelLink, error) {
 		// negotiated. We'll fetch the link and return it.
 		link, ok := s.forwardingIndex[chanID]
 		if !ok {
+			log.Debugf("Forwarding index not found using "+
+				"chanID=%v", chanID)
+
 			// The link wasn't found, bail out.
 			return nil, ErrChannelLinkNotFound
 		}
@@ -2285,6 +2315,9 @@ func (s *Switch) getLinkByMapping(pkt *htlcPacket) (ChannelLink, error) {
 	// Fetch the link whose internal SCID is baseScid.
 	link, ok := s.forwardingIndex[baseScid]
 	if !ok {
+		log.Debugf("Forwarding index not found using baseScid=%v",
+			baseScid)
+
 		// Link wasn't found, bail out.
 		return nil, ErrChannelLinkNotFound
 	}
@@ -2293,6 +2326,9 @@ func (s *Switch) getLinkByMapping(pkt *htlcPacket) (ChannelLink, error) {
 	// forward over it and this is a channel where the option-scid-alias
 	// feature bit was negotiated.
 	if link.IsUnadvertised() {
+		log.Debugf("Link is unadvertised, chanID=%v, baseScid=%v",
+			chanID, baseScid)
+
 		return nil, ErrChannelLinkNotFound
 	}
 
@@ -2641,7 +2677,7 @@ func (s *Switch) failMailboxUpdate(outgoingScid,
 // and the caller is expected to handle this properly. In this case, a return
 // to the original non-alias behavior is expected.
 func (s *Switch) failAliasUpdate(scid lnwire.ShortChannelID,
-	incoming bool) *lnwire.ChannelUpdate {
+	incoming bool) *lnwire.ChannelUpdate1 {
 
 	// This function does not defer the unlocking because of the database
 	// lookups for ChannelUpdate.
@@ -2993,6 +3029,15 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// If the source of this packet has not been set, use the circuit map
 	// to lookup the origin.
 	circuit, err := s.closeCircuit(packet)
+
+	// If the circuit is in the process of closing, we will return a nil as
+	// there's another packet handling undergoing.
+	if errors.Is(err, ErrCircuitClosing) {
+		log.Debugf("Circuit is closing for packet=%v", packet)
+		return nil
+	}
+
+	// Exit early if there's another error.
 	if err != nil {
 		return err
 	}
@@ -3004,7 +3049,7 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// and when `UpdateFulfillHTLC` is received. After which `RevokeAndAck`
 	// is received, which invokes `processRemoteSettleFails` in its link.
 	if circuit == nil {
-		log.Debugf("Found nil circuit: packet=%v", spew.Sdump(packet))
+		log.Debugf("Circuit already closed for packet=%v", packet)
 		return nil
 	}
 
@@ -3046,6 +3091,12 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 				OutgoingChanID: circuit.Outgoing.ChanID,
 				AmtIn:          circuit.IncomingAmount,
 				AmtOut:         circuit.OutgoingAmount,
+				IncomingHtlcID: fn.Some(
+					circuit.Incoming.HtlcID,
+				),
+				OutgoingHtlcID: fn.Some(
+					circuit.Outgoing.HtlcID,
+				),
 			},
 		)
 		s.fwdEventMtx.Unlock()

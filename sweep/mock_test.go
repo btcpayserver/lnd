@@ -4,7 +4,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -24,10 +24,10 @@ func NewMockSweeperStore() *MockSweeperStore {
 }
 
 // IsOurTx determines whether a tx is published by us, based on its hash.
-func (s *MockSweeperStore) IsOurTx(hash chainhash.Hash) (bool, error) {
+func (s *MockSweeperStore) IsOurTx(hash chainhash.Hash) bool {
 	args := s.Called(hash)
 
-	return args.Bool(0), args.Error(1)
+	return args.Bool(0)
 }
 
 // StoreTx stores a tx we are about to publish.
@@ -268,6 +268,13 @@ func (m *MockInputSet) StartingFeeRate() fn.Option[chainfee.SatPerKWeight] {
 	return args.Get(0).(fn.Option[chainfee.SatPerKWeight])
 }
 
+// Immediate returns whether the inputs should be swept immediately.
+func (m *MockInputSet) Immediate() bool {
+	args := m.Called()
+
+	return args.Bool(0)
+}
+
 // MockBumper is a mock implementation of the interface Bumper.
 type MockBumper struct {
 	mock.Mock
@@ -277,14 +284,14 @@ type MockBumper struct {
 var _ Bumper = (*MockBumper)(nil)
 
 // Broadcast broadcasts the transaction to the network.
-func (m *MockBumper) Broadcast(req *BumpRequest) (<-chan *BumpResult, error) {
+func (m *MockBumper) Broadcast(req *BumpRequest) <-chan *BumpResult {
 	args := m.Called(req)
 
 	if args.Get(0) == nil {
-		return nil, args.Error(1)
+		return nil
 	}
 
-	return args.Get(0).(chan *BumpResult), args.Error(1)
+	return args.Get(0).(chan *BumpResult)
 }
 
 // MockFeeFunction is a mock implementation of the FeeFunction interface.
@@ -331,7 +338,7 @@ func (m *MockAuxSweeper) DeriveSweepAddr(_ []input.Input,
 			Value:    123,
 			PkScript: changePkScript.DeliveryAddress,
 		},
-		IsExtra:     false,
+		IsExtra:     true,
 		InternalKey: fn.None[keychain.KeyDescriptor](),
 	})
 }

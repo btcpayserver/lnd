@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -46,37 +47,53 @@ var (
 	))
 )
 
-// testTaproot ensures that the daemon can send to and spend from taproot (p2tr)
-// outputs.
-func testTaproot(ht *lntest.HarnessTest) {
-	testTaprootSendCoinsKeySpendBip86(ht, ht.Alice)
-	testTaprootComputeInputScriptKeySpendBip86(ht, ht.Alice)
-	testTaprootSignOutputRawScriptSpend(ht, ht.Alice)
+// testTaprootSpend ensures that the daemon can send to and spend from taproot
+// (p2tr) outputs.
+func testTaprootSpend(ht *lntest.HarnessTest) {
+	alice := ht.NewNode("Alice", nil)
+
+	testTaprootSendCoinsKeySpendBip86(ht, alice)
+	testTaprootComputeInputScriptKeySpendBip86(ht, alice)
+	testTaprootSignOutputRawScriptSpend(ht, alice)
 	testTaprootSignOutputRawScriptSpend(
-		ht, ht.Alice, txscript.SigHashSingle,
+		ht, alice, txscript.SigHashSingle,
 	)
-	testTaprootSignOutputRawKeySpendBip86(ht, ht.Alice)
+	testTaprootSignOutputRawKeySpendBip86(ht, alice)
 	testTaprootSignOutputRawKeySpendBip86(
-		ht, ht.Alice, txscript.SigHashSingle,
+		ht, alice, txscript.SigHashSingle,
 	)
-	testTaprootSignOutputRawKeySpendRootHash(ht, ht.Alice)
+	testTaprootSignOutputRawKeySpendRootHash(ht, alice)
+}
+
+// testTaprootMuSig2 ensures that the daemon can send to and spend from taproot
+// (p2tr) outputs using musig2.
+func testTaprootMuSig2(ht *lntest.HarnessTest) {
+	alice := ht.NewNodeWithCoins("Alice", nil)
 
 	muSig2Versions := []signrpc.MuSig2Version{
 		signrpc.MuSig2Version_MUSIG2_VERSION_V040,
 		signrpc.MuSig2Version_MUSIG2_VERSION_V100RC2,
 	}
 	for _, version := range muSig2Versions {
-		testTaprootMuSig2KeySpendBip86(ht, ht.Alice, version)
-		testTaprootMuSig2KeySpendRootHash(ht, ht.Alice, version)
-		testTaprootMuSig2ScriptSpend(ht, ht.Alice, version)
-		testTaprootMuSig2CombinedLeafKeySpend(ht, ht.Alice, version)
-		testMuSig2CombineKey(ht, ht.Alice, version)
+		testTaprootMuSig2KeySpendBip86(ht, alice, version)
+		testTaprootMuSig2KeySpendRootHash(ht, alice, version)
+		testTaprootMuSig2ScriptSpend(ht, alice, version)
+		testTaprootMuSig2CombinedLeafKeySpend(ht, alice, version)
+		testMuSig2CombineKey(ht, alice, version)
+		testTaprootMuSig2CombinedNonceCoordinator(ht, alice, version)
 	}
+}
 
-	testTaprootImportTapscriptFullTree(ht, ht.Alice)
-	testTaprootImportTapscriptPartialReveal(ht, ht.Alice)
-	testTaprootImportTapscriptRootHashOnly(ht, ht.Alice)
-	testTaprootImportTapscriptFullKey(ht, ht.Alice)
+// testTaprootImportScripts ensures that the daemon can import taproot scripts.
+func testTaprootImportScripts(ht *lntest.HarnessTest) {
+	alice := ht.NewNodeWithCoins("Alice", nil)
+
+	testTaprootImportTapscriptFullTree(ht, alice)
+	testTaprootImportTapscriptPartialReveal(ht, alice)
+	testTaprootImportTapscriptRootHashOnly(ht, alice)
+	testTaprootImportTapscriptFullKey(ht, alice)
+
+	testTaprootImportTapscriptFullKeyFundPsbt(ht, alice)
 }
 
 // testTaprootSendCoinsKeySpendBip86 tests sending to and spending from
@@ -1346,6 +1363,134 @@ func testTaprootImportTapscriptFullKey(ht *lntest.HarnessTest,
 	)
 }
 
+// testTaprootImportTapscriptFullKeyFundPsbt tests importing p2tr script
+// addresses for which we only know the full Taproot key. We also test that we
+// can use such an imported script to fund a PSBT.
+func testTaprootImportTapscriptFullKeyFundPsbt(ht *lntest.HarnessTest,
+	alice *node.HarnessNode) {
+
+	// For the next step, we need a public key. Let's use a special family
+	// for this.
+	_, internalKey, derivationPath := deriveInternalKey(ht, alice)
+
+	// Let's create a taproot script output now. This is a hash lock with a
+	// simple preimage of "foobar".
+	leaf1 := testScriptHashLock(ht.T, []byte("foobar"))
+
+	tapscript := input.TapscriptFullTree(internalKey, leaf1)
+	rootHash := leaf1.TapHash()
+	taprootKey, err := tapscript.TaprootKey()
+	require.NoError(ht, err)
+
+	// Import the scripts and make sure we get the same address back as we
+	// calculated ourselves.
+	req := &walletrpc.ImportTapscriptRequest{
+		InternalPublicKey: schnorr.SerializePubKey(taprootKey),
+		Script: &walletrpc.ImportTapscriptRequest_FullKeyOnly{
+			FullKeyOnly: true,
+		},
+	}
+	importResp := alice.RPC.ImportTapscript(req)
+
+	calculatedAddr, err := btcutil.NewAddressTaproot(
+		schnorr.SerializePubKey(taprootKey), harnessNetParams,
+	)
+	require.NoError(ht, err)
+	require.Equal(ht, calculatedAddr.String(), importResp.P2TrAddress)
+
+	// Send some coins to the generated tapscript address.
+	p2trOutpoint, p2trPkScript := sendToTaprootOutput(ht, alice, taprootKey)
+
+	p2trOutputRPC := &lnrpc.OutPoint{
+		TxidBytes:   p2trOutpoint.Hash[:],
+		OutputIndex: p2trOutpoint.Index,
+	}
+	ht.AssertUTXOInWallet(alice, p2trOutputRPC, "imported")
+	ht.AssertWalletAccountBalance(alice, "imported", testAmount, 0)
+
+	// We now fund a PSBT that spends the imported tapscript address.
+	utxo := &wire.TxOut{
+		Value:    testAmount,
+		PkScript: p2trPkScript,
+	}
+	_, sweepPkScript := newAddrWithScript(
+		ht, alice, lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+	)
+
+	output := &wire.TxOut{
+		PkScript: sweepPkScript,
+		Value:    1,
+	}
+	packet, err := psbt.New(
+		[]*wire.OutPoint{&p2trOutpoint}, []*wire.TxOut{output}, 2, 0,
+		[]uint32{0},
+	)
+	require.NoError(ht, err)
+
+	// We have everything we need to know to sign the PSBT.
+	in := &packet.Inputs[0]
+	in.Bip32Derivation = []*psbt.Bip32Derivation{{
+		PubKey:    internalKey.SerializeCompressed(),
+		Bip32Path: derivationPath,
+	}}
+	in.TaprootBip32Derivation = []*psbt.TaprootBip32Derivation{{
+		XOnlyPubKey: schnorr.SerializePubKey(internalKey),
+		Bip32Path:   derivationPath,
+	}}
+	in.SighashType = txscript.SigHashDefault
+	in.TaprootMerkleRoot = rootHash[:]
+	in.WitnessUtxo = utxo
+
+	var buf bytes.Buffer
+	require.NoError(ht, packet.Serialize(&buf))
+
+	change := &walletrpc.PsbtCoinSelect_ExistingOutputIndex{
+		ExistingOutputIndex: 0,
+	}
+	fundResp := alice.RPC.FundPsbt(&walletrpc.FundPsbtRequest{
+		Template: &walletrpc.FundPsbtRequest_CoinSelect{
+			CoinSelect: &walletrpc.PsbtCoinSelect{
+				Psbt:         buf.Bytes(),
+				ChangeOutput: change,
+			},
+		},
+		Fees: &walletrpc.FundPsbtRequest_SatPerVbyte{
+			SatPerVbyte: 1,
+		},
+	})
+
+	// Sign the manually funded PSBT now.
+	signResp := alice.RPC.SignPsbt(&walletrpc.SignPsbtRequest{
+		FundedPsbt: fundResp.FundedPsbt,
+	})
+
+	signedPacket, err := psbt.NewFromRawBytes(
+		bytes.NewReader(signResp.SignedPsbt), false,
+	)
+	require.NoError(ht, err)
+
+	// We should be able to finalize the PSBT and extract the sweep TX now.
+	err = psbt.MaybeFinalizeAll(signedPacket)
+	require.NoError(ht, err)
+
+	sweepTx, err := psbt.Extract(signedPacket)
+	require.NoError(ht, err)
+
+	buf.Reset()
+	err = sweepTx.Serialize(&buf)
+	require.NoError(ht, err)
+
+	// Publish the sweep transaction and then mine it as well.
+	alice.RPC.PublishTransaction(&walletrpc.Transaction{
+		TxHex: buf.Bytes(),
+	})
+
+	// Mine one block which should contain the sweep transaction.
+	block := ht.MineBlocksAndAssertNumTxes(1, 1)[0]
+	sweepTxHash := sweepTx.TxHash()
+	ht.AssertTxInBlock(block, sweepTxHash)
+}
+
 // clearWalletImportedTapscriptBalance manually assembles and then attempts to
 // sign a TX to sweep funds from an imported tapscript address.
 func clearWalletImportedTapscriptBalance(ht *lntest.HarnessTest,
@@ -1969,4 +2114,190 @@ func testMuSig2CombineKey(ht *lntest.HarnessTest, alice *node.HarnessNode,
 			ht, expectedPreTweakKey100, resp.TaprootInternalKey,
 		)
 	}
+}
+
+// testTaprootMuSig2CombinedNonceCoordinator tests the coordinator pattern where
+// a single party aggregates all nonces and distributes the combined nonce to
+// participants using MuSig2RegisterCombinedNonce.
+func testTaprootMuSig2CombinedNonceCoordinator(ht *lntest.HarnessTest,
+	alice *node.HarnessNode, version signrpc.MuSig2Version) {
+
+	// We're using a simple BIP-86 key spend only setup.
+	taprootTweak := &signrpc.TaprootTweakDesc{
+		KeySpendOnly: true,
+	}
+
+	// Derive signing keys for our three participants.
+	keyDesc1, keyDesc2, keyDesc3, allPubKeys := deriveSigningKeys(
+		ht, alice, version,
+	)
+
+	// Create three sessions WITHOUT exchanging nonces initially. This
+	// simulates the coordinator pattern where the coordinator collects
+	// nonces first, then aggregates them externally.
+	sessResp1 := alice.RPC.MuSig2CreateSession(
+		&signrpc.MuSig2SessionRequest{
+			KeyLoc:           keyDesc1.KeyLoc,
+			AllSignerPubkeys: allPubKeys,
+			TaprootTweak:     taprootTweak,
+			Version:          version,
+		},
+	)
+	require.Equal(ht, version, sessResp1.Version)
+	require.False(ht, sessResp1.HaveAllNonces)
+
+	sessResp2 := alice.RPC.MuSig2CreateSession(
+		&signrpc.MuSig2SessionRequest{
+			KeyLoc:           keyDesc2.KeyLoc,
+			AllSignerPubkeys: allPubKeys,
+			TaprootTweak:     taprootTweak,
+			Version:          version,
+		},
+	)
+	require.False(ht, sessResp2.HaveAllNonces)
+
+	sessResp3 := alice.RPC.MuSig2CreateSession(
+		&signrpc.MuSig2SessionRequest{
+			KeyLoc:           keyDesc3.KeyLoc,
+			AllSignerPubkeys: allPubKeys,
+			TaprootTweak:     taprootTweak,
+			Version:          version,
+		},
+	)
+	require.False(ht, sessResp3.HaveAllNonces)
+
+	// The coordinator collects all individual nonces.
+	allNonces := [][]byte{
+		sessResp1.LocalPublicNonces,
+		sessResp2.LocalPublicNonces,
+		sessResp3.LocalPublicNonces,
+	}
+
+	// For v0.4.0, both RegisterCombinedNonce and GetCombinedNonce should
+	// return unsupported errors.
+	if version == signrpc.MuSig2Version_MUSIG2_VERSION_V040 {
+		// Try to register a combined nonce - should fail with
+		// unsupported error.
+		var dummyNonce [66]byte
+		err := alice.RPC.MuSig2RegisterCombinedNonceErr(
+			&signrpc.MuSig2RegisterCombinedNonceRequest{
+				SessionId:           sessResp1.SessionId,
+				CombinedPublicNonce: dummyNonce[:],
+			},
+		)
+		require.ErrorContains(ht, err, "not supported")
+
+		// Try to get combined nonce - should also fail.
+		err = alice.RPC.MuSig2GetCombinedNonceErr(
+			&signrpc.MuSig2GetCombinedNonceRequest{
+				SessionId: sessResp1.SessionId,
+			},
+		)
+		require.ErrorContains(ht, err, "not supported")
+
+		// For v0.4.0, we can't proceed with the coordinator pattern,
+		// so we're done with this version.
+		return
+	}
+
+	// Copy the nonces over to slice of fixed byte arrays and then use the
+	// musig2 library to aggregate them.
+	var nonces [][musig2.PubNonceSize]byte
+	for _, nonce := range allNonces {
+		var n [musig2.PubNonceSize]byte
+		copy(n[:], nonce)
+		nonces = append(nonces, n)
+	}
+
+	combinedNonce, err := musig2.AggregateNonces(nonces)
+	require.NoError(ht, err)
+
+	// The coordinator now distributes the combined nonce to all
+	// participants.
+	alice.RPC.MuSig2RegisterCombinedNonce(
+		&signrpc.MuSig2RegisterCombinedNonceRequest{
+			SessionId:           sessResp1.SessionId,
+			CombinedPublicNonce: combinedNonce[:],
+		},
+	)
+
+	alice.RPC.MuSig2RegisterCombinedNonce(
+		&signrpc.MuSig2RegisterCombinedNonceRequest{
+			SessionId:           sessResp2.SessionId,
+			CombinedPublicNonce: combinedNonce[:],
+		},
+	)
+
+	alice.RPC.MuSig2RegisterCombinedNonce(
+		&signrpc.MuSig2RegisterCombinedNonceRequest{
+			SessionId:           sessResp3.SessionId,
+			CombinedPublicNonce: combinedNonce[:],
+		},
+	)
+
+	// Verify we can retrieve the combined nonce.
+	getNonceResp := alice.RPC.MuSig2GetCombinedNonce(
+		&signrpc.MuSig2GetCombinedNonceRequest{
+			SessionId: sessResp1.SessionId,
+		},
+	)
+	require.Equal(ht, combinedNonce[:], getNonceResp.CombinedPublicNonce)
+
+	// Test mutual exclusivity: trying to register individual nonces after
+	// combined nonce should fail.
+	err = alice.RPC.MuSig2RegisterNoncesErr(
+		&signrpc.MuSig2RegisterNoncesRequest{
+			SessionId: sessResp1.SessionId,
+			OtherSignerPublicNonces: [][]byte{
+				sessResp2.LocalPublicNonces,
+			},
+		},
+	)
+	require.ErrorContains(ht, err, "already have all nonces")
+
+	// Now complete a full signing flow to verify everything works.
+	combinedKey, err := schnorr.ParsePubKey(sessResp1.CombinedKey)
+	require.NoError(ht, err)
+
+	// Create a simple message to sign.
+	var msg [32]byte
+	copy(msg[:], []byte("test message for combined nonce"))
+
+	// All three participants sign the message.
+	signReq := &signrpc.MuSig2SignRequest{
+		SessionId:     sessResp1.SessionId,
+		MessageDigest: msg[:],
+	}
+	alice.RPC.MuSig2Sign(signReq)
+
+	signReq = &signrpc.MuSig2SignRequest{
+		SessionId:     sessResp2.SessionId,
+		MessageDigest: msg[:],
+		Cleanup:       true,
+	}
+	signResp2 := alice.RPC.MuSig2Sign(signReq)
+
+	signReq = &signrpc.MuSig2SignRequest{
+		SessionId:     sessResp3.SessionId,
+		MessageDigest: msg[:],
+		Cleanup:       true,
+	}
+	signResp3 := alice.RPC.MuSig2Sign(signReq)
+
+	// Combine the signatures.
+	combineReq := &signrpc.MuSig2CombineSigRequest{
+		SessionId: sessResp1.SessionId,
+		OtherPartialSignatures: [][]byte{
+			signResp2.LocalPartialSignature,
+			signResp3.LocalPartialSignature,
+		},
+	}
+	combineResp := alice.RPC.MuSig2CombineSig(combineReq)
+	require.True(ht, combineResp.HaveAllSignatures)
+	require.NotEmpty(ht, combineResp.FinalSignature)
+
+	// Verify the final signature is valid.
+	sig, err := schnorr.ParseSignature(combineResp.FinalSignature)
+	require.NoError(ht, err)
+	require.True(ht, sig.Verify(msg[:], combinedKey))
 }

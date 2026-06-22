@@ -1,17 +1,19 @@
 package lnd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"reflect"
 
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -112,7 +114,7 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 	chanRouter *routing.ChannelRouter,
 	routerBackend *routerrpc.RouterBackend,
 	nodeSigner *netann.NodeSigner,
-	graphDB *channeldb.ChannelGraph,
+	graphDB *graphdb.ChannelGraph,
 	chanStateDB *channeldb.ChannelStateDB,
 	sweeper *sweep.UtxoSweeper,
 	tower *watchtower.Standalone,
@@ -120,8 +122,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 	tcpResolver lncfg.TCPResolver,
 	genInvoiceFeatures func() *lnwire.FeatureVector,
 	genAmpInvoiceFeatures func() *lnwire.FeatureVector,
-	getNodeAnnouncement func() lnwire.NodeAnnouncement,
-	updateNodeAnnouncement func(features *lnwire.RawFeatureVector,
+	getNodeAnnouncement func() lnwire.NodeAnnouncement1,
+	updateNodeAnnouncement func(ctx context.Context,
+		features *lnwire.RawFeatureVector,
 		modifiers ...netann.NodeAnnModifier) error,
 	parseAddr func(addr string) (net.Addr, error),
 	rpcLogger btclog.Logger, aliasMgr *aliasmgr.Manager,
@@ -206,6 +209,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 					cc.Wallet.Cfg.CoinSelectionStrategy,
 				),
 			)
+			subCfgValue.FieldByName("ChanStateDB").Set(
+				reflect.ValueOf(chanStateDB),
+			)
 
 		case *autopilotrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -258,8 +264,10 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 			subCfgValue.FieldByName("DefaultCLTVExpiry").Set(
 				reflect.ValueOf(defaultDelta),
 			)
-			subCfgValue.FieldByName("GraphDB").Set(
-				reflect.ValueOf(graphDB),
+			subCfgValue.FieldByName("Graph").Set(
+				reflect.ValueOf(graphdb.NewVersionedGraph(
+					graphDB, lnwire.GossipVersion1,
+				)),
 			)
 			subCfgValue.FieldByName("ChanStateDB").Set(
 				reflect.ValueOf(chanStateDB),
@@ -341,6 +349,10 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 
 			subCfgValue.FieldByName("GraphDB").Set(
 				reflect.ValueOf(graphDB),
+			)
+
+			subCfgValue.FieldByName("Switch").Set(
+				reflect.ValueOf(htlcSwitch),
 			)
 
 		case *peersrpc.Config:

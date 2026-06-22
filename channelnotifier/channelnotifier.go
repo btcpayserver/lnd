@@ -72,11 +72,25 @@ type ClosedChannelEvent struct {
 	CloseSummary *channeldb.ChannelCloseSummary
 }
 
+// ChannelUpdateEvent represents a new event where a channel's state is updated.
+type ChannelUpdateEvent struct {
+	// Channel is the channel that has been updated.
+	Channel *channeldb.OpenChannel
+}
+
 // FullyResolvedChannelEvent represents a new event where a channel becomes
 // fully resolved.
 type FullyResolvedChannelEvent struct {
 	// ChannelPoint is the channelpoint for the newly fully resolved
 	// channel.
+	ChannelPoint *wire.OutPoint
+}
+
+// FundingTimeoutEvent represents a new event where a pending-open channel has
+// timed out from the PoV of the funding manager because the funding tx
+// has not confirmed in the allotted time.
+type FundingTimeoutEvent struct {
+	// ChannelPoint is the channelpoint for the newly inactive channel.
 	ChannelPoint *wire.OutPoint
 }
 
@@ -116,6 +130,11 @@ func (c *ChannelNotifier) Stop() error {
 // any time the Server is made aware of a new event. The subscription provides
 // channel events from the point of subscription onwards.
 //
+// NOTE: This subscription includes both channel lifecycle events and higher
+// frequency channel state updates, such as ChannelUpdateEvent. Callers that
+// only need lifecycle updates should explicitly filter for the event types they
+// consume.
+//
 // TODO(carlaKC): update  to allow subscriptions to specify a block height from
 // which we would like to subscribe to events.
 func (c *ChannelNotifier) SubscribeChannelEvents() (*subscribe.Client, error) {
@@ -144,7 +163,7 @@ func (c *ChannelNotifier) NotifyPendingOpenChannelEvent(chanPoint wire.OutPoint,
 // channel has gone from pending open to open.
 func (c *ChannelNotifier) NotifyOpenChannelEvent(chanPoint wire.OutPoint) {
 	// Fetch the relevant channel from the database.
-	channel, err := c.chanDB.FetchChannel(nil, chanPoint)
+	channel, err := c.chanDB.FetchChannel(chanPoint)
 	if err != nil {
 		log.Warnf("Unable to fetch open channel from the db: %v", err)
 	}
@@ -172,6 +191,23 @@ func (c *ChannelNotifier) NotifyClosedChannelEvent(chanPoint wire.OutPoint) {
 	}
 }
 
+// NotifyEarlyClosedChannelEvent dispatches a ClosedChannelEvent built from the
+// supplied close summary, without consulting the channel database. This is
+// used by the chain watcher to insta-dispatch CLOSED_CHANNEL events to RPC
+// subscribers as soon as a coop close is first detected on chain, before the
+// async N-conf path has persisted the close in the database. The summary's
+// IsPending field will typically be true at this point; callers should set it
+// accordingly.
+func (c *ChannelNotifier) NotifyEarlyClosedChannelEvent(
+	summary *channeldb.ChannelCloseSummary) {
+
+	event := ClosedChannelEvent{CloseSummary: summary}
+	if err := c.ntfnServer.SendUpdate(event); err != nil {
+		log.Warnf("Unable to send early closed channel update: %v",
+			err)
+	}
+}
+
 // NotifyFullyResolvedChannelEvent notifies the channelEventNotifier goroutine
 // that a channel was fully resolved on chain.
 func (c *ChannelNotifier) NotifyFullyResolvedChannelEvent(
@@ -181,6 +217,17 @@ func (c *ChannelNotifier) NotifyFullyResolvedChannelEvent(
 	event := FullyResolvedChannelEvent{ChannelPoint: &chanPoint}
 	if err := c.ntfnServer.SendUpdate(event); err != nil {
 		log.Warnf("Unable to send resolved channel update: %v", err)
+	}
+}
+
+// NotifyFundingTimeout notifies the channelEventNotifier goroutine that
+// a funding timeout has occurred for a certain channel point.
+func (c *ChannelNotifier) NotifyFundingTimeout(chanPoint wire.OutPoint) {
+	// Send this event to all channel event subscribers.
+	event := FundingTimeoutEvent{ChannelPoint: &chanPoint}
+	if err := c.ntfnServer.SendUpdate(event); err != nil {
+		log.Warnf("Unable to send funding timeout update: %v for "+
+			"ChanPoint(%v)", err, chanPoint)
 	}
 }
 
@@ -217,5 +264,16 @@ func (c *ChannelNotifier) NotifyInactiveChannelEvent(chanPoint wire.OutPoint) {
 	event := InactiveChannelEvent{ChannelPoint: &chanPoint}
 	if err := c.ntfnServer.SendUpdate(event); err != nil {
 		log.Warnf("Unable to send inactive channel update: %v", err)
+	}
+}
+
+// NotifyChannelUpdateEvent notifies subscribers that a channel's state has been
+// updated.
+func (c *ChannelNotifier) NotifyChannelUpdateEvent(
+	channel *channeldb.OpenChannel) {
+
+	event := ChannelUpdateEvent{Channel: channel}
+	if err := c.ntfnServer.SendUpdate(event); err != nil {
+		log.Warnf("Unable to send channel update: %v", err)
 	}
 }

@@ -19,9 +19,10 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -128,8 +129,7 @@ type Utxo struct {
 	Confirmations int64
 	PkScript      []byte
 	wire.OutPoint
-	Derivation *psbt.Bip32Derivation
-	PrevTx     *wire.MsgTx
+	PrevTx *wire.MsgTx
 }
 
 // OutputDetail contains additional information on a destination address.
@@ -229,11 +229,16 @@ type TransactionSubscription interface {
 // behavior of all interface methods in order to ensure identical behavior
 // across all concrete implementations.
 type WalletController interface {
-	// FetchInputInfo queries for the WalletController's knowledge of the
-	// passed outpoint. If the base wallet determines this output is under
-	// its control, then the original txout should be returned.  Otherwise,
-	// a non-nil error value of ErrNotMine should be returned instead.
-	FetchInputInfo(prevOut *wire.OutPoint) (*Utxo, error)
+	// FetchOutpointInfo queries for the WalletController's knowledge of
+	// the passed outpoint. If the base wallet determines this output is
+	// under its control, then the original txout should be returned.
+	// Otherwise, a non-nil error value of ErrNotMine should be returned
+	// instead.
+	FetchOutpointInfo(prevOut *wire.OutPoint) (*Utxo, error)
+
+	// FetchDerivationInfo queries for the wallet's knowledge of the passed
+	// pkScript and constructs the derivation info and returns it.
+	FetchDerivationInfo(pkScript []byte) (*psbt.Bip32Derivation, error)
 
 	// ScriptForOutput returns the address, witness program and redeem
 	// script for a given UTXO. An error is returned if the UTXO does not
@@ -397,7 +402,9 @@ type WalletController interface {
 	// retrieve the transactions relevant to a specific account. When
 	// empty, transactions of all wallet accounts are returned.
 	ListTransactionDetails(startHeight, endHeight int32,
-		accountFilter string) ([]*TransactionDetail, error)
+		accountFilter string, indexOffset uint32,
+		maxTransactions uint32) ([]*TransactionDetail, uint64, uint64,
+		error)
 
 	// LeaseOutput locks an output to the given ID, preventing it from being
 	// available for any future coin selection attempts. The absolute time
@@ -411,8 +418,7 @@ type WalletController interface {
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
 	LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
-		duration time.Duration) (time.Time, []byte, btcutil.Amount,
-		error)
+		duration time.Duration) (time.Time, error)
 
 	// ReleaseOutput unlocks an output, allowing it to be available for coin
 	// selection if it remains unspent. The ID should match the one used to
@@ -654,10 +660,16 @@ func InternalKeyForAddr(wallet WalletController, netParams *chaincfg.Params,
 		return none, nil
 	}
 
+	// Imported addresses do not provide private keys, so they do not
+	// implement waddrmgr.ManagedPubKeyAddress. See RPC ImportTapscript.
+	if walletAddr.Imported() {
+		return none, nil
+	}
+
 	pubKeyAddr, ok := walletAddr.(waddrmgr.ManagedPubKeyAddress)
 	if !ok {
 		return none, fmt.Errorf("expected pubkey addr, got %T",
-			pubKeyAddr)
+			walletAddr)
 	}
 
 	_, derivationPath, _ := pubKeyAddr.DerivationInfo()
@@ -744,4 +756,92 @@ func SupportedWallets() []string {
 	}
 
 	return supportedWallets
+}
+
+// FetchFundingTxWrapper is a wrapper around FetchFundingTx, except that it will
+// exit when the supplied quit channel is closed.
+func FetchFundingTxWrapper(chain BlockChainIO, chanID lnwire.ShortChannelID,
+	quit chan struct{}) (*wire.MsgTx, error) {
+
+	txChan := make(chan *wire.MsgTx, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		tx, err := FetchFundingTx(chain, chanID)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		txChan <- tx
+	}()
+
+	select {
+	case tx := <-txChan:
+		return tx, nil
+
+	case err := <-errChan:
+		return nil, err
+
+	case <-quit:
+		return nil, fmt.Errorf("quit channel passed to " +
+			"lnwallet.FetchFundingTxWrapper has been closed")
+	}
+}
+
+// FetchFundingTx uses the given BlockChainIO to fetch and return the funding
+// transaction identified by the passed short channel ID.
+//
+// TODO(roasbeef): replace with call to GetBlockTransaction? (would allow to
+// later use getblocktxn).
+func FetchFundingTx(chain BlockChainIO,
+	chanID lnwire.ShortChannelID) (*wire.MsgTx, error) {
+
+	// First fetch the block hash by the block number encoded, then use
+	// that hash to fetch the block itself.
+	blockNum := int64(chanID.BlockHeight)
+	blockHash, err := chain.GetBlockHash(blockNum)
+	if err != nil {
+		return nil, err
+	}
+
+	fundingBlock, err := chain.GetBlock(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// As a sanity check, ensure that the advertised transaction index is
+	// within the bounds of the total number of transactions within a
+	// block.
+	numTxns := uint32(len(fundingBlock.Transactions))
+	if chanID.TxIndex > numTxns-1 {
+		return nil, fmt.Errorf("tx_index=#%v "+
+			"is out of range (max_index=%v), network_chan_id=%v",
+			chanID.TxIndex, numTxns-1, chanID)
+	}
+
+	return fundingBlock.Transactions[chanID.TxIndex].Copy(), nil
+}
+
+// FetchPKScriptWithQuit fetches the output script for the given SCID and exits
+// early with an error if the provided quit channel is closed before
+// completion.
+func FetchPKScriptWithQuit(chain BlockChainIO, chanID lnwire.ShortChannelID,
+	quit chan struct{}) ([]byte, error) {
+
+	tx, err := FetchFundingTxWrapper(chain, chanID, quit)
+	if err != nil {
+		return nil, err
+	}
+
+	outputLocator := chanvalidate.ShortChanIDChanLocator{
+		ID: chanID,
+	}
+
+	output, _, err := outputLocator.Locate(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	return output.PkScript, nil
 }

@@ -19,11 +19,7 @@ $  gem install grpc
 $  gem install grpc-tools
 ```
 
-Clone the Google APIs repository:
 
-```shell
-$  git clone https://github.com/googleapis/googleapis.git
-```
 
 Fetch the `lightning.proto` file (or copy it from your local source directory):
 
@@ -34,7 +30,7 @@ $  curl -o lightning.proto -s https://raw.githubusercontent.com/lightningnetwork
 Compile the proto file:
 
 ```shell
-$  grpc_tools_ruby_protoc --proto_path googleapis:. --ruby_out=. --grpc_out=. lightning.proto
+$  grpc_tools_ruby_protoc --ruby_out=. --grpc_out=. lightning.proto
 ```
 
 Two files will be generated in the current directory: 
@@ -62,8 +58,8 @@ $:.unshift(File.dirname(__FILE__))
 require 'grpc'
 require 'lightning_services_pb'
 
-# Due to updated ECDSA generated tls.cert we need to let gprc know that
-# we need to use that cipher suite otherwise there will be a handhsake
+# Due to updated ECDSA generated tls.cert we need to let grpc know that
+# we need to use that cipher suite otherwise there will be a handshake
 # error when we communicate with the lnd rpc server.
 ENV['GRPC_SSL_CIPHER_SUITES'] = "HIGH+ECDSA"
 

@@ -60,7 +60,7 @@ var defaultSetDesc = setDesc{
 	lnwire.AMPRequired: {
 		SetInvoiceAmp: {}, // 9A
 	},
-	lnwire.ExplicitChannelTypeOptional: {
+	lnwire.ExplicitChannelTypeRequired: {
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
 	},
@@ -84,6 +84,10 @@ var defaultSetDesc = setDesc{
 		SetNodeAnn: {}, // N
 		SetInvoice: {}, // 9
 	},
+	lnwire.QuiescenceOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
 	lnwire.ShutdownAnySegwitOptional: {
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
@@ -92,7 +96,26 @@ var defaultSetDesc = setDesc{
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
 	},
+	lnwire.SimpleTaprootChannelsOptionalFinal: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
 	lnwire.SimpleTaprootOverlayChansOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.ExperimentalAccountabilityOptional: {
+		SetNodeAnn: {}, // N
+	},
+	lnwire.RbfCoopCloseOptionalStaging: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.RbfCoopCloseOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.OnionMessagesOptional: {
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
 	},

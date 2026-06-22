@@ -6,13 +6,15 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -87,7 +89,7 @@ type scidAliasHandler interface {
 	// HTLCs on option_scid_alias channels.
 	attachFailAliasUpdate(failClosure func(
 		sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate)
+		incoming bool) *lnwire.ChannelUpdate1)
 
 	// getAliases fetches the link's underlying aliases. This is used by
 	// the Switch to determine whether to forward an HTLC and where to
@@ -170,6 +172,18 @@ type ChannelUpdateHandler interface {
 	// will only ever be called once. If no CommitSig is owed in the
 	// argument's LinkDirection, then we will call this hook immediately.
 	OnCommitOnce(LinkDirection, func())
+
+	// InitStfu allows us to initiate quiescence on this link. It returns
+	// a receive only channel that will block until quiescence has been
+	// achieved, or definitively fails. The return value is the
+	// ChannelParty who holds the role of initiator or Err if the operation
+	// fails.
+	//
+	// This operation has been added to allow channels to be quiesced via
+	// RPC. It may be removed or reworked in the future as RPC initiated
+	// quiescence is a holdover until we have downstream protocols that use
+	// it.
+	InitStfu() <-chan fn.Result[lntypes.ChannelParty]
 }
 
 // CommitHookID is a value that is used to uniquely identify hooks in the
@@ -184,7 +198,7 @@ type FlushHookID uint64
 
 // LinkDirection is used to query and change any link state on a per-direction
 // basis.
-type LinkDirection bool
+type LinkDirection = bool
 
 const (
 	// Incoming is the direction from the remote peer to our node.
@@ -196,8 +210,18 @@ const (
 
 // OptionalBandwidth is a type alias for the result of a bandwidth query that
 // may return a bandwidth value or fn.None if the bandwidth is not available or
-// not applicable.
-type OptionalBandwidth = fn.Option[lnwire.MilliSatoshi]
+// not applicable. IsHandled is set to false if the external traffic shaper does
+// not handle the channel in question.
+type OptionalBandwidth struct {
+	// IsHandled is true if the external traffic shaper handles the channel.
+	// If this is false, then the bandwidth value is not applicable.
+	IsHandled bool
+
+	// Bandwidth is the available bandwidth for the channel, as determined
+	// by the external traffic shaper. If the external traffic shaper is not
+	// handling the channel, this value will be fn.None.
+	Bandwidth fn.Option[lnwire.MilliSatoshi]
+}
 
 // ChannelLink is an interface which represents the subsystem for managing the
 // incoming htlc requests, applying the changes to the channel, and also
@@ -472,8 +496,9 @@ type AuxHtlcModifier interface {
 	// data blob of an HTLC, may produce a different blob or modify the
 	// amount of bitcoin this htlc should carry.
 	ProduceHtlcExtraData(totalAmount lnwire.MilliSatoshi,
-		htlcCustomRecords lnwire.CustomRecords) (lnwire.MilliSatoshi,
-		lnwire.CustomRecords, error)
+		htlcCustomRecords lnwire.CustomRecords,
+		peer route.Vertex) (lnwire.MilliSatoshi, lnwire.CustomRecords,
+		error)
 }
 
 // AuxTrafficShaper is an interface that allows the sender to determine if a
@@ -486,14 +511,22 @@ type AuxTrafficShaper interface {
 	// identified by the provided channel ID may have external mechanisms
 	// that would allow it to carry out the payment.
 	ShouldHandleTraffic(cid lnwire.ShortChannelID,
-		fundingBlob fn.Option[tlv.Blob]) (bool, error)
+		fundingBlob, htlcBlob fn.Option[tlv.Blob]) (bool, error)
 
 	// PaymentBandwidth returns the available bandwidth for a custom channel
-	// decided by the given channel aux blob and HTLC blob. A return value
-	// of 0 means there is no bandwidth available. To find out if a channel
-	// is a custom channel that should be handled by the traffic shaper, the
-	// ShouldHandleTraffic method should be called first.
-	PaymentBandwidth(htlcBlob, commitmentBlob fn.Option[tlv.Blob],
-		linkBandwidth,
-		htlcAmt lnwire.MilliSatoshi) (lnwire.MilliSatoshi, error)
+	// decided by the given channel funding/commitment aux blob and HTLC
+	// blob. A return value of 0 means there is no bandwidth available. To
+	// find out if a channel is a custom channel that should be handled by
+	// the traffic shaper, the ShouldHandleTraffic method should be called
+	// first.
+	PaymentBandwidth(fundingBlob, htlcBlob,
+		commitmentBlob fn.Option[tlv.Blob],
+		linkBandwidth, htlcAmt lnwire.MilliSatoshi,
+		htlcView lnwallet.AuxHtlcView,
+		peer route.Vertex) (lnwire.MilliSatoshi, error)
+
+	// IsCustomHTLC returns true if the HTLC carries the set of relevant
+	// custom records to put it under the purview of the traffic shaper,
+	// meaning that it's from a custom channel.
+	IsCustomHTLC(htlcRecords lnwire.CustomRecords) bool
 }

@@ -5,16 +5,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"testing"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
@@ -23,99 +25,10 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 )
-
-// testDisconnectingTargetPeer performs a test which disconnects Alice-peer
-// from Bob-peer and then re-connects them again. We expect Alice to be able to
-// disconnect at any point.
-//
-// TODO(yy): move to lnd_network_test.
-func testDisconnectingTargetPeer(ht *lntest.HarnessTest) {
-	// We'll start both nodes with a high backoff so that they don't
-	// reconnect automatically during our test.
-	args := []string{
-		"--minbackoff=1m",
-		"--maxbackoff=1m",
-	}
-
-	alice, bob := ht.Alice, ht.Bob
-	ht.RestartNodeWithExtraArgs(alice, args)
-	ht.RestartNodeWithExtraArgs(bob, args)
-
-	// Start by connecting Alice and Bob with no channels.
-	ht.EnsureConnected(alice, bob)
-
-	chanAmt := funding.MaxBtcFundingAmount
-	pushAmt := btcutil.Amount(0)
-
-	// Create a new channel that requires 1 confs before it's considered
-	// open, then broadcast the funding transaction
-	const numConfs = 1
-	p := lntest.OpenChannelParams{
-		Amt:     chanAmt,
-		PushAmt: pushAmt,
-	}
-	stream := ht.OpenChannelAssertStream(alice, bob, p)
-
-	// At this point, the channel's funding transaction will have been
-	// broadcast, but not confirmed. Alice and Bob's nodes should reflect
-	// this when queried via RPC.
-	ht.AssertNumPendingOpenChannels(alice, 1)
-	ht.AssertNumPendingOpenChannels(bob, 1)
-
-	// Disconnect Alice-peer from Bob-peer should have no error.
-	ht.DisconnectNodes(alice, bob)
-
-	// Assert that the connection was torn down.
-	ht.AssertNotConnected(alice, bob)
-
-	// Mine a block, then wait for Alice's node to notify us that the
-	// channel has been opened.
-	ht.MineBlocksAndAssertNumTxes(numConfs, 1)
-
-	// At this point, the channel should be fully opened and there should
-	// be no pending channels remaining for either node.
-	ht.AssertNumPendingOpenChannels(alice, 0)
-	ht.AssertNumPendingOpenChannels(bob, 0)
-
-	// Reconnect the nodes so that the channel can become active.
-	ht.ConnectNodes(alice, bob)
-
-	// The channel should be listed in the peer information returned by
-	// both peers.
-	chanPoint := ht.WaitForChannelOpenEvent(stream)
-
-	// Check both nodes to ensure that the channel is ready for operation.
-	ht.AssertChannelExists(alice, chanPoint)
-	ht.AssertChannelExists(bob, chanPoint)
-
-	// Disconnect Alice-peer from Bob-peer should have no error.
-	ht.DisconnectNodes(alice, bob)
-
-	// Check existing connection.
-	ht.AssertNotConnected(alice, bob)
-
-	// Reconnect both nodes before force closing the channel.
-	ht.ConnectNodes(alice, bob)
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.ForceCloseChannel(alice, chanPoint)
-
-	// Disconnect Alice-peer from Bob-peer should have no error.
-	ht.DisconnectNodes(alice, bob)
-
-	// Check that the nodes not connected.
-	ht.AssertNotConnected(alice, bob)
-
-	// Finally, re-connect both nodes.
-	ht.ConnectNodes(alice, bob)
-
-	// Check existing connection.
-	ht.AssertConnected(alice, bob)
-}
 
 // testSphinxReplayPersistence verifies that replayed onion packets are
 // rejected by a remote peer after a restart. We use a combination of unsafe
@@ -157,7 +70,6 @@ func testSphinxReplayPersistence(ht *lntest.HarnessTest) {
 			Amt: chanAmt,
 		},
 	)
-	defer ht.CloseChannel(fred, chanPointFC)
 
 	// Now that the channel is open, create an invoice for Dave which
 	// expects a payment of 1000 satoshis from Carol paid via a particular
@@ -172,16 +84,15 @@ func testSphinxReplayPersistence(ht *lntest.HarnessTest) {
 	invoiceResp := dave.RPC.AddInvoice(invoice)
 
 	// Wait for all channels to be recognized and advertized.
-	ht.AssertTopologyChannelOpen(carol, chanPoint)
-	ht.AssertTopologyChannelOpen(dave, chanPoint)
-	ht.AssertTopologyChannelOpen(carol, chanPointFC)
-	ht.AssertTopologyChannelOpen(fred, chanPointFC)
+	ht.AssertChannelInGraph(carol, chanPoint)
+	ht.AssertChannelInGraph(dave, chanPoint)
+	ht.AssertChannelInGraph(carol, chanPointFC)
+	ht.AssertChannelInGraph(fred, chanPointFC)
 
 	// With the invoice for Dave added, send a payment from Fred paying
 	// to the above generated invoice.
 	req := &routerrpc.SendPaymentRequest{
 		PaymentRequest: invoiceResp.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 	}
 	payStream := fred.RPC.SendPayment(req)
@@ -226,9 +137,6 @@ func testSphinxReplayPersistence(ht *lntest.HarnessTest) {
 	// unaltered.
 	ht.AssertAmountPaid("carol => dave", carol, chanPoint, 0, 0)
 	ht.AssertAmountPaid("dave <= carol", dave, chanPoint, 0, 0)
-
-	// Cleanup by mining the force close and sweep transaction.
-	ht.ForceCloseChannel(carol, chanPoint)
 }
 
 // testListChannels checks that the response from ListChannels is correct. It
@@ -239,17 +147,11 @@ func testListChannels(ht *lntest.HarnessTest) {
 	const aliceRemoteMaxHtlcs = 50
 	const bobRemoteMaxHtlcs = 100
 
-	// Get the standby nodes and open a channel between them.
-	alice, bob := ht.Alice, ht.Bob
-
 	args := []string{fmt.Sprintf(
 		"--default-remote-max-htlcs=%v",
 		bobRemoteMaxHtlcs,
 	)}
-	ht.RestartNodeWithExtraArgs(bob, args)
-
-	// Connect Alice to Bob.
-	ht.EnsureConnected(alice, bob)
+	cfgs := [][]string{nil, args}
 
 	// Open a channel with 100k satoshis between Alice and Bob with Alice
 	// being the sole funder of the channel. The minial HTLC amount is set
@@ -264,8 +166,10 @@ func testListChannels(ht *lntest.HarnessTest) {
 		MinHtlc:        customizedMinHtlc,
 		RemoteMaxHtlcs: aliceRemoteMaxHtlcs,
 	}
-	chanPoint := ht.OpenChannel(alice, bob, p)
-	defer ht.CloseChannel(alice, chanPoint)
+
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, p)
+	alice, bob := nodes[0], nodes[1]
+	chanPoint := chanPoints[0]
 
 	// Alice should have one channel opened with Bob.
 	ht.AssertNodeNumChannels(alice, 1)
@@ -353,6 +257,17 @@ func testListChannels(ht *lntest.HarnessTest) {
 	assertChannelConstraintsEqual(
 		ht, aliceChannel.RemoteConstraints, bobChannel.LocalConstraints,
 	)
+
+	// Finally we assert that the flap count is updated as expected.
+	resp := alice.RPC.ListPeers()
+
+	// Assert Alice only have one peer.
+	require.Len(ht, resp.Peers, 1)
+	for _, p := range resp.Peers {
+		// The channel open event resulted in an online event, so we
+		// expect the flap count to be 1.
+		require.EqualValues(ht, 1, p.FlapCount)
+	}
 }
 
 // testMaxPendingChannels checks that error is returned from remote peer if
@@ -369,7 +284,7 @@ func testMaxPendingChannels(ht *lntest.HarnessTest) {
 	}
 	carol := ht.NewNode("Carol", args)
 
-	alice := ht.Alice
+	alice := ht.NewNodeWithCoins("Alice", nil)
 	ht.ConnectNodes(alice, carol)
 
 	carolBalance := btcutil.Amount(maxPendingChannels) * amount
@@ -417,19 +332,13 @@ func testMaxPendingChannels(ht *lntest.HarnessTest) {
 		// Ensure that the funding transaction enters a block, and is
 		// properly advertised by Alice.
 		ht.AssertTxInBlock(block, fundingTxID)
-		ht.AssertTopologyChannelOpen(alice, fundingChanPoint)
+		ht.AssertChannelInGraph(alice, fundingChanPoint)
 
 		// The channel should be listed in the peer information
 		// returned by both peers.
 		ht.AssertChannelExists(alice, fundingChanPoint)
 
 		chanPoints[i] = fundingChanPoint
-	}
-
-	// Next, close the channel between Alice and Carol, asserting that the
-	// channel has been properly closed on-chain.
-	for _, chanPoint := range chanPoints {
-		ht.CloseChannel(alice, chanPoint)
 	}
 }
 
@@ -439,7 +348,9 @@ func testMaxPendingChannels(ht *lntest.HarnessTest) {
 func testGarbageCollectLinkNodes(ht *lntest.HarnessTest) {
 	const chanAmt = 1000000
 
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Open a channel between Alice and Bob which will later be
 	// cooperatively closed.
@@ -467,7 +378,7 @@ func testGarbageCollectLinkNodes(ht *lntest.HarnessTest) {
 	dave := ht.NewNode("Dave", nil)
 
 	ht.ConnectNodes(alice, dave)
-	persistentChanPoint := ht.OpenChannel(
+	ht.OpenChannel(
 		alice, dave, lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
@@ -519,12 +430,6 @@ func testGarbageCollectLinkNodes(ht *lntest.HarnessTest) {
 	// close the channel instead.
 	ht.ForceCloseChannel(alice, forceCloseChanPoint)
 
-	// We'll need to mine some blocks in order to mark the channel fully
-	// closed.
-	ht.MineBlocks(
-		chainreg.DefaultBitcoinTimeLockDelta - defaultCSV,
-	)
-
 	// Before we test reconnection, we'll ensure that the channel has been
 	// fully cleaned up for both Carol and Alice.
 	ht.AssertNumPendingForceClose(alice, 0)
@@ -540,9 +445,6 @@ func testGarbageCollectLinkNodes(ht *lntest.HarnessTest) {
 		"did not expect to find bob in the channel graph, but did")
 	require.NotContains(ht, channelGraph.Nodes, carol.PubKeyStr,
 		"did not expect to find carol in the channel graph, but did")
-
-	// Now that the test is done, we can also close the persistent link.
-	ht.CloseChannel(alice, persistentChanPoint)
 }
 
 // testRejectHTLC tests that a node can be created with the flag --rejecthtlc.
@@ -553,7 +455,8 @@ func testRejectHTLC(ht *lntest.HarnessTest) {
 	// Alice ------> Carol ------> Bob
 	//
 	const chanAmt = btcutil.Amount(1000000)
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
 
 	// Create Carol with reject htlc flag.
 	carol := ht.NewNode("Carol", []string{"--rejecthtlc"})
@@ -568,14 +471,14 @@ func testRejectHTLC(ht *lntest.HarnessTest) {
 	ht.FundCoins(btcutil.SatoshiPerBitcoin, carol)
 
 	// Open a channel between Alice and Carol.
-	chanPointAlice := ht.OpenChannel(
+	ht.OpenChannel(
 		alice, carol, lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
 	)
 
 	// Open a channel between Carol and Bob.
-	chanPointCarol := ht.OpenChannel(
+	ht.OpenChannel(
 		carol, bob, lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
@@ -629,17 +532,14 @@ func testRejectHTLC(ht *lntest.HarnessTest) {
 	// lnd with --rejecthtlc.
 	paymentReq := &routerrpc.SendPaymentRequest{
 		PaymentRequest: resp.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 	}
-	payStream := alice.RPC.SendPayment(paymentReq)
-	ht.AssertPaymentStatusFromStream(payStream, lnrpc.Payment_FAILED)
+	ht.SendPaymentAssertFail(
+		alice, paymentReq,
+		lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE,
+	)
 
 	ht.AssertLastHTLCError(alice, lnrpc.Failure_CHANNEL_DISABLED)
-
-	// Close all channels.
-	ht.CloseChannel(alice, chanPointAlice)
-	ht.CloseChannel(carol, chanPointCarol)
 }
 
 // testNodeSignVerify checks that only connected nodes are allowed to perform
@@ -647,15 +547,15 @@ func testRejectHTLC(ht *lntest.HarnessTest) {
 func testNodeSignVerify(ht *lntest.HarnessTest) {
 	chanAmt := funding.MaxBtcFundingAmount
 	pushAmt := btcutil.Amount(100000)
-	alice, bob := ht.Alice, ht.Bob
+	p := lntest.OpenChannelParams{
+		Amt:     chanAmt,
+		PushAmt: pushAmt,
+	}
 
 	// Create a channel between alice and bob.
-	aliceBobCh := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{
-			Amt:     chanAmt,
-			PushAmt: pushAmt,
-		},
-	)
+	cfgs := [][]string{nil, nil}
+	_, nodes := ht.CreateSimpleNetwork(cfgs, p)
+	alice, bob := nodes[0], nodes[1]
 
 	// alice signs "alice msg" and sends her signature to bob.
 	aliceMsg := []byte("alice msg")
@@ -683,23 +583,23 @@ func testNodeSignVerify(ht *lntest.HarnessTest) {
 	require.False(ht, verifyResp.Valid, "carol's signature didn't validate")
 	require.Equal(ht, verifyResp.Pubkey, carol.PubKeyStr,
 		"carol's signature doesn't contain alice's pubkey.")
-
-	// Close the channel between alice and bob.
-	ht.CloseChannel(alice, aliceBobCh)
 }
 
 // testAbandonChannel abandons a channel and asserts that it is no longer open
 // and not in one of the pending closure states. It also verifies that the
 // abandoned channel is reported as closed with close type 'abandoned'.
 func testAbandonChannel(ht *lntest.HarnessTest) {
-	alice, bob := ht.Alice, ht.Bob
-
 	// First establish a channel between Alice and Bob.
 	channelParam := lntest.OpenChannelParams{
 		Amt:     funding.MaxBtcFundingAmount,
 		PushAmt: btcutil.Amount(100000),
 	}
-	chanPoint := ht.OpenChannel(alice, bob, channelParam)
+
+	// Create a channel between alice and bob.
+	cfgs := [][]string{nil, nil}
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, channelParam)
+	alice := nodes[0]
+	chanPoint := chanPoints[0]
 
 	// Now that the channel is open, we'll obtain its channel ID real quick
 	// so we can use it to query the graph below.
@@ -751,16 +651,13 @@ func testAbandonChannel(ht *lntest.HarnessTest) {
 	// Calling AbandonChannel again, should result in no new errors, as the
 	// channel has already been removed.
 	alice.RPC.AbandonChannel(abandonChannelRequest)
-
-	// Now that we're done with the test, the channel can be closed. This
-	// is necessary to avoid unexpected outcomes of other tests that use
-	// Bob's lnd instance.
-	ht.ForceCloseChannel(bob, chanPoint)
 }
 
 // testSendAllCoins tests that we're able to properly sweep all coins from the
 // wallet into a single target address at the specified fee rate.
 func testSendAllCoins(ht *lntest.HarnessTest) {
+	alice := ht.NewNodeWithCoins("Alice", nil)
+
 	// First, we'll make a new node, Ainz who'll we'll use to test wallet
 	// sweeping.
 	//
@@ -787,7 +684,7 @@ func testSendAllCoins(ht *lntest.HarnessTest) {
 
 	// Ensure that we can't send coins to another user's Pubkey.
 	err = ainz.RPC.SendCoinsAssertErr(&lnrpc.SendCoinsRequest{
-		Addr:       ht.Alice.RPC.GetInfo().IdentityPubkey,
+		Addr:       alice.RPC.GetInfo().IdentityPubkey,
 		SendAll:    true,
 		Label:      sendCoinsLabel,
 		TargetConf: 6,
@@ -1158,7 +1055,8 @@ func assertChannelConstraintsEqual(ht *lntest.HarnessTest,
 // on a message with a provided address.
 func testSignVerifyMessageWithAddr(ht *lntest.HarnessTest) {
 	// Using different nodes to sign the message and verify the signature.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNode("Alice,", nil)
+	bob := ht.NewNode("Bob,", nil)
 
 	// Test an lnd wallet created P2WKH address.
 	respAddr := alice.RPC.NewAddress(&lnrpc.NewAddressRequest{
@@ -1269,44 +1167,6 @@ func testSignVerifyMessageWithAddr(ht *lntest.HarnessTest) {
 	)
 
 	require.False(ht, respValid.Valid, "external signature did validate")
-}
-
-// testNativeSQLNoMigration tests that nodes that have invoices would not start
-// up with native SQL enabled, as we don't currently support migration of KV
-// invoices to the new SQL schema.
-func testNativeSQLNoMigration(ht *lntest.HarnessTest) {
-	alice := ht.Alice
-
-	// Make sure we run the test with SQLite or Postgres.
-	if alice.Cfg.DBBackend != node.BackendSqlite &&
-		alice.Cfg.DBBackend != node.BackendPostgres {
-
-		ht.Skip("node not running with SQLite or Postgres")
-	}
-
-	// Skip the test if the node is already running with native SQL.
-	if alice.Cfg.NativeSQL {
-		ht.Skip("node already running with native SQL")
-	}
-
-	alice.RPC.AddInvoice(&lnrpc.Invoice{
-		Value: 10_000,
-	})
-
-	alice.SetExtraArgs([]string{"--db.use-native-sql"})
-
-	// Restart the node manually as we're really only interested in the
-	// startup error.
-	require.NoError(ht, alice.Stop())
-	require.NoError(ht, alice.StartLndCmd(context.Background()))
-
-	// We expect the node to fail to start up with native SQL enabled, as we
-	// have an invoice in the KV store.
-	require.Error(ht, alice.WaitForProcessExit())
-
-	// Reset the extra args and restart alice.
-	alice.SetExtraArgs(nil)
-	require.NoError(ht, alice.Start(ht.Context()))
 }
 
 // testSendSelectedCoins tests that we're able to properly send the selected
@@ -1421,9 +1281,10 @@ func testSendSelectedCoinsChannelReserve(ht *lntest.HarnessTest) {
 	// Create a two-hop network: Alice -> Bob.
 	//
 	// NOTE: Alice will have one UTXO after the funding.
-	_, nodes := createSimpleNetwork(
-		ht, []string{"--protocol.anchors"}, 2,
-		lntest.OpenChannelParams{
+	cfg := []string{"--protocol.anchors"}
+	cfgs := [][]string{cfg, cfg}
+	_, nodes := ht.CreateSimpleNetwork(
+		cfgs, lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
 	)
@@ -1499,4 +1360,294 @@ func testSendSelectedCoinsChannelReserve(ht *lntest.HarnessTest) {
 
 	// Alice should have one reserved UTXO now.
 	ht.AssertNumUTXOs(alice, 1)
+}
+
+// testGRPCNotFound verifies that the expected grpc NotFound status code is
+// returned when querying various rpc endpoints.
+func testGRPCNotFound(ht *lntest.HarnessTest) {
+	var (
+		notFoundErr = codes.NotFound.String()
+		unknownPub  = "0286098b97bc843372b4426d4b276cea9aa2f48f0428d6" +
+			"f5b66ae101befc14f8b4"
+		rHash = ht.Random32Bytes()
+	)
+	unknownPubBytes, err := route.NewVertexFromStr(unknownPub)
+	require.NoError(ht, err)
+
+	alice := ht.NewNode("Alice", []string{
+		// We add this flag so that we can test the
+		// LookupHTLCResolutionAssertErr endpoint.
+		"--store-final-htlc-resolutions",
+	}).RPC
+
+	alice.GetChanInfoAssertErr(&lnrpc.ChanInfoRequest{
+		// Use a random channel ID that doesn't exist.
+		ChanId: 949807622323240961,
+	}, notFoundErr)
+
+	alice.GetNodeInfoAssertErr(&lnrpc.NodeInfoRequest{
+		// Use a random pubkey that doesn't exist.
+		PubKey: unknownPub,
+	}, notFoundErr)
+
+	alice.SendCustomMessageAssertErr(&lnrpc.SendCustomMessageRequest{
+		// Use a random pubkey that doesn't exist.
+		Peer: unknownPubBytes[:],
+		Data: []byte("test message"),
+	}, notFoundErr)
+
+	alice.LookupHTLCResolutionAssertErr(&lnrpc.LookupHtlcResolutionRequest{
+		ChanId:    400000,
+		HtlcIndex: 300,
+	}, notFoundErr)
+
+	alice.LookupInvoiceAssertErr(&lnrpc.PaymentHash{
+		// Use a random payment hash that doesn't exist.
+		RHash: rHash,
+	}, notFoundErr)
+}
+
+// testReorgNotifications tests that RegisterSpendNtfn behaves as expected
+// during a reorg. A reorg notification is produced after a reorg affects the
+// block which has produced a spending notification for this registration.
+func testReorgNotifications(ht *lntest.HarnessTest) {
+	ctxb := ht.Context()
+	const timeout = wait.DefaultTimeout
+
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+
+	const tx1Amount = 1_000_000
+
+	// Alice will send coins to herself, Bob will watch spending and
+	// confirmation of the transaction. We make sure that a node can watch
+	// transactions which are not a part of its wallet.
+	respAddr := alice.RPC.NewAddress(&lnrpc.NewAddressRequest{
+		Type: lnrpc.AddressType_TAPROOT_PUBKEY,
+	})
+	txid1Str := alice.RPC.SendCoins(&lnrpc.SendCoinsRequest{
+		Addr:        respAddr.Address,
+		Amount:      tx1Amount,
+		SatPerVbyte: 2,
+	}).Txid
+	txid1, err := chainhash.NewHashFromStr(txid1Str)
+	require.NoError(ht, err)
+	tx1 := ht.AssertTxInMempool(*txid1)
+
+	// Find the output of tx1.
+	tx1OutIndex := -1
+	for i, txOut := range tx1.TxOut {
+		if txOut.Value == tx1Amount {
+			tx1OutIndex = i
+		}
+	}
+	require.NotEqual(ht, -1, tx1OutIndex)
+	tx1op := wire.OutPoint{
+		Hash:  *txid1,
+		Index: uint32(tx1OutIndex),
+	}
+	tx1opLnrpc := &lnrpc.OutPoint{
+		TxidStr:     txid1Str,
+		OutputIndex: uint32(tx1OutIndex),
+	}
+	tx1opChainrpc := &chainrpc.Outpoint{
+		Hash:  txid1[:],
+		Index: uint32(tx1OutIndex),
+	}
+	pkscript := tx1.TxOut[tx1OutIndex].PkScript
+
+	// Now fee bump the output of the first transaction.
+	alice.RPC.BumpFee(&walletrpc.BumpFeeRequest{
+		Outpoint:    tx1opLnrpc,
+		Immediate:   true,
+		SatPerVbyte: 20,
+	})
+
+	// Now find the fee bump tx.
+	listSweepsReq := &walletrpc.ListSweepsRequest{
+		Verbose: true,
+
+		// startHeight -1 means include only unconfirmed.
+		StartHeight: -1,
+	}
+
+	var tx2aLnrpc *lnrpc.Transaction
+	require.NoError(ht, wait.NoError(func() error {
+		sweepsResp := alice.RPC.ListSweeps(listSweepsReq)
+		sweepsDetails := sweepsResp.GetTransactionDetails()
+		if sweepsDetails == nil {
+			return fmt.Errorf("no sweep details")
+		}
+		if len(sweepsDetails.Transactions) != 1 {
+			return fmt.Errorf("got %d sweeps, want %d",
+				len(sweepsDetails.Transactions), 1)
+		}
+		tx2aLnrpc = sweepsDetails.Transactions[0]
+
+		return nil
+	}, defaultTimeout))
+
+	require.Len(ht, tx2aLnrpc.PreviousOutpoints, 1)
+	require.Equal(
+		ht, tx1op.String(), tx2aLnrpc.PreviousOutpoints[0].Outpoint,
+	)
+	txid2a, err := chainhash.NewHashFromStr(tx2aLnrpc.TxHash)
+	require.NoError(ht, err)
+	tx2a := ht.AssertTxInMempool(*txid2a)
+
+	// Fee bump the output of the first transaction again with a higher fee
+	// rate to get RBF transaction tx2b.
+	alice.RPC.BumpFee(&walletrpc.BumpFeeRequest{
+		Outpoint:    tx1opLnrpc,
+		Immediate:   true,
+		SatPerVbyte: 200,
+	})
+
+	var tx2bLnrpc *lnrpc.Transaction
+	require.NoError(ht, wait.NoError(func() error {
+		sweepsResp := alice.RPC.ListSweeps(listSweepsReq)
+		sweepsDetails := sweepsResp.GetTransactionDetails()
+		if sweepsDetails == nil {
+			return fmt.Errorf("no sweep details")
+		}
+		for _, tx := range sweepsDetails.Transactions {
+			if tx.TxHash != tx2aLnrpc.TxHash {
+				tx2bLnrpc = tx
+				break
+			}
+		}
+		if tx2bLnrpc == nil {
+			return fmt.Errorf("tx2aLnrpc hasn't been replaced yet")
+		}
+
+		return nil
+	}, defaultTimeout))
+
+	require.Len(ht, tx2bLnrpc.PreviousOutpoints, 1)
+	require.Equal(
+		ht, tx1op.String(), tx2bLnrpc.PreviousOutpoints[0].Outpoint,
+	)
+	txid2b, err := chainhash.NewHashFromStr(tx2bLnrpc.TxHash)
+	require.NoError(ht, err)
+	tx2b := ht.AssertTxInMempool(*txid2b)
+
+	// Mine tx1 only.
+	ht.Miner().MineBlockWithTxes([]*btcutil.Tx{btcutil.NewTx(tx1)})
+
+	// Bob starts watching spending of tx1op.
+	spendClient := bob.RPC.RegisterSpendNtfn(&chainrpc.SpendRequest{
+		Outpoint:   tx1opChainrpc,
+		Script:     pkscript,
+		HeightHint: ht.CurrentHeight(),
+	})
+
+	ctx, cancel := context.WithTimeout(ctxb, timeout)
+	defer cancel()
+
+	// receiveSpendNotification tries to receive a spend notification from
+	// a spend client until the context expires.
+	receiveSpendNotification := func() (*chainrpc.SpendEvent, error) {
+		var (
+			msg     *chainrpc.SpendEvent
+			recvErr error
+		)
+
+		received := make(chan struct{})
+		go func() {
+			msg, recvErr = spendClient.Recv()
+			close(received)
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("spending notification expired")
+
+		case <-received:
+			return msg, recvErr
+		}
+	}
+
+	// Mine tx2b.
+	block1 := ht.Miner().MineBlockWithTxes(
+		[]*btcutil.Tx{btcutil.NewTx(tx2b)},
+	)
+
+	// Make sure RegisterSpendNtfn noticed the spending.
+	spendMsg, err := receiveSpendNotification()
+	require.NoError(ht, err)
+	spendDetails := spendMsg.GetSpend()
+	require.NotNil(ht, spendDetails)
+	require.Equal(ht, txid2b[:], spendDetails.SpendingTxHash)
+
+	// Reorg block1.
+	blockHash1 := block1.Header.BlockHash()
+	require.NoError(ht, ht.Miner().InvalidateBlock(&blockHash1))
+
+	// Mine empty blocks to evict block1 in bitcoin backend (e.g. bitcoind).
+	ht.Miner().MineEmptyBlocks(2)
+
+	// Make sure RegisterSpendNtfn noticed the reorg. Transaction tx2b was
+	// just unconfirmed.
+	ctx, cancel = context.WithTimeout(ctxb, timeout)
+	defer cancel()
+	spendMsg, err = receiveSpendNotification()
+	require.NoError(ht, err)
+	require.NotNil(ht, spendMsg.GetReorg())
+
+	// Mine tx2a to confirm a different version of spending.
+	ht.Miner().MineBlockWithTxes([]*btcutil.Tx{btcutil.NewTx(tx2a)})
+
+	// Make sure RegisterSpendNtfn noticed the spending.
+	ctx, cancel = context.WithTimeout(ctxb, timeout)
+	defer cancel()
+	spendMsg, err = receiveSpendNotification()
+	require.NoError(ht, err)
+	spendDetails = spendMsg.GetSpend()
+	require.NotNil(ht, spendDetails)
+	require.Equal(ht, txid2a[:], spendDetails.SpendingTxHash)
+}
+
+// testEstimateFee tests walletrpc.EstimateFee API.
+func testEstimateFee(ht *lntest.HarnessTest) {
+	alice := ht.NewNode("Alice", nil)
+
+	ctx := ht.Context()
+
+	testCases := []struct {
+		name        string
+		confTarget  int32
+		errContains string
+	}{
+		{
+			name:       "conf target 1",
+			confTarget: 1,
+		},
+		{
+			name:        "conf target 0",
+			confTarget:  0,
+			errContains: "must be greater than 0",
+		},
+		{
+			name:        "conf target -1",
+			confTarget:  -1,
+			errContains: "must be greater than 0",
+		},
+	}
+
+	for _, tc := range testCases {
+		ht.Run(tc.name, func(t *testing.T) {
+			req := &walletrpc.EstimateFeeRequest{
+				ConfTarget: tc.confTarget,
+			}
+			resp, err := alice.RPC.WalletKit.EstimateFee(ctx, req)
+
+			if tc.errContains != "" {
+				require.ErrorContains(t, err, tc.errContains)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotZero(t, resp.SatPerKw)
+			require.NotZero(t, resp.MinRelayFeeSatPerKw)
+		})
+	}
 }

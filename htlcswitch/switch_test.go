@@ -1,9 +1,9 @@
 package htlcswitch
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -13,15 +13,15 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/contractcourt"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -1001,9 +1001,7 @@ func TestSwitchForwardFailAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1088,16 +1086,14 @@ func TestSwitchForwardFailAfterFullAdd(t *testing.T) {
 	// Now we will restart bob, leaving the forwarding decision for this
 	// htlc is in the half-added state.
 	if err := s.Stop(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	if err := cdb.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1142,7 +1138,7 @@ func TestSwitchForwardFailAfterFullAdd(t *testing.T) {
 
 	// Send the fail packet from the remote peer through the switch.
 	if err := s2.ForwardPackets(nil, fail); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	// Pull packet from alice's link, as it should have gone through
@@ -1191,9 +1187,7 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1278,16 +1272,14 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 	// Now we will restart bob, leaving the forwarding decision for this
 	// htlc is in the half-added state.
 	if err := s.Stop(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	if err := cdb.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1334,7 +1326,7 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 
 	// Send the settle packet from the remote peer through the switch.
 	if err := s2.ForwardPackets(nil, settle); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	// Pull packet from alice's link, as it should have gone through
@@ -1384,9 +1376,7 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1463,16 +1453,14 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 	// Now we will restart bob, leaving the forwarding decision for this
 	// htlc is in the half-added state.
 	if err := s.Stop(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	if err := cdb.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1540,9 +1528,7 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1614,16 +1600,14 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 	// Now we will restart bob, leaving the forwarding decision for this
 	// htlc is in the half-added state.
 	if err := s.Stop(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	if err := cdb.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1697,9 +1681,7 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1770,16 +1752,14 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 	}
 
 	if err := s.Stop(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
 	if err := cdb.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1866,12 +1846,10 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 	}
 
 	if err := cdb2.Close(); err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err)
 	}
 
-	cdb3, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb3.Close() })
+	cdb3 := channeldb.OpenForTesting(t, tempPath)
 
 	s3, err := initSwitchWithDB(testStartingHeight, cdb3)
 	require.NoError(t, err, "unable reinit switch")
@@ -3568,7 +3546,7 @@ func (n *threeHopNetwork) sendThreeHopPayment(t *testing.T) (*lnwire.UpdateAddHT
 	}
 
 	err = n.carolServer.registry.AddInvoice(
-		context.Background(), *invoice, htlc.PaymentHash,
+		t.Context(), *invoice, htlc.PaymentHash,
 	)
 	require.NoError(t, err, "unable to add invoice in carol registry")
 
@@ -3826,9 +3804,7 @@ func newInterceptableSwitchTestContext(
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -3892,7 +3868,7 @@ func (c *interceptableSwitchTestContext) createTestPacket() *htlcPacket {
 
 func (c *interceptableSwitchTestContext) finish() {
 	if err := c.s.Stop(); err != nil {
-		c.t.Fatalf(err.Error())
+		c.t.Fatal(err)
 	}
 }
 
@@ -3951,7 +3927,7 @@ func TestSwitchHoldForward(t *testing.T) {
 	// Simulate an error during the composition of the failure message.
 	currentCallback := c.s.cfg.FetchLastChannelUpdate
 	c.s.cfg.FetchLastChannelUpdate = func(
-		lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
+		lnwire.ShortChannelID) (*lnwire.ChannelUpdate1, error) {
 
 		return nil, errors.New("cannot fetch update")
 	}
@@ -4289,14 +4265,19 @@ func TestSwitchDustForwarding(t *testing.T) {
 
 	// We'll test that once the default threshold is exceeded on the
 	// Alice -> Bob channel, either side's calls to SendHTLC will fail.
-	//
-	// Alice will send 354 HTLC's of 700sats. Bob will also send 354 HTLC's
-	// of 700sats.
-	numHTLCs := 354
+	numHTLCs := maxInflightHtlcs
 	aliceAttemptID, bobAttemptID := numHTLCs, numHTLCs
 	amt := lnwire.NewMSatFromSatoshis(700)
 	aliceBobFirstHop := n.aliceChannelLink.ShortChanID()
 
+	// We decreased the max number of inflight HTLCs therefore we also need
+	// do decrease the max fee exposure.
+	maxFeeExposure := lnwire.NewMSatFromSatoshis(74500)
+	n.aliceChannelLink.cfg.MaxFeeExposure = maxFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = maxFeeExposure
+
+	// Alice will send 50 HTLC's of 700sats. Bob will also send 50 HTLC's
+	// of 700sats.
 	sendDustHtlcs(t, n, true, amt, aliceBobFirstHop, numHTLCs)
 	sendDustHtlcs(t, n, false, amt, aliceBobFirstHop, numHTLCs)
 
@@ -4318,22 +4299,13 @@ func TestSwitchDustForwarding(t *testing.T) {
 		OnionBlob:   blob,
 	}
 
-	checkAlmostDust := func(link *channelLink, mbox MailBox,
-		whoseCommit lntypes.ChannelParty) bool {
+	// This is the expected dust without taking the commitfee into account.
+	expectedDust := maxInflightHtlcs * 2 * amt
 
-		timeout := time.After(15 * time.Second)
-		pollInterval := 300 * time.Millisecond
-		expectedDust := 354 * 2 * amt
+	assertAlmostDust := func(link *channelLink, mbox MailBox,
+		whoseCommit lntypes.ChannelParty) {
 
-		for {
-			<-time.After(pollInterval)
-
-			select {
-			case <-timeout:
-				return false
-			default:
-			}
-
+		err := wait.NoError(func() error {
 			linkDust := link.getDustSum(
 				whoseCommit, fn.None[chainfee.SatPerKWeight](),
 			)
@@ -4347,11 +4319,13 @@ func TestSwitchDustForwarding(t *testing.T) {
 			}
 
 			if totalDust == expectedDust {
-				break
+				return nil
 			}
-		}
 
-		return true
+			return fmt.Errorf("got totalDust=%v, expectedDust=%v",
+				totalDust, expectedDust)
+		}, 15*time.Second)
+		require.NoError(t, err, "timeout checking dust")
 	}
 
 	// Wait until Bob is almost at the fee threshold.
@@ -4359,14 +4333,15 @@ func TestSwitchDustForwarding(t *testing.T) {
 		n.firstBobChannelLink.ChanID(),
 		n.firstBobChannelLink.ShortChanID(),
 	)
-	require.True(
-		t, checkAlmostDust(
-			n.firstBobChannelLink, bobMbox, lntypes.Local,
-		),
-	)
+	assertAlmostDust(n.firstBobChannelLink, bobMbox, lntypes.Local)
 
 	// Sending one more HTLC should fail. SendHTLC won't error, but the
-	// HTLC should be failed backwards.
+	// HTLC should be failed backwards. When sending we only check for the
+	// dust amount without the commitment fee. When the HTLC is added to the
+	// commitment state (link) we also take into account the commitment fee
+	// and with a fee of 6000 sat/kw and a commitment size of 724 (non
+	// anchor channel) we are overexposed in fees (maxFeeExposure) that's
+	// why the HTLC is failed back.
 	err = n.bobServer.htlcSwitch.SendHTLC(
 		aliceBobFirstHop, uint64(bobAttemptID), failingHtlc,
 	)
@@ -4412,9 +4387,7 @@ func TestSwitchDustForwarding(t *testing.T) {
 		aliceBobFirstHop, uint64(bobAttemptID), nondustHtlc,
 	)
 	require.NoError(t, err)
-	require.True(t, checkAlmostDust(
-		n.firstBobChannelLink, bobMbox, lntypes.Local,
-	))
+	assertAlmostDust(n.firstBobChannelLink, bobMbox, lntypes.Local)
 
 	// Check that the HTLC failed.
 	bobResultChan, err = n.bobServer.htlcSwitch.GetAttemptResult(
@@ -4492,11 +4465,7 @@ func TestSwitchDustForwarding(t *testing.T) {
 	aliceMbox := aliceOrch.GetOrCreateMailBox(
 		n.aliceChannelLink.ChanID(), n.aliceChannelLink.ShortChanID(),
 	)
-	require.True(
-		t, checkAlmostDust(
-			n.aliceChannelLink, aliceMbox, lntypes.Remote,
-		),
-	)
+	assertAlmostDust(n.aliceChannelLink, aliceMbox, lntypes.Remote)
 
 	err = n.aliceServer.htlcSwitch.SendHTLC(
 		n.aliceChannelLink.ShortChanID(), uint64(aliceAttemptID),
@@ -4522,8 +4491,8 @@ func TestSwitchDustForwarding(t *testing.T) {
 }
 
 // sendDustHtlcs is a helper function used to send many dust HTLC's to test the
-// Switch's dust-threshold logic. It takes a boolean denoting whether or not
-// Alice is the sender.
+// Switch's channel-max-fee-exposure logic. It takes a boolean denoting whether
+// or not Alice is the sender.
 func sendDustHtlcs(t *testing.T, n *threeHopNetwork, alice bool,
 	amt lnwire.MilliSatoshi, sid lnwire.ShortChannelID, numHTLCs int) {
 
@@ -4920,9 +4889,7 @@ func testSwitchForwardFailAlias(t *testing.T, zeroConf bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)
@@ -4996,9 +4963,7 @@ func testSwitchForwardFailAlias(t *testing.T, zeroConf bool) {
 	err = cdb.Close()
 	require.NoError(t, err)
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err)
@@ -5136,9 +5101,7 @@ func testSwitchAliasFailAdd(t *testing.T, zeroConf, private, useAlias bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	defer cdb.Close()
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)
@@ -5477,9 +5440,7 @@ func testSwitchAliasInterceptFail(t *testing.T, zeroConf bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)

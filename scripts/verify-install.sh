@@ -21,20 +21,18 @@ MIN_REQUIRED_SIGNATURES=5
 KEYS=()
 KEYS+=("F4FC70F07310028424EFC20A8E4256593F177720 guggero")
 KEYS+=("15E7ECF257098A4EF91655EB4CA7FE54A6213C91 carlaKC")
-KEYS+=("E4D85299674B2D31FAA1892E372CBD7633C61696 roasbeef")
-KEYS+=("729E9D9D92C75A5FBFEEE057B5DD717BEF7CA5B1 wpaulino")
-KEYS+=("7E81EF6B9989A9CC93884803118759E83439A9B1 Crypt-iQ")
+KEYS+=("A5B61896952D9FDA83BC054CDC42612E89237182 roasbeef")
 KEYS+=("9FC6B0BFD597A94DBF09708280E5375C094198D8 bhandras")
-KEYS+=("E97A1AB6C77A1D2B72F50A6F90E00CCB1C74C611 arshbot")
-KEYS+=("EB13A98091E8D67CDD7FC5A7E9FE7FE00AD163A4 positiveblue")
 KEYS+=("26984CB69EB8C4A26196F7A4D7D916376026F177 ellemouton")
-KEYS+=("FE5E159A70C436D6AF4D2887B1F8848557AA29D2 ffranr")
+KEYS+=("C97AAA1470F979878F7A6DEDC3440ACF100A33B4 ffranr")
 KEYS+=("4DC235556B18694E08518DBB671103D881A5F0E4 sputn1ck")
-KEYS+=("187F6ADD93AE3B0CF335AA6AB984570980684DCC ViktorTigerstrom")
 KEYS+=("E85497D2DBA0EB9ADB0024279BCD95C4FF296868 yyforyongyu")
 KEYS+=("32F7EA1E7A0339F7D37164B9F82D456EA023C9BF hieblmi")
 KEYS+=("5295A477FFC8064D7057B191FA7E65C951F12439 proofofkeags")
 KEYS+=("3E9BD4436C288039CA827A9200C9E2BC2E45666F suheb")
+KEYS+=("5F75437E11695F86D50C11BB1AFF9C4DCED6D666 ziggie1984")
+KEYS+=("C20A78516A0944900EBFCA29961CC8259AE675D4 ViktorT-11")
+KEYS+=("1583B601BB57CC7CD2DF8A87E08DEA9B12B66AF6 georgetsagk")
 
 TEMP_DIR=$(mktemp -d /tmp/lnd-sig-verification-XXXXXX)
 
@@ -98,14 +96,20 @@ function import_keys() {
 function verify_signatures() {
   # Download the JSON of the release itself. That'll contain the release ID we
   # need for the next call.
-  RELEASE_JSON=$(curl -L -s -H "$HEADER_JSON" "$RELEASE_URL/$VERSION")
+  RELEASE_JSON=$(wget -q --header="$HEADER_JSON" -O - "$RELEASE_URL/$VERSION") || {
+    echo "ERROR: Failed to download release JSON from $RELEASE_URL/$VERSION"
+    exit 1
+  }
 
   TAG_NAME=$(echo $RELEASE_JSON | jq -r '.tag_name')
   RELEASE_ID=$(echo $RELEASE_JSON | jq -r '.id')
   echo "Release $TAG_NAME found with ID $RELEASE_ID"
 
   # Now download the asset list and filter by the manifest and the signatures.
-  ASSETS=$(curl -L -s -H "$HEADER_GH_JSON" "$API_URL/$RELEASE_ID" | jq -c '.assets[]')
+  ASSETS=$(wget -q --header="$HEADER_GH_JSON" -O - "$API_URL/$RELEASE_ID" | jq -c '.assets[]') || {
+    echo "ERROR: Failed to download asset list from $API_URL/$RELEASE_ID"
+    exit 1
+  }
   MANIFEST=$(echo $ASSETS | jq -r "$MANIFEST_SELECTOR")
   SIGNATURES=$(echo $ASSETS | jq -r "$SIGNATURE_SELECTOR")
 
@@ -119,11 +123,17 @@ function verify_signatures() {
   # Download the main "manifest-*.txt" and all "manifest-*.sig" files containing
   # the detached signatures.
   echo "Downloading $MANIFEST"
-  curl -L -s -o "$TEMP_DIR/$MANIFEST" "$RELEASE_URL/download/$VERSION/$MANIFEST"
+  wget -q -O "$TEMP_DIR/$MANIFEST" "$RELEASE_URL/download/$VERSION/$MANIFEST" || {
+    echo "ERROR: Failed to download $MANIFEST from $RELEASE_URL/download/$VERSION/$MANIFEST"
+    exit 1
+  }
 
   for signature in $SIGNATURES; do
     echo "Downloading $signature"
-    curl -L -s -o "$TEMP_DIR/$signature" "$RELEASE_URL/download/$VERSION/$signature"
+    wget -q -O "$TEMP_DIR/$signature" "$RELEASE_URL/download/$VERSION/$signature" || {
+      echo "ERROR: Failed to download $signature from $RELEASE_URL/download/$VERSION/$signature"
+      exit 1
+    }
   done
 
   echo ""
@@ -162,7 +172,12 @@ function verify_signatures() {
     # Run the actual verification.
     gpg --homedir "$TEMP_DIR" --no-default-keyring --keyring "$KEYRING" --status-fd=1 \
       --verify "$TEMP_DIR/$signature" "$TEMP_DIR/$MANIFEST" \
-      > "$STATUS_FILE" 2>&1 || { echo "ERROR: Invalid signature!"; exit 1; } 
+      > "$STATUS_FILE" 2>&1 || {
+        echo "ERROR: Invalid signature $signature from user $USERNAME!"
+        echo "  GPG output:"
+        cat "$STATUS_FILE" | sed 's/^/    /'
+        exit 1
+      }
 
     echo "Verifying $signature of user $USERNAME against key ring $KEYRING"
     if grep -q "Good signature" "$STATUS_FILE"; then
@@ -265,7 +280,7 @@ shift
 verify_version "$VERSION"
 
 # Make sure we have all tools needed for the verification.
-check_command curl
+check_command wget
 check_command jq
 check_command gpg
 

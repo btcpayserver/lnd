@@ -12,7 +12,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -199,11 +199,11 @@ func newMockOutputLeaser() *mockOutputLeaser {
 }
 
 func (m *mockOutputLeaser) LeaseOutput(_ wtxmgr.LockID, o wire.OutPoint,
-	t time.Duration) (time.Time, []byte, btcutil.Amount, error) {
+	t time.Duration) (time.Time, error) {
 
 	m.leasedOutputs[o] = struct{}{}
 
-	return time.Now().Add(t), nil, 0, nil
+	return time.Now().Add(t), nil
 }
 
 func (m *mockOutputLeaser) ReleaseOutput(_ wtxmgr.LockID,

@@ -2,13 +2,14 @@ package routing
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -165,13 +166,14 @@ func (m *mockGraph) addChannel(id uint64, node1id, node2id byte,
 // forEachNodeChannel calls the callback for every channel of the given node.
 //
 // NOTE: Part of the Graph interface.
-func (m *mockGraph) ForEachNodeChannel(nodePub route.Vertex,
-	cb func(channel *channeldb.DirectedChannel) error) error {
+func (m *mockGraph) ForEachNodeDirectedChannel(_ context.Context,
+	nodePub route.Vertex, cb func(channel *graphdb.DirectedChannel) error,
+	_ func()) error {
 
 	// Look up the mock node.
 	node, ok := m.nodes[nodePub]
 	if !ok {
-		return channeldb.ErrGraphNodeNotFound
+		return graphdb.ErrGraphNodeNotFound
 	}
 
 	// Iterate over all of its channels.
@@ -188,7 +190,7 @@ func (m *mockGraph) ForEachNodeChannel(nodePub route.Vertex,
 
 		// Call the per channel callback.
 		err := cb(
-			&channeldb.DirectedChannel{
+			&graphdb.DirectedChannel{
 				ChannelID:    channel.id,
 				IsNode1:      nodePub == node1,
 				OtherNode:    peer,
@@ -221,10 +223,21 @@ func (m *mockGraph) sourceNode() route.Vertex {
 // fetchNodeFeatures returns the features of the given node.
 //
 // NOTE: Part of the Graph interface.
-func (m *mockGraph) FetchNodeFeatures(nodePub route.Vertex) (
-	*lnwire.FeatureVector, error) {
+func (m *mockGraph) FetchNodeFeatures(_ context.Context,
+	_ route.Vertex) (*lnwire.FeatureVector, error) {
 
 	return lnwire.EmptyFeatureVector(), nil
+}
+
+// GraphSession will provide the call-back with access to a
+// graphdb.NodeTraverser instance which can be used to perform queries against
+// the channel graph.
+//
+// NOTE: Part of the GraphSessionFactory interface.
+func (m *mockGraph) GraphSession(_ context.Context,
+	cb func(graph graphdb.NodeTraverser) error, _ func()) error {
+
+	return cb(m)
 }
 
 // htlcResult describes the resolution of an htlc. If failure is nil, the htlc

@@ -2,6 +2,7 @@ package netann_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -12,12 +13,15 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/netann"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,18 +103,28 @@ func createEdgePolicies(t *testing.T, channel *channeldb.OpenChannel,
 	// bit.
 	dir2 |= lnwire.ChanUpdateDirection
 
-	return &models.ChannelEdgeInfo{
-			ChannelPoint:  channel.FundingOutpoint,
-			NodeKey1Bytes: pubkey1,
-			NodeKey2Bytes: pubkey2,
-		},
+	pubkey1Vertex, err := route.NewVertexFromBytes(pubkey1[:])
+	require.NoError(t, err)
+	pubkey2Vertex, err := route.NewVertexFromBytes(pubkey2[:])
+	require.NoError(t, err)
+
+	edgeInfo, err := models.NewV1Channel(
+		channel.ShortChanID().ToUint64(), chainhash.Hash{},
+		pubkey1Vertex, pubkey2Vertex, &models.ChannelV1Fields{},
+		models.WithChannelPoint(channel.FundingOutpoint),
+	)
+	require.NoError(t, err)
+
+	return edgeInfo,
 		&models.ChannelEdgePolicy{
+			Version:      lnwire.GossipVersion1,
 			ChannelID:    channel.ShortChanID().ToUint64(),
 			ChannelFlags: dir1,
 			LastUpdate:   time.Now(),
 			SigBytes:     testSigBytes,
 		},
 		&models.ChannelEdgePolicy{
+			Version:      lnwire.GossipVersion1,
 			ChannelID:    channel.ShortChanID().ToUint64(),
 			ChannelFlags: dir2,
 			LastUpdate:   time.Now(),
@@ -126,11 +140,11 @@ type mockGraph struct {
 	chanPols2 map[wire.OutPoint]*models.ChannelEdgePolicy
 	sidToCid  map[lnwire.ShortChannelID]wire.OutPoint
 
-	updates chan *lnwire.ChannelUpdate
+	updates chan *lnwire.ChannelUpdate1
 }
 
-func newMockGraph(t *testing.T, numChannels int,
-	startActive, startEnabled bool, pubKey *btcec.PublicKey) *mockGraph {
+func newMockGraph(t *testing.T, numChannels int, startEnabled bool,
+	pubKey *btcec.PublicKey) *mockGraph {
 
 	g := &mockGraph{
 		channels:  make([]*channeldb.OpenChannel, 0, numChannels),
@@ -138,7 +152,7 @@ func newMockGraph(t *testing.T, numChannels int,
 		chanPols1: make(map[wire.OutPoint]*models.ChannelEdgePolicy),
 		chanPols2: make(map[wire.OutPoint]*models.ChannelEdgePolicy),
 		sidToCid:  make(map[lnwire.ShortChannelID]wire.OutPoint),
-		updates:   make(chan *lnwire.ChannelUpdate, 2*numChannels),
+		updates:   make(chan *lnwire.ChannelUpdate1, 2*numChannels),
 	}
 
 	for i := 0; i < numChannels; i++ {
@@ -160,7 +174,8 @@ func (g *mockGraph) FetchAllOpenChannels() ([]*channeldb.OpenChannel, error) {
 }
 
 func (g *mockGraph) FetchChannelEdgesByOutpoint(
-	op *wire.OutPoint) (*models.ChannelEdgeInfo,
+	_ context.Context, op *wire.OutPoint) (
+	*models.ChannelEdgeInfo,
 	*models.ChannelEdgePolicy, *models.ChannelEdgePolicy, error) {
 
 	g.mu.Lock()
@@ -168,7 +183,7 @@ func (g *mockGraph) FetchChannelEdgesByOutpoint(
 
 	info, ok := g.chanInfos[*op]
 	if !ok {
-		return nil, nil, nil, channeldb.ErrEdgeNotFound
+		return nil, nil, nil, graphdb.ErrEdgeNotFound
 	}
 
 	pol1 := g.chanPols1[*op]
@@ -177,7 +192,7 @@ func (g *mockGraph) FetchChannelEdgesByOutpoint(
 	return info, pol1, pol2, nil
 }
 
-func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate,
+func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate1,
 	op *wire.OutPoint, private bool) error {
 
 	g.mu.Lock()
@@ -211,6 +226,7 @@ func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate,
 	timestamp := time.Unix(int64(update.Timestamp), 0)
 
 	policy := &models.ChannelEdgePolicy{
+		Version:      lnwire.GossipVersion1,
 		ChannelID:    update.ShortChannelID.ToUint64(),
 		ChannelFlags: update.ChannelFlags,
 		LastUpdate:   timestamp,
@@ -319,9 +335,7 @@ func newManagerCfg(t *testing.T, numChannels int,
 	require.NoError(t, err, "unable to generate key pair")
 	privKeySigner := keychain.NewPrivKeyMessageSigner(privKey, testKeyLoc)
 
-	graph := newMockGraph(
-		t, numChannels, startEnabled, startEnabled, privKey.PubKey(),
-	)
+	graph := newMockGraph(t, numChannels, startEnabled, privKey.PubKey())
 	htlcSwitch := newMockSwitch()
 
 	cfg := &netann.ChanStatusConfig{
@@ -697,7 +711,7 @@ var stateMachineTests = []stateMachineTest{
 			// Request that they be enabled, which should return an
 			// error as the graph doesn't have an edge for them.
 			h.assertEnables(
-				unknownChans, channeldb.ErrEdgeNotFound, false,
+				unknownChans, graphdb.ErrEdgeNotFound, false,
 			)
 			// No updates should be sent as a result of the failure.
 			h.assertNoUpdates(h.safeDisableTimeout)
@@ -717,7 +731,7 @@ var stateMachineTests = []stateMachineTest{
 			// Request that they be disabled, which should return an
 			// error as the graph doesn't have an edge for them.
 			h.assertDisables(
-				unknownChans, channeldb.ErrEdgeNotFound, false,
+				unknownChans, graphdb.ErrEdgeNotFound, false,
 			)
 			// No updates should be sent as a result of the failure.
 			h.assertNoUpdates(h.safeDisableTimeout)
@@ -747,7 +761,9 @@ var stateMachineTests = []stateMachineTest{
 
 			// Check that trying to enable the channel with unknown
 			// edges results in a failure.
-			h.assertEnables(newChans, channeldb.ErrEdgeNotFound, false)
+			h.assertEnables(
+				newChans, graphdb.ErrEdgeNotFound, false,
+			)
 
 			// Now, insert edge policies for the channel into the
 			// graph, starting with the channel enabled, and mark
@@ -794,7 +810,9 @@ var stateMachineTests = []stateMachineTest{
 
 			// Check that trying to enable the channel with unknown
 			// edges results in a failure.
-			h.assertDisables(rmChans, channeldb.ErrEdgeNotFound, false)
+			h.assertDisables(
+				rmChans, graphdb.ErrEdgeNotFound, false,
+			)
 		},
 	},
 	{

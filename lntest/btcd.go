@@ -74,6 +74,11 @@ func (b BtcdBackendConfig) Name() string {
 	return "btcd"
 }
 
+// P2PAddr return bitcoin p2p ip:port.
+func (b BtcdBackendConfig) P2PAddr() (string, error) {
+	return b.harness.P2PAddress(), nil
+}
+
 // NewBackend starts a new rpctest.Harness and returns a BtcdBackendConfig for
 // that node. miner should be set to the P2P address of the miner to connect
 // to.
@@ -94,6 +99,14 @@ func NewBackend(miner string, netParams *chaincfg.Params) (
 		"--nobanning",
 		// Don't disconnect if a reply takes too long.
 		"--nostalldetect",
+
+		// The default max num of websockets is 25, but the closed
+		// connections are not cleaned up immediately so we double the
+		// size.
+		//
+		// TODO(yy): fix this in `btcd` to clean up the stale
+		// connections.
+		"--rpcmaxwebsockets=50",
 	}
 	chainBackend, err := rpctest.New(
 		netParams, nil, args, node.GetBtcdBinary(),

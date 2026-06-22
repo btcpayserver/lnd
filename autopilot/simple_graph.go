@@ -1,5 +1,11 @@
 package autopilot
 
+import (
+	"context"
+
+	"github.com/lightningnetwork/lnd/routing/route"
+)
+
 // diameterCutoff is used to discard nodes in the diameter calculation.
 // It is the multiplier for the eccentricity of the highest-degree node,
 // serving as a cutoff to discard all nodes with a smaller hop distance. This
@@ -20,7 +26,7 @@ type SimpleGraph struct {
 // NewSimpleGraph creates a simplified graph from the current channel graph.
 // Returns an error if the channel graph iteration fails due to underlying
 // failure.
-func NewSimpleGraph(g ChannelGraph) (*SimpleGraph, error) {
+func NewSimpleGraph(ctx context.Context, g ChannelGraph) (*SimpleGraph, error) {
 	nodes := make(map[NodeID]int)
 	adj := make(map[int][]int)
 	nextIndex := 0
@@ -29,8 +35,8 @@ func NewSimpleGraph(g ChannelGraph) (*SimpleGraph, error) {
 	// The returned index is then used to create a simplified adjacency list
 	// where each node is identified by its index instead of its pubkey, and
 	// also to create a mapping from node index to node pubkey.
-	getNodeIndex := func(node Node) int {
-		key := NodeID(node.PubKey())
+	getNodeIndex := func(node route.Vertex) int {
+		key := NodeID(node)
 		nodeIndex, ok := nodes[key]
 
 		if !ok {
@@ -42,17 +48,23 @@ func NewSimpleGraph(g ChannelGraph) (*SimpleGraph, error) {
 		return nodeIndex
 	}
 
-	// Iterate over each node and each channel and update the adj and the node
-	// index.
-	err := g.ForEachNode(func(node Node) error {
-		u := getNodeIndex(node)
+	// Iterate over each node and each channel and update the adj and the
+	// node index.
+	err := g.ForEachNodesChannels(ctx, func(_ context.Context,
+		node Node, channels []*ChannelEdge) error {
 
-		return node.ForEachChannel(func(edge ChannelEdge) error {
+		u := getNodeIndex(node.PubKey())
+
+		for _, edge := range channels {
 			v := getNodeIndex(edge.Peer)
-
 			adj[u] = append(adj[u], v)
-			return nil
-		})
+		}
+
+		return nil
+	}, func() {
+		clear(adj)
+		clear(nodes)
+		nextIndex = 0
 	})
 	if err != nil {
 		return nil, err
@@ -85,9 +97,7 @@ func NewSimpleGraph(g ChannelGraph) (*SimpleGraph, error) {
 func maxVal(mapping map[int]uint32) uint32 {
 	maxValue := uint32(0)
 	for _, value := range mapping {
-		if maxValue < value {
-			maxValue = value
-		}
+		maxValue = max(maxValue, value)
 	}
 	return maxValue
 }

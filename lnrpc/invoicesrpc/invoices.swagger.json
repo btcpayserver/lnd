@@ -318,6 +318,7 @@
         "route_hints": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcRouteHint"
           },
           "description": "Route hints that can each be individually used to assist in reaching the\ninvoice's destination."
@@ -533,6 +534,14 @@
             "format": "byte"
           },
           "description": "A list of node IDs of nodes that should not be used in any of our generated\nblinded paths."
+        },
+        "incoming_channel_list": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uint64"
+          },
+          "description": "The chained channels list specified via channel id (separated by commas),\nstarting from a channel owned by the receiver node."
         }
       }
     },
@@ -648,6 +657,7 @@
         "route_hints": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcRouteHint"
           },
           "description": "Route hints that can each be individually used to assist in reaching the\ninvoice's destination."
@@ -688,6 +698,7 @@
         "htlcs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcInvoiceHTLC"
           },
           "description": "List of HTLCs paying to this invoice [EXPERIMENTAL].\nNote: Output only, don't specify for creating an invoice."
@@ -812,6 +823,7 @@
         "hop_hints": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcHopHint"
           },
           "description": "A list of hop hints that when chained together can assist in reaching a\nspecific destination."
@@ -821,14 +833,11 @@
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -843,6 +852,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }

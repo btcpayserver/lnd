@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -14,8 +15,31 @@ import (
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
+)
+
+const (
+	fallbackVersionWitness    = txscript.BaseSegwitWitnessVersion
+	fallbackVersionTaproot    = txscript.TaprootWitnessVersion
+	fallbackVersionPubkeyHash = 17
+	fallbackVersionScriptHash = 18
+)
+
+var (
+	// ErrInvalidUTF8Description is returned if the invoice description is
+	// not valid UTF-8.
+	ErrInvalidUTF8Description = errors.New("description is not valid UTF-8")
+
+	// ErrLengthNotMultipleOfHopHintLength is returned if the length of the
+	// route hint data is not a multiple of the hop hint length.
+	ErrLengthNotMultipleOfHopHint = errors.New("length is not a multiple " +
+		"of hop hint length")
+
+	// ErrEmptyRouteHint is returned if the route hint field contains no hop
+	// data.
+	ErrEmptyRouteHint = errors.New("route hint field contains no hop data")
 )
 
 // DecodeOption is a type that can be used to supply functional options to the
@@ -446,6 +470,10 @@ func parseDescription(data []byte) (*string, error) {
 		return nil, err
 	}
 
+	if !utf8.Valid(base256Data) {
+		return nil, ErrInvalidUTF8Description
+	}
+
 	description := string(base256Data)
 
 	return &description, nil
@@ -509,7 +537,7 @@ func parseFallbackAddr(data []byte, net *chaincfg.Params) (btcutil.Address, erro
 
 	version := data[0]
 	switch version {
-	case 0:
+	case fallbackVersionWitness:
 		witness, err := bech32.ConvertBits(data[1:], 5, 8, false)
 		if err != nil {
 			return nil, err
@@ -528,7 +556,16 @@ func parseFallbackAddr(data []byte, net *chaincfg.Params) (btcutil.Address, erro
 		if err != nil {
 			return nil, err
 		}
-	case 17:
+	case fallbackVersionTaproot:
+		witness, err := bech32.ConvertBits(data[1:], 5, 8, false)
+		if err != nil {
+			return nil, err
+		}
+		addr, err = btcutil.NewAddressTaproot(witness, net)
+		if err != nil {
+			return nil, err
+		}
+	case fallbackVersionPubkeyHash:
 		pubKeyHash, err := bech32.ConvertBits(data[1:], 5, 8, false)
 		if err != nil {
 			return nil, err
@@ -538,7 +575,7 @@ func parseFallbackAddr(data []byte, net *chaincfg.Params) (btcutil.Address, erro
 		if err != nil {
 			return nil, err
 		}
-	case 18:
+	case fallbackVersionScriptHash:
 		scriptHash, err := bech32.ConvertBits(data[1:], 5, 8, false)
 		if err != nil {
 			return nil, err
@@ -565,8 +602,12 @@ func parseRouteHint(data []byte) ([]HopHint, error) {
 
 	// Check that base256Data is a multiple of hopHintLen.
 	if len(base256Data)%hopHintLen != 0 {
-		return nil, fmt.Errorf("expected length multiple of %d bytes, "+
-			"got %d", hopHintLen, len(base256Data))
+		return nil, ErrLengthNotMultipleOfHopHint
+	}
+
+	// Check for empty route hint
+	if len(base256Data) == 0 {
+		return nil, ErrEmptyRouteHint
 	}
 
 	var routeHint []HopHint

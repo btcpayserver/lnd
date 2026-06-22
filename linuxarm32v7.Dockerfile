@@ -1,4 +1,4 @@
-FROM golang:1.23.4-bullseye as builder
+FROM golang:1.26.3-bookworm as builder
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
@@ -6,7 +6,7 @@ ENV GODEBUG netdns=cgo
 
 # Install dependencies and build the binaries.
 RUN apt-get -y update && apt-get -y install git make wget \
-    && apt-get install -qq --no-install-recommends qemu qemu-user-static qemu-user binfmt-support
+    && apt-get install -qq --no-install-recommends qemu-user-static qemu-user binfmt-support
 
 RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-armhf" \
     && echo "01b54b934d5f5deb32aa4eb4b0f71d0e76324f4f0237cc262d59376bf2bdc269 /opt/tini" | sha256sum -c - \
@@ -17,15 +17,15 @@ WORKDIR /go/src/github.com/lightningnetwork/lnd
 COPY . .
 
 RUN make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc"
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc kvdb_sqlite"
 
 # Build loop binary
-RUN git clone --depth 1 --branch v0.29.0-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
+RUN git clone --depth 1 --branch v0.33.3-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
 WORKDIR /go/src/github.com/lightninglabs/loop/cmd
 
 RUN go install ./...
 # eof
-
+    
 
 # Force the builder machine to take make an arm runtime image. This is fine as long as the builder does not run any program
 FROM --platform=linux/arm/v7 arm32v7/debian:bullseye-slim as final

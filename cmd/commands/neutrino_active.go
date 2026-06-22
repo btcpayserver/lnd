@@ -6,8 +6,6 @@ package commands
 import (
 	"github.com/lightningnetwork/lnd/lnrpc/neutrinorpc"
 	"github.com/urfave/cli"
-
-	"strconv"
 )
 
 func getNeutrinoKitClient(ctx *cli.Context) (neutrinorpc.NeutrinoKitClient, func()) {
@@ -227,47 +225,6 @@ func getCFilter(ctx *cli.Context) error {
 	return nil
 }
 
-var getBlockHashCommand = cli.Command{
-	Name:        "getblockhash",
-	Usage:       "Get a block hash.",
-	Category:    "Neutrino",
-	Description: "Returns the header hash of a block at a given height.",
-	ArgsUsage:   "height",
-	Action:      actionDecorator(getBlockHash),
-}
-
-func getBlockHash(ctx *cli.Context) error {
-	ctxc := getContext()
-	args := ctx.Args()
-
-	// Display the command's help message if we do not have the expected
-	// number of arguments/flags.
-	if !args.Present() {
-		return cli.ShowCommandHelp(ctx, "getblockhash")
-	}
-
-	client, cleanUp := getNeutrinoKitClient(ctx)
-	defer cleanUp()
-
-	height, err := strconv.ParseInt(args.First(), 10, 32)
-	if err != nil {
-		return err
-	}
-
-	req := &neutrinorpc.GetBlockHashRequest{
-		Height: int32(height),
-	}
-
-	resp, err := client.GetBlockHash(ctxc, req)
-	if err != nil {
-		return err
-	}
-
-	printRespJSON(resp)
-
-	return nil
-}
-
 // neutrinoCommands will return the set of commands to enable for neutrinorpc
 // builds.
 func neutrinoCommands() []cli.Command {
@@ -284,7 +241,6 @@ func neutrinoCommands() []cli.Command {
 				isBannedCommand,
 				getBlockHeaderNeutrinoCommand,
 				getCFilterCommand,
-				getBlockHashCommand,
 			},
 		},
 	}

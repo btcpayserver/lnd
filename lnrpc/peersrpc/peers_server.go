@@ -116,7 +116,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterPeersServer(grpcServer, r)
 
-	log.Debugf("Peers RPC server successfully register with root " +
+	log.Debugf("Peers RPC server successfully registered with root " +
 		"gRPC server")
 
 	return nil
@@ -306,7 +306,7 @@ func (s *Server) updateFeatures(currentfeatures *lnwire.RawFeatureVector,
 
 // UpdateNodeAnnouncement allows the caller to update the node parameters
 // and broadcasts a new version of the node announcement to its peers.
-func (s *Server) UpdateNodeAnnouncement(_ context.Context,
+func (s *Server) UpdateNodeAnnouncement(ctx context.Context,
 	req *NodeAnnouncementUpdateRequest) (
 	*NodeAnnouncementUpdateResponse, error) {
 
@@ -393,7 +393,7 @@ func (s *Server) UpdateNodeAnnouncement(_ context.Context,
 	}
 
 	if err := s.cfg.UpdateNodeAnnouncement(
-		nodeAnnFeatures, nodeModifiers...,
+		ctx, nodeAnnFeatures, nodeModifiers...,
 	); err != nil {
 		return nil, err
 	}

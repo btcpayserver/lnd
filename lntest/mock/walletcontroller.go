@@ -16,7 +16,7 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -43,9 +43,9 @@ func (w *WalletController) BackEnd() string {
 	return "mock"
 }
 
-// FetchInputInfo will be called to get info about the inputs to the funding
+// FetchOutpointInfo will be called to get info about the inputs to the funding
 // transaction.
-func (w *WalletController) FetchInputInfo(
+func (w *WalletController) FetchOutpointInfo(
 	prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
 
 	utxo := &lnwallet.Utxo{
@@ -187,16 +187,17 @@ func (w *WalletController) ListUnspentWitness(int32, int32,
 
 // ListTransactionDetails currently returns dummy values.
 func (w *WalletController) ListTransactionDetails(int32, int32,
-	string) ([]*lnwallet.TransactionDetail, error) {
+	string, uint32, uint32) ([]*lnwallet.TransactionDetail,
+	uint64, uint64, error) {
 
-	return nil, nil
+	return nil, 0, 0, nil
 }
 
 // LeaseOutput returns the current time and a nil error.
 func (w *WalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, []byte, btcutil.Amount, error) {
+	time.Duration) (time.Time, error) {
 
-	return time.Now(), nil, 0, nil
+	return time.Now(), nil
 }
 
 // ReleaseOutput currently does nothing.
@@ -290,4 +291,12 @@ func (w *WalletController) RemoveDescendants(*wire.MsgTx) error {
 
 func (w *WalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	return nil
+}
+
+// FetchDerivationInfo queries for the wallet's knowledge of the passed
+// pkScript and constructs the derivation info and returns it.
+func (w *WalletController) FetchDerivationInfo(
+	pkScript []byte) (*psbt.Bip32Derivation, error) {
+
+	return nil, nil
 }

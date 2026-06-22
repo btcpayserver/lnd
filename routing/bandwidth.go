@@ -1,10 +1,11 @@
 package routing
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -24,9 +25,9 @@ type bandwidthHints interface {
 	availableChanBandwidth(channelID uint64,
 		amount lnwire.MilliSatoshi) (lnwire.MilliSatoshi, bool)
 
-	// firstHopCustomBlob returns the custom blob for the first hop of the
-	// payment, if available.
-	firstHopCustomBlob() fn.Option[tlv.Blob]
+	// isCustomHTLCPayment returns true if this payment is a custom payment.
+	// For custom payments policy checks might not be needed.
+	isCustomHTLCPayment() bool
 }
 
 // getLinkQuery is the function signature used to lookup a link.
@@ -63,16 +64,19 @@ func newBandwidthManager(graph Graph, sourceNode route.Vertex,
 
 	// First, we'll collect the set of outbound edges from the target
 	// source node and add them to our bandwidth manager's map of channels.
-	err := graph.ForEachNodeChannel(sourceNode,
-		func(channel *channeldb.DirectedChannel) error {
+	err := graph.ForEachNodeDirectedChannel(
+		context.TODO(), sourceNode,
+		func(channel *graphdb.DirectedChannel) error {
 			shortID := lnwire.NewShortChanIDFromInt(
 				channel.ChannelID,
 			)
 			manager.localChans[shortID] = struct{}{}
 
 			return nil
-		})
-
+		}, func() {
+			clear(manager.localChans)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -85,22 +89,18 @@ func newBandwidthManager(graph Graph, sourceNode route.Vertex,
 // queried is one of our local channels, so any failure to retrieve the link
 // is interpreted as the link being offline.
 func (b *bandwidthManager) getBandwidth(cid lnwire.ShortChannelID,
-	amount lnwire.MilliSatoshi) lnwire.MilliSatoshi {
+	amount lnwire.MilliSatoshi) (lnwire.MilliSatoshi, error) {
 
 	link, err := b.getLink(cid)
 	if err != nil {
-		// If the link isn't online, then we'll report that it has
-		// zero bandwidth.
-		log.Warnf("ShortChannelID=%v: link not found: %v", cid, err)
-		return 0
+		return 0, fmt.Errorf("error querying switch for link: %w", err)
 	}
 
 	// If the link is found within the switch, but it isn't yet eligible
 	// to forward any HTLCs, then we'll treat it as if it isn't online in
 	// the first place.
 	if !link.EligibleToForward() {
-		log.Warnf("ShortChannelID=%v: not eligible to forward", cid)
-		return 0
+		return 0, fmt.Errorf("link not eligible to forward")
 	}
 
 	// bandwidthResult is an inline type that we'll use to pass the
@@ -143,6 +143,13 @@ func (b *bandwidthManager) getBandwidth(cid lnwire.ShortChannelID,
 					"auxiliary bandwidth: %w", err))
 			}
 
+			// If the external traffic shaper is not handling the
+			// channel, we'll just return the original bandwidth and
+			// no custom amount.
+			if !auxBandwidth.IsHandled {
+				return fn.Ok(bandwidthResult{})
+			}
+
 			// We don't know the actual HTLC amount that will be
 			// sent using the custom channel. But we'll still want
 			// to make sure we can add another HTLC, using the
@@ -152,16 +159,14 @@ func (b *bandwidthManager) getBandwidth(cid lnwire.ShortChannelID,
 			// the max number of HTLCs on the channel. A proper
 			// balance check is done elsewhere.
 			return fn.Ok(bandwidthResult{
-				bandwidth:  auxBandwidth,
+				bandwidth:  auxBandwidth.Bandwidth,
 				htlcAmount: fn.Some[lnwire.MilliSatoshi](0),
 			})
 		},
 	).Unpack()
 	if err != nil {
-		log.Errorf("ShortChannelID=%v: failed to get bandwidth from "+
-			"external traffic shaper: %v", cid, err)
-
-		return 0
+		return 0, fmt.Errorf("failed to consult external traffic "+
+			"shaper: %w", err)
 	}
 
 	htlcAmount := result.htlcAmount.UnwrapOr(amount)
@@ -169,9 +174,8 @@ func (b *bandwidthManager) getBandwidth(cid lnwire.ShortChannelID,
 	// If our link isn't currently in a state where it can add another
 	// outgoing htlc, treat the link as unusable.
 	if err := link.MayAddOutgoingHtlc(htlcAmount); err != nil {
-		log.Warnf("ShortChannelID=%v: cannot add outgoing "+
-			"htlc with amount %v: %v", cid, htlcAmount, err)
-		return 0
+		return 0, fmt.Errorf("cannot add outgoing htlc to channel %v "+
+			"with amount %v: %w", cid, htlcAmount, err)
 	}
 
 	// If the external traffic shaper determined the bandwidth, we'll return
@@ -179,7 +183,7 @@ func (b *bandwidthManager) getBandwidth(cid lnwire.ShortChannelID,
 	// available on that channel).
 	reportedBandwidth := result.bandwidth.UnwrapOr(linkBandwidth)
 
-	return reportedBandwidth
+	return reportedBandwidth, nil
 }
 
 // availableChanBandwidth returns the total available bandwidth for a channel
@@ -194,11 +198,34 @@ func (b *bandwidthManager) availableChanBandwidth(channelID uint64,
 		return 0, false
 	}
 
-	return b.getBandwidth(shortID, amount), true
+	bandwidth, err := b.getBandwidth(shortID, amount)
+	if err != nil {
+		log.Warnf("failed to get bandwidth for channel %v: %v",
+			shortID, err)
+
+		return 0, true
+	}
+
+	return bandwidth, true
 }
 
-// firstHopCustomBlob returns the custom blob for the first hop of the payment,
-// if available.
-func (b *bandwidthManager) firstHopCustomBlob() fn.Option[tlv.Blob] {
-	return b.firstHopBlob
+// isCustomHTLCPayment returns true if this payment is a custom payment.
+// For custom payments policy checks might not be needed.
+func (b *bandwidthManager) isCustomHTLCPayment() bool {
+	return fn.MapOptionZ(b.firstHopBlob, func(blob tlv.Blob) bool {
+		customRecords, err := lnwire.ParseCustomRecords(blob)
+		if err != nil {
+			log.Warnf("failed to parse custom records when "+
+				"checking if payment is custom: %v", err)
+
+			return false
+		}
+
+		return fn.MapOptionZ(
+			b.trafficShaper,
+			func(s htlcswitch.AuxTrafficShaper) bool {
+				return s.IsCustomHTLC(customRecords)
+			},
+		)
+	})
 }

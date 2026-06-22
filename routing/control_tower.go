@@ -1,45 +1,14 @@
 package routing
 
 import (
+	"context"
 	"sync"
 
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/multimutex"
+	paymentsdb "github.com/lightningnetwork/lnd/payments/db"
 	"github.com/lightningnetwork/lnd/queue"
 )
-
-// dbMPPayment is an interface derived from channeldb.MPPayment that is used by
-// the payment lifecycle.
-type dbMPPayment interface {
-	// GetState returns the current state of the payment.
-	GetState() *channeldb.MPPaymentState
-
-	// Terminated returns true if the payment is in a final state.
-	Terminated() bool
-
-	// GetStatus returns the current status of the payment.
-	GetStatus() channeldb.PaymentStatus
-
-	// NeedWaitAttempts specifies whether the payment needs to wait for the
-	// outcome of an attempt.
-	NeedWaitAttempts() (bool, error)
-
-	// GetHTLCs returns all HTLCs of this payment.
-	GetHTLCs() []channeldb.HTLCAttempt
-
-	// InFlightHTLCs returns all HTLCs that are in flight.
-	InFlightHTLCs() []channeldb.HTLCAttempt
-
-	// AllowMoreAttempts is used to decide whether we can safely attempt
-	// more HTLCs for a given payment state. Return an error if the payment
-	// is in an unexpected state.
-	AllowMoreAttempts() (bool, error)
-
-	// TerminalInfo returns the settled HTLC attempt or the payment's
-	// failure reason.
-	TerminalInfo() (*channeldb.HTLCAttempt, *channeldb.FailureReason)
-}
 
 // ControlTower tracks all outgoing payments made, whose primary purpose is to
 // prevent duplicate payments to the same payment hash. In production, a
@@ -47,17 +16,23 @@ type dbMPPayment interface {
 // restarts. Payments are transitioned through various payment states, and the
 // ControlTower interface provides access to driving the state transitions.
 type ControlTower interface {
-	// This method checks that no succeeded payment exist for this payment
-	// hash.
-	InitPayment(lntypes.Hash, *channeldb.PaymentCreationInfo) error
+	// InitPayment initializes a new payment with the given payment hash and
+	// also notifies subscribers of the payment creation.
+	//
+	// NOTE: Subscribers should be notified by the new state of the payment.
+	InitPayment(context.Context, lntypes.Hash,
+		*paymentsdb.PaymentCreationInfo) error
 
 	// DeleteFailedAttempts removes all failed HTLCs from the db. It should
 	// be called for a given payment whenever all inflight htlcs are
 	// completed, and the payment has reached a final settled state.
-	DeleteFailedAttempts(lntypes.Hash) error
+	DeleteFailedAttempts(context.Context, lntypes.Hash) error
 
 	// RegisterAttempt atomically records the provided HTLCAttemptInfo.
-	RegisterAttempt(lntypes.Hash, *channeldb.HTLCAttemptInfo) error
+	//
+	// NOTE: Subscribers should be notified by the new state of the payment.
+	RegisterAttempt(context.Context, lntypes.Hash,
+		*paymentsdb.HTLCAttemptInfo) error
 
 	// SettleAttempt marks the given attempt settled with the preimage. If
 	// this is a multi shard payment, this might implicitly mean the the
@@ -67,16 +42,21 @@ type ControlTower interface {
 	// error to prevent us from making duplicate payments to the same
 	// payment hash. The provided preimage is atomically saved to the DB
 	// for record keeping.
-	SettleAttempt(lntypes.Hash, uint64, *channeldb.HTLCSettleInfo) (
-		*channeldb.HTLCAttempt, error)
+	//
+	// NOTE: Subscribers should be notified by the new state of the payment.
+	SettleAttempt(context.Context, lntypes.Hash, uint64,
+		*paymentsdb.HTLCSettleInfo) (*paymentsdb.HTLCAttempt, error)
 
 	// FailAttempt marks the given payment attempt failed.
-	FailAttempt(lntypes.Hash, uint64, *channeldb.HTLCFailInfo) (
-		*channeldb.HTLCAttempt, error)
+	//
+	// NOTE: Subscribers should be notified by the new state of the payment.
+	FailAttempt(context.Context, lntypes.Hash, uint64,
+		*paymentsdb.HTLCFailInfo) (*paymentsdb.HTLCAttempt, error)
 
 	// FetchPayment fetches the payment corresponding to the given payment
 	// hash.
-	FetchPayment(paymentHash lntypes.Hash) (dbMPPayment, error)
+	FetchPayment(ctx context.Context,
+		paymentHash lntypes.Hash) (paymentsdb.DBMPPayment, error)
 
 	// FailPayment transitions a payment into the Failed state, and records
 	// the ultimate reason the payment failed. Note that this should only
@@ -84,10 +64,14 @@ type ControlTower interface {
 	// invoking this method, InitPayment should return nil on its next call
 	// for this payment hash, allowing the user to make a subsequent
 	// payment.
-	FailPayment(lntypes.Hash, channeldb.FailureReason) error
+	//
+	// NOTE: Subscribers should be notified by the new state of the payment.
+	FailPayment(context.Context, lntypes.Hash,
+		paymentsdb.FailureReason) error
 
 	// FetchInFlightPayments returns all payments with status InFlight.
-	FetchInFlightPayments() ([]*channeldb.MPPayment, error)
+	FetchInFlightPayments(ctx context.Context) ([]*paymentsdb.MPPayment,
+		error)
 
 	// SubscribePayment subscribes to updates for the payment with the given
 	// hash. A first update with the current state of the payment is always
@@ -151,7 +135,7 @@ func (s *controlTowerSubscriberImpl) Updates() <-chan interface{} {
 // controlTower is persistent implementation of ControlTower to restrict
 // double payment sending.
 type controlTower struct {
-	db *channeldb.PaymentControl
+	db paymentsdb.DB
 
 	// subscriberIndex is used to provide a unique id for each subscriber
 	// to all payments. This is used to easily remove the subscriber when
@@ -168,7 +152,7 @@ type controlTower struct {
 }
 
 // NewControlTower creates a new instance of the controlTower.
-func NewControlTower(db *channeldb.PaymentControl) ControlTower {
+func NewControlTower(db paymentsdb.DB) ControlTower {
 	return &controlTower{
 		db: db,
 		subscribersAllPayments: make(
@@ -183,10 +167,10 @@ func NewControlTower(db *channeldb.PaymentControl) ControlTower {
 // making sure it does not already exist as an in-flight payment. Then this
 // method returns successfully, the payment is guaranteed to be in the
 // Initiated state.
-func (p *controlTower) InitPayment(paymentHash lntypes.Hash,
-	info *channeldb.PaymentCreationInfo) error {
+func (p *controlTower) InitPayment(ctx context.Context,
+	paymentHash lntypes.Hash, info *paymentsdb.PaymentCreationInfo) error {
 
-	err := p.db.InitPayment(paymentHash, info)
+	err := p.db.InitPayment(ctx, paymentHash, info)
 	if err != nil {
 		return err
 	}
@@ -196,7 +180,7 @@ func (p *controlTower) InitPayment(paymentHash lntypes.Hash,
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.FetchPayment(paymentHash)
+	payment, err := p.db.FetchPayment(ctx, paymentHash)
 	if err != nil {
 		return err
 	}
@@ -208,19 +192,21 @@ func (p *controlTower) InitPayment(paymentHash lntypes.Hash,
 
 // DeleteFailedAttempts deletes all failed htlcs if the payment was
 // successfully settled.
-func (p *controlTower) DeleteFailedAttempts(paymentHash lntypes.Hash) error {
-	return p.db.DeleteFailedAttempts(paymentHash)
+func (p *controlTower) DeleteFailedAttempts(ctx context.Context,
+	paymentHash lntypes.Hash) error {
+
+	return p.db.DeleteFailedAttempts(ctx, paymentHash)
 }
 
 // RegisterAttempt atomically records the provided HTLCAttemptInfo to the
 // DB.
-func (p *controlTower) RegisterAttempt(paymentHash lntypes.Hash,
-	attempt *channeldb.HTLCAttemptInfo) error {
+func (p *controlTower) RegisterAttempt(ctx context.Context,
+	paymentHash lntypes.Hash, attempt *paymentsdb.HTLCAttemptInfo) error {
 
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.RegisterAttempt(paymentHash, attempt)
+	payment, err := p.db.RegisterAttempt(ctx, paymentHash, attempt)
 	if err != nil {
 		return err
 	}
@@ -234,14 +220,17 @@ func (p *controlTower) RegisterAttempt(paymentHash lntypes.Hash,
 // SettleAttempt marks the given attempt settled with the preimage. If
 // this is a multi shard payment, this might implicitly mean the the
 // full payment succeeded.
-func (p *controlTower) SettleAttempt(paymentHash lntypes.Hash,
-	attemptID uint64, settleInfo *channeldb.HTLCSettleInfo) (
-	*channeldb.HTLCAttempt, error) {
+func (p *controlTower) SettleAttempt(ctx context.Context,
+	paymentHash lntypes.Hash, attemptID uint64,
+	settleInfo *paymentsdb.HTLCSettleInfo) (*paymentsdb.HTLCAttempt,
+	error) {
 
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.SettleAttempt(paymentHash, attemptID, settleInfo)
+	payment, err := p.db.SettleAttempt(
+		ctx, paymentHash, attemptID, settleInfo,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -253,14 +242,14 @@ func (p *controlTower) SettleAttempt(paymentHash lntypes.Hash,
 }
 
 // FailAttempt marks the given payment attempt failed.
-func (p *controlTower) FailAttempt(paymentHash lntypes.Hash,
-	attemptID uint64, failInfo *channeldb.HTLCFailInfo) (
-	*channeldb.HTLCAttempt, error) {
+func (p *controlTower) FailAttempt(ctx context.Context,
+	paymentHash lntypes.Hash, attemptID uint64,
+	failInfo *paymentsdb.HTLCFailInfo) (*paymentsdb.HTLCAttempt, error) {
 
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.FailAttempt(paymentHash, attemptID, failInfo)
+	payment, err := p.db.FailAttempt(ctx, paymentHash, attemptID, failInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -272,23 +261,27 @@ func (p *controlTower) FailAttempt(paymentHash lntypes.Hash,
 }
 
 // FetchPayment fetches the payment corresponding to the given payment hash.
-func (p *controlTower) FetchPayment(paymentHash lntypes.Hash) (
-	dbMPPayment, error) {
+func (p *controlTower) FetchPayment(ctx context.Context,
+	paymentHash lntypes.Hash) (
+	paymentsdb.DBMPPayment, error) {
 
-	return p.db.FetchPayment(paymentHash)
+	return p.db.FetchPayment(ctx, paymentHash)
 }
 
 // FailPayment transitions a payment into the Failed state, and records the
 // reason the payment failed. After invoking this method, InitPayment should
 // return nil on its next call for this payment hash, allowing the switch to
 // make a subsequent payment.
-func (p *controlTower) FailPayment(paymentHash lntypes.Hash,
-	reason channeldb.FailureReason) error {
+//
+// NOTE: This method will overwrite the failure reason if the payment is already
+// failed.
+func (p *controlTower) FailPayment(ctx context.Context,
+	paymentHash lntypes.Hash, reason paymentsdb.FailureReason) error {
 
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.Fail(paymentHash, reason)
+	payment, err := p.db.Fail(ctx, paymentHash, reason)
 	if err != nil {
 		return err
 	}
@@ -300,8 +293,10 @@ func (p *controlTower) FailPayment(paymentHash lntypes.Hash,
 }
 
 // FetchInFlightPayments returns all payments with status InFlight.
-func (p *controlTower) FetchInFlightPayments() ([]*channeldb.MPPayment, error) {
-	return p.db.FetchInFlightPayments()
+func (p *controlTower) FetchInFlightPayments(
+	ctx context.Context) ([]*paymentsdb.MPPayment, error) {
+
+	return p.db.FetchInFlightPayments(ctx)
 }
 
 // SubscribePayment subscribes to updates for the payment with the given hash. A
@@ -310,12 +305,14 @@ func (p *controlTower) FetchInFlightPayments() ([]*channeldb.MPPayment, error) {
 func (p *controlTower) SubscribePayment(paymentHash lntypes.Hash) (
 	ControlTowerSubscriber, error) {
 
+	ctx := context.TODO()
+
 	// Take lock before querying the db to prevent missing or duplicating an
 	// update.
 	p.paymentsMtx.Lock(paymentHash)
 	defer p.paymentsMtx.Unlock(paymentHash)
 
-	payment, err := p.db.FetchPayment(paymentHash)
+	payment, err := p.db.FetchPayment(ctx, paymentHash)
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +349,8 @@ func (p *controlTower) SubscribePayment(paymentHash lntypes.Hash) (
 func (p *controlTower) SubscribeAllPayments() (ControlTowerSubscriber, error) {
 	subscriber := newControlTowerSubscriber()
 
+	ctx := context.TODO()
+
 	// Add the subscriber to the list before fetching in-flight payments, so
 	// no events are missed. If a payment attempt update occurs after
 	// appending and before fetching in-flight payments, an out-of-order
@@ -362,10 +361,13 @@ func (p *controlTower) SubscribeAllPayments() (ControlTowerSubscriber, error) {
 	p.subscriberIndex++
 	p.subscribersMtx.Unlock()
 
-	inflightPayments, err := p.db.FetchInFlightPayments()
+	log.Debugf("Scanning for inflight payments")
+	inflightPayments, err := p.db.FetchInFlightPayments(ctx)
 	if err != nil {
 		return nil, err
 	}
+	log.Debugf("Scanning for inflight payments finished: "+
+		"found_inflight=%d", len(inflightPayments))
 
 	for index := range inflightPayments {
 		// Always write current payment state to the channel.
@@ -380,7 +382,7 @@ func (p *controlTower) SubscribeAllPayments() (ControlTowerSubscriber, error) {
 // be executed atomically (by means of a lock) with the database update to
 // guarantee consistency of the notifications.
 func (p *controlTower) notifySubscribers(paymentHash lntypes.Hash,
-	event *channeldb.MPPayment) {
+	event *paymentsdb.MPPayment) {
 
 	// Get all subscribers for this payment.
 	p.subscribersMtx.Lock()

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
@@ -29,6 +30,10 @@ var (
 		Name:  "ip_address",
 		Usage: "the IP address the macaroon will be bound to",
 	}
+	macIPRangeFlag = cli.StringFlag{
+		Name:  "ip_range",
+		Usage: "the IP range the macaroon will be bound to",
+	}
 	macCustomCaveatNameFlag = cli.StringFlag{
 		Name:  "custom_caveat_name",
 		Usage: "the name of the custom caveat to add",
@@ -37,6 +42,12 @@ var (
 		Name: "custom_caveat_condition",
 		Usage: "the condition of the custom caveat to add, can be " +
 			"empty if custom caveat doesn't need a value",
+	}
+	bakeFromRootKeyFlag = cli.StringFlag{
+		Name: "root_key",
+		Usage: "if the root key is known, it can be passed directly " +
+			"as a hex encoded string, turning the command into " +
+			"an offline operation",
 	}
 )
 
@@ -48,7 +59,7 @@ var bakeMacaroonCommand = cli.Command{
 	ArgsUsage: "[--save_to=] [--timeout=] [--ip_address=] " +
 		"[--custom_caveat_name= [--custom_caveat_condition=]] " +
 		"[--root_key_id=] [--allow_external_permissions] " +
-		"permissions...",
+		"[--root_key=] permissions...",
 	Description: `
 	Bake a new macaroon that grants the provided permissions and
 	optionally adds restrictions (timeout, IP address) to it.
@@ -74,6 +85,12 @@ var bakeMacaroonCommand = cli.Command{
 
 	To get a list of all available URIs and permissions, use the
 	"lncli listpermissions" command.
+
+	If the root key is known (for example because "lncli create" was used
+	with a custom --mac_root_key value), it can be passed directly as a
+	hex encoded string using the --root_key flag. This turns the command
+	into an offline operation and the macaroon will be created without
+	calling into the server's RPC endpoint.
 	`,
 	Flags: []cli.Flag{
 		cli.StringFlag{
@@ -95,14 +112,13 @@ var bakeMacaroonCommand = cli.Command{
 			Usage: "whether permissions lnd is not familiar with " +
 				"are allowed",
 		},
+		bakeFromRootKeyFlag,
 	},
 	Action: actionDecorator(bakeMacaroon),
 }
 
 func bakeMacaroon(ctx *cli.Context) error {
 	ctxc := getContext()
-	client, cleanUp := getClient(ctx)
-	defer cleanUp()
 
 	// Show command help if no arguments.
 	if ctx.NArg() == 0 {
@@ -154,36 +170,69 @@ func bakeMacaroon(ctx *cli.Context) error {
 		)
 	}
 
-	// Now we have gathered all the input we need and can do the actual
-	// RPC call.
-	req := &lnrpc.BakeMacaroonRequest{
-		Permissions:              parsedPermissions,
-		RootKeyId:                rootKeyID,
-		AllowExternalPermissions: ctx.Bool("allow_external_permissions"),
-	}
-	resp, err := client.BakeMacaroon(ctxc, req)
-	if err != nil {
-		return err
-	}
+	var rawMacaroon *macaroon.Macaroon
+	switch {
+	case ctx.IsSet(bakeFromRootKeyFlag.Name):
+		macRootKey, err := hex.DecodeString(
+			ctx.String(bakeFromRootKeyFlag.Name),
+		)
+		if err != nil {
+			return fmt.Errorf("unable to parse macaroon root key: "+
+				"%w", err)
+		}
 
-	// Now we should have gotten a valid macaroon. Unmarshal it so we can
-	// add first-party caveats (if necessary) to it.
-	macBytes, err := hex.DecodeString(resp.Macaroon)
-	if err != nil {
-		return err
-	}
-	unmarshalMac := &macaroon.Macaroon{}
-	if err = unmarshalMac.UnmarshalBinary(macBytes); err != nil {
-		return err
+		ops := fn.Map(
+			parsedPermissions,
+			func(p *lnrpc.MacaroonPermission) bakery.Op {
+				return bakery.Op{
+					Entity: p.Entity,
+					Action: p.Action,
+				}
+			},
+		)
+
+		rawMacaroon, err = macaroons.BakeFromRootKey(macRootKey, ops)
+		if err != nil {
+			return fmt.Errorf("unable to bake macaroon: %w", err)
+		}
+
+	default:
+		client, cleanUp := getClient(ctx)
+		defer cleanUp()
+
+		// Now we have gathered all the input we need and can do the
+		// actual RPC call.
+		req := &lnrpc.BakeMacaroonRequest{
+			Permissions: parsedPermissions,
+			RootKeyId:   rootKeyID,
+			AllowExternalPermissions: ctx.Bool(
+				"allow_external_permissions",
+			),
+		}
+		resp, err := client.BakeMacaroon(ctxc, req)
+		if err != nil {
+			return err
+		}
+
+		// Now we should have gotten a valid macaroon. Unmarshal it so
+		// we can add first-party caveats (if necessary) to it.
+		macBytes, err := hex.DecodeString(resp.Macaroon)
+		if err != nil {
+			return err
+		}
+		rawMacaroon = &macaroon.Macaroon{}
+		if err = rawMacaroon.UnmarshalBinary(macBytes); err != nil {
+			return err
+		}
 	}
 
 	// Now apply the desired constraints to the macaroon. This will always
 	// create a new macaroon object, even if no constraints are added.
-	constrainedMac, err := applyMacaroonConstraints(ctx, unmarshalMac)
+	constrainedMac, err := applyMacaroonConstraints(ctx, rawMacaroon)
 	if err != nil {
 		return err
 	}
-	macBytes, err = constrainedMac.MarshalBinary()
+	macBytes, err := constrainedMac.MarshalBinary()
 	if err != nil {
 		return err
 	}
@@ -509,6 +558,19 @@ func applyMacaroonConstraints(ctx *cli.Context,
 		macConstraints = append(
 			macConstraints,
 			macaroons.IPLockConstraint(ipAddress.String()),
+		)
+	}
+
+	if ctx.IsSet(macIPRangeFlag.Name) {
+		_, net, err := net.ParseCIDR(ctx.String(macIPRangeFlag.Name))
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse ip_range "+
+				"%s: %w", ctx.String("ip_range"), err)
+		}
+
+		macConstraints = append(
+			macConstraints,
+			macaroons.IPLockConstraint(net.String()),
 		)
 	}
 

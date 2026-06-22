@@ -3,11 +3,12 @@ package routerrpc
 import (
 	"errors"
 
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,6 +61,9 @@ func (r *forwardInterceptor) run() error {
 			return err
 		}
 
+		log.Tracef("Received packet from stream: %v",
+			lnutils.SpewLogClosure(resp))
+
 		if err := r.resolveFromClient(resp); err != nil {
 			return err
 		}
@@ -73,7 +77,8 @@ func (r *forwardInterceptor) run() error {
 func (r *forwardInterceptor) onIntercept(
 	htlc htlcswitch.InterceptedPacket) error {
 
-	log.Tracef("Sending intercepted packet to client %v", htlc)
+	log.Tracef("Sending intercepted packet to client %v",
+		lnutils.SpewLogClosure(htlc))
 
 	inKey := htlc.IncomingCircuit
 
@@ -154,7 +159,7 @@ func (r *forwardInterceptor) resolveFromClient(
 			outWireCustomRecords = fn.Some[lnwire.CustomRecords](cr)
 		}
 
-		//nolint:lll
+		//nolint:ll
 		return r.htlcSwitch.Resolve(&htlcswitch.FwdResolution{
 			Key:                  circuitKey,
 			Action:               htlcswitch.FwdActionResumeModified,

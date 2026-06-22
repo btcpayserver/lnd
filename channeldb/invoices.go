@@ -7,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"time"
 
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	invpkg "github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -80,6 +81,13 @@ var (
 	//
 	//   settleIndexNo => invoiceKey
 	settleIndexBucket = []byte("invoice-settle-index")
+
+	// invoiceBucketTombstone is a special key that indicates the invoice
+	// bucket has been permanently closed. Its purpose is to prevent the
+	// invoice bucket from being reopened in the future. A key use case for
+	// the tombstone is to ensure users cannot switch back to the KV invoice
+	// database after migrating to the native SQL database.
+	invoiceBucketTombstone = []byte("invoice-tombstone")
 )
 
 const (
@@ -134,6 +142,10 @@ const (
 	ampStateSettleDateType  tlv.Type = 3
 	ampStateCircuitKeysType tlv.Type = 4
 	ampStateAmtPaidType     tlv.Type = 5
+
+	// invoiceProgressLogInterval is the interval we use limiting the
+	// logging output of invoice processing.
+	invoiceProgressLogInterval = 30 * time.Second
 )
 
 // AddInvoice inserts the targeted invoice into the database. If the invoice has
@@ -233,7 +245,12 @@ func (d *DB) AddInvoice(_ context.Context, newInvoice *invpkg.Invoice,
 func (d *DB) InvoicesAddedSince(_ context.Context, sinceAddIndex uint64) (
 	[]invpkg.Invoice, error) {
 
-	var newInvoices []invpkg.Invoice
+	var (
+		newInvoices    []invpkg.Invoice
+		start          = time.Now()
+		lastLogTime    = time.Now()
+		processedCount int
+	)
 
 	// If an index of zero was specified, then in order to maintain
 	// backwards compat, we won't send out any new invoices.
@@ -266,7 +283,6 @@ func (d *DB) InvoicesAddedSince(_ context.Context, sinceAddIndex uint64) (
 		addSeqNo, invoiceKey := invoiceCursor.Next()
 
 		for ; addSeqNo != nil && bytes.Compare(addSeqNo, startIndex[:]) > 0; addSeqNo, invoiceKey = invoiceCursor.Next() {
-
 			// For each key found, we'll look up the actual
 			// invoice, then accumulate it into our return value.
 			invoice, err := fetchInvoice(
@@ -277,6 +293,17 @@ func (d *DB) InvoicesAddedSince(_ context.Context, sinceAddIndex uint64) (
 			}
 
 			newInvoices = append(newInvoices, invoice)
+
+			processedCount++
+			if time.Since(lastLogTime) >=
+				invoiceProgressLogInterval {
+
+				log.Debugf("Processed %d invoices which "+
+					"were added since add index %v",
+					processedCount, sinceAddIndex)
+
+				lastLogTime = time.Now()
+			}
 		}
 
 		return nil
@@ -286,6 +313,12 @@ func (d *DB) InvoicesAddedSince(_ context.Context, sinceAddIndex uint64) (
 	if err != nil {
 		return nil, err
 	}
+
+	elapsed := time.Since(start)
+	log.Debugf("Completed scanning for invoices added since index %v: "+
+		"total_processed=%d, found_invoices=%d, elapsed=%v",
+		sinceAddIndex, processedCount, len(newInvoices),
+		elapsed.Round(time.Millisecond))
 
 	return newInvoices, nil
 }
@@ -520,7 +553,7 @@ func (d *DB) QueryInvoices(_ context.Context, q invpkg.InvoiceQuery) (
 
 		// Create a paginator which reads from our add index bucket with
 		// the parameters provided by the invoice query.
-		paginator := newPaginator(
+		paginator := NewPaginator(
 			invoiceAddIndex.ReadCursor(), q.Reversed, q.IndexOffset,
 			q.NumMaxInvoices,
 		)
@@ -570,7 +603,7 @@ func (d *DB) QueryInvoices(_ context.Context, q invpkg.InvoiceQuery) (
 
 		// Query our paginator using accumulateInvoices to build up a
 		// set of invoices.
-		if err := paginator.query(accumulateInvoices); err != nil {
+		if err := paginator.Query(accumulateInvoices); err != nil {
 			return err
 		}
 
@@ -650,18 +683,13 @@ func (d *DB) UpdateInvoice(_ context.Context, ref invpkg.InvoiceRef,
 			return err
 		}
 
-		// If the set ID hint is non-nil, then we'll use that to filter
-		// out the HTLCs for AMP invoice so we don't need to read them
-		// all out to satisfy the invoice callback below. If it's nil,
-		// then we pass in the zero set ID which means no HTLCs will be
-		// read out.
-		var invSetID invpkg.SetID
-
-		if setIDHint != nil {
-			invSetID = *setIDHint
-		}
+		// setIDHint can also be nil here, which means all the HTLCs
+		// for AMP invoices are fetched. If the blank setID is passed
+		// in, then no HTLCs are fetched for the AMP invoice. If a
+		// specific setID is passed in, then only the HTLCs for that
+		// setID are fetched for a particular sub-AMP invoice.
 		invoice, err := fetchInvoice(
-			invoiceNum, invoices, []*invpkg.SetID{&invSetID}, false,
+			invoiceNum, invoices, []*invpkg.SetID{setIDHint}, false,
 		)
 		if err != nil {
 			return err
@@ -691,7 +719,7 @@ func (d *DB) UpdateInvoice(_ context.Context, ref invpkg.InvoiceRef,
 		// If this is an AMP update, then limit the returned AMP state
 		// to only the requested set ID.
 		if setIDHint != nil {
-			filterInvoiceAMPState(updatedInvoice, &invSetID)
+			filterInvoiceAMPState(updatedInvoice, setIDHint)
 		}
 
 		return nil
@@ -813,9 +841,7 @@ func (k *kvInvoiceUpdater) UpdateAmpState(setID [32]byte,
 			cancelledHtlcs := k.invoice.HTLCSet(
 				&setID, invpkg.HtlcStateCanceled,
 			)
-			for htlcKey, htlc := range cancelledHtlcs {
-				k.updatedAmpHtlcs[setID][htlcKey] = htlc
-			}
+			maps.Copy(k.updatedAmpHtlcs[setID], cancelledHtlcs)
 
 		case invpkg.HtlcStateSettled:
 			k.updatedAmpHtlcs[setID] = make(
@@ -848,7 +874,10 @@ func (k *kvInvoiceUpdater) Finalize(updateType invpkg.UpdateType) error {
 		return k.storeSettleHodlInvoiceUpdate()
 
 	case invpkg.CancelInvoiceUpdate:
-		return k.serializeAndStoreInvoice()
+		// Persist all changes which where made when cancelling the
+		// invoice. All HTLCs which were accepted are now canceled, so
+		// we persist this state.
+		return k.storeCancelHtlcsUpdate()
 	}
 
 	return fmt.Errorf("unknown update type: %v", updateType)
@@ -1041,7 +1070,12 @@ func (k *kvInvoiceUpdater) serializeAndStoreInvoice() error {
 func (d *DB) InvoicesSettledSince(_ context.Context, sinceSettleIndex uint64) (
 	[]invpkg.Invoice, error) {
 
-	var settledInvoices []invpkg.Invoice
+	var (
+		settledInvoices []invpkg.Invoice
+		start           = time.Now()
+		lastLogTime     = time.Now()
+		processedCount  int
+	)
 
 	// If an index of zero was specified, then in order to maintain
 	// backwards compat, we won't send out any new invoices.
@@ -1100,6 +1134,18 @@ func (d *DB) InvoicesSettledSince(_ context.Context, sinceSettleIndex uint64) (
 			}
 
 			settledInvoices = append(settledInvoices, invoice)
+
+			processedCount++
+			if time.Since(lastLogTime) >=
+				invoiceProgressLogInterval {
+
+				log.Debugf("Processed %d settled invoices "+
+					"which have a settle index greater "+
+					"than %v", processedCount,
+					sinceSettleIndex)
+
+				lastLogTime = time.Now()
+			}
 		}
 
 		return nil
@@ -1109,6 +1155,12 @@ func (d *DB) InvoicesSettledSince(_ context.Context, sinceSettleIndex uint64) (
 	if err != nil {
 		return nil, err
 	}
+
+	elapsed := time.Since(start)
+	log.Debugf("Completed scanning for settled invoices starting at "+
+		"index %v: total_processed=%d, found_invoices=%d, elapsed=%v",
+		sinceSettleIndex, processedCount, len(settledInvoices),
+		elapsed.Round(time.Millisecond))
 
 	return settledInvoices, nil
 }
@@ -1433,9 +1485,7 @@ func fetchFilteredAmpInvoices(invoiceBucket kvdb.RBucket, invoiceNum []byte,
 			return nil, err
 		}
 
-		for key, htlc := range htlcsBySetID {
-			htlcs[key] = htlc
-		}
+		maps.Copy(htlcs, htlcsBySetID)
 	}
 
 	return htlcs, nil
@@ -1503,9 +1553,7 @@ func fetchAmpSubInvoices(invoiceBucket kvdb.RBucket, invoiceNum []byte,
 				return err
 			}
 
-			for key, htlc := range htlcsBySetID {
-				htlcs[key] = htlc
-			}
+			maps.Copy(htlcs, htlcsBySetID)
 
 			return nil
 		},
@@ -2401,4 +2449,50 @@ func (d *DB) DeleteInvoice(_ context.Context,
 	}, func() {})
 
 	return err
+}
+
+// SetInvoiceBucketTombstone sets the tombstone key in the invoice bucket to
+// mark the bucket as permanently closed. This prevents it from being reopened
+// in the future.
+func (d *DB) SetInvoiceBucketTombstone() error {
+	return kvdb.Update(d, func(tx kvdb.RwTx) error {
+		// Access the top-level invoice bucket.
+		invoices := tx.ReadWriteBucket(invoiceBucket)
+		if invoices == nil {
+			return fmt.Errorf("invoice bucket does not exist")
+		}
+
+		// Add the tombstone key to the invoice bucket.
+		err := invoices.Put(invoiceBucketTombstone, []byte("1"))
+		if err != nil {
+			return fmt.Errorf("failed to set tombstone: %w", err)
+		}
+
+		return nil
+	}, func() {})
+}
+
+// GetInvoiceBucketTombstone checks if the tombstone key exists in the invoice
+// bucket. It returns true if the tombstone is present and false otherwise.
+func (d *DB) GetInvoiceBucketTombstone() (bool, error) {
+	var tombstoneExists bool
+
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
+		// Access the top-level invoice bucket.
+		invoices := tx.ReadBucket(invoiceBucket)
+		if invoices == nil {
+			return fmt.Errorf("invoice bucket does not exist")
+		}
+
+		// Check if the tombstone key exists.
+		tombstone := invoices.Get(invoiceBucketTombstone)
+		tombstoneExists = tombstone != nil
+
+		return nil
+	}, func() {})
+	if err != nil {
+		return false, err
+	}
+
+	return tombstoneExists, nil
 }

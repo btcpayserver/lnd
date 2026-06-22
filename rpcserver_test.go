@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,11 +41,7 @@ func (m *mockDataParser) InlineParseCustomData(msg proto.Message) error {
 
 func TestAuxDataParser(t *testing.T) {
 	// We create an empty channeldb, so we can fetch some channels.
-	cdb, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, cdb.Close())
-	})
+	cdb := channeldb.OpenForTesting(t, t.TempDir())
 
 	r := &rpcServer{
 		server: &server{

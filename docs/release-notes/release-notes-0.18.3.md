@@ -59,11 +59,7 @@ commitment when the channel was force closed.
 
 * We'll now always send [channel updates to our remote peer for open
   channels](https://github.com/lightningnetwork/lnd/pull/8963).
- 
-* [Fix a bug](https://github.com/lightningnetwork/lnd/pull/9023) that would
-  cause UpdateAddHTLC message with blinding point fields to not be re-forwarded
-  correctly on restart.
- 
+
 * [A bug has been fixed that could cause invalid channel
   announcements](https://github.com/lightningnetwork/lnd/pull/9002) to be
   generated if the inbound fee discount is used.
@@ -77,6 +73,18 @@ would create a blinded route with a minHTLC greater than the actual payment
 amount. Moreover remove strict correlation between min_cltv_delta and the
 blinded path expiry.
 
+* [Fixed](https://github.com/lightningnetwork/lnd/pull/9021) an issue with some
+  command-line arguments not being passed when running `make itest-parallel`.
+
+ 
+* [Fix a bug](https://github.com/lightningnetwork/lnd/pull/9039) that would
+  cause UpdateAddHTLC message with blinding point fields to not be re-forwarded
+  correctly on restart.
+
+* [A bug related to sending dangling channel
+  updates](https://github.com/lightningnetwork/lnd/pull/9046) after a
+  reconnection for taproot channels has been fixed.
+ 
 # New Features
 ## Functional Enhancements
 
@@ -172,6 +180,11 @@ that validate `ChannelAnnouncement` messages.
 
 * [Allow](https://github.com/lightningnetwork/lnd/pull/8845) multiple etcd hosts
   to be specified in db.etcd.host.
+
+* Improved the internal [`LeaseOutput`
+  method](https://github.com/lightningnetwork/lnd/pull/8961) to be more
+  efficient, which improves the performance of related RPC calls such as
+  `LeaseOutput`, `SendCoins`, and PSBT funding process. 
 
 ## RPC Updates
 

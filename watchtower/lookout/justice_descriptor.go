@@ -9,9 +9,9 @@ import (
 	"github.com/btcsuite/btcd/btcutil/txsort"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/watchtower/blob"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
 )
@@ -196,7 +196,7 @@ func (p *JusticeDescriptor) assembleJusticeTxn(txWeight lntypes.WeightUnit,
 		}
 		if err := vm.Execute(); err != nil {
 			log.Debugf("Failed to validate justice transaction: %s",
-				spew.Sdump(justiceTxn))
+				lnutils.SpewLogClosure(justiceTxn))
 			return nil, fmt.Errorf("error validating TX: %w", err)
 		}
 	}
@@ -230,6 +230,9 @@ func (p *JusticeDescriptor) CreateJusticeTxn() (*wire.MsgTx, error) {
 	case input.P2WPKHSize:
 		weightEstimate.AddP2WKHOutput()
 
+	// NOTE: P2TR has the same size as P2WSH (34 bytes), their output sizes
+	// are also the same (43 bytes), so here we implicitly catch the P2TR
+	// output case.
 	case input.P2WSHSize:
 		weightEstimate.AddP2WSHOutput()
 
@@ -260,8 +263,9 @@ func (p *JusticeDescriptor) CreateJusticeTxn() (*wire.MsgTx, error) {
 
 	sweepInputs = append(sweepInputs, toLocalInput)
 
-	log.Debugf("Found to local witness output=%#v, stack=%v",
-		toLocalInput.txOut, toLocalInput.witness)
+	log.Debugf("Found to local witness output=%v, stack=%x",
+		lnutils.SpewLogClosure(toLocalInput.txOut),
+		toLocalInput.witness)
 
 	// If the justice kit specifies that we have to sweep the to-remote
 	// output, we'll also try to assemble the output and add it to weight
@@ -273,8 +277,9 @@ func (p *JusticeDescriptor) CreateJusticeTxn() (*wire.MsgTx, error) {
 		}
 		sweepInputs = append(sweepInputs, toRemoteInput)
 
-		log.Debugf("Found to remote witness output=%#v, stack=%v",
-			toRemoteInput.txOut, toRemoteInput.witness)
+		log.Debugf("Found to remote witness output=%v, stack=%x",
+			lnutils.SpewLogClosure(toRemoteInput.txOut),
+			toRemoteInput.witness)
 
 		// Get the weight for the to-remote witness and add that to the
 		// estimator.

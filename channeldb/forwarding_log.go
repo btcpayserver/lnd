@@ -2,11 +2,14 @@ package channeldb
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"sort"
 	"time"
 
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -25,11 +28,12 @@ const (
 	// is as follows:
 	//
 	//  * 8 byte incoming chan ID || 8 byte outgoing chan ID || 8 byte value in
-	//    || 8 byte value out
+	//    || 8 byte value out || 8 byte incoming htlc id || 8 byte
+	//    outgoing htlc id
 	//
 	// From the value in and value out, callers can easily compute the
 	// total fee extract from a forwarding event.
-	forwardingEventSize = 32
+	forwardingEventSize = 48
 
 	// MaxResponseEvents is the max number of forwarding events that will
 	// be returned by a single query response. This size was selected to
@@ -37,6 +41,10 @@ const (
 	// full forwarding event (including the timestamp) is 40 bytes, we can
 	// safely return 50k entries in a single response.
 	MaxResponseEvents = 50000
+
+	// defaultDeleteBatchSize is the default number of forwarding events
+	// deleted per database transaction when no batch size is specified.
+	defaultDeleteBatchSize = 10_000
 )
 
 // ForwardingLog returns an instance of the ForwardingLog object backed by the
@@ -78,14 +86,44 @@ type ForwardingEvent struct {
 	// AmtOut is the amount of the outgoing HTLC. Subtracting the incoming
 	// amount from this gives the total fees for this payment circuit.
 	AmtOut lnwire.MilliSatoshi
+
+	// IncomingHtlcID is the ID of the incoming HTLC in the payment circuit.
+	// If this is not set, the value will be nil. This field is added in
+	// v0.20 and is made optional to make it backward compatible with
+	// existing forwarding events created before it's introduction.
+	IncomingHtlcID fn.Option[uint64]
+
+	// OutgoingHtlcID is the ID of the outgoing HTLC in the payment circuit.
+	// If this is not set, the value will be nil. This field is added in
+	// v0.20 and is made optional to make it backward compatible with
+	// existing forwarding events created before it's introduction.
+	OutgoingHtlcID fn.Option[uint64]
 }
 
 // encodeForwardingEvent writes out the target forwarding event to the passed
 // io.Writer, using the expected DB format. Note that the timestamp isn't
 // serialized as this will be the key value within the bucket.
 func encodeForwardingEvent(w io.Writer, f *ForwardingEvent) error {
+	// We check for the HTLC IDs if they are set. If they are not,
+	// from v0.20 upward, we return an error to make it clear they are
+	// required.
+	incomingID, err := f.IncomingHtlcID.UnwrapOrErr(
+		errors.New("incoming HTLC ID must be set"),
+	)
+	if err != nil {
+		return err
+	}
+
+	outgoingID, err := f.OutgoingHtlcID.UnwrapOrErr(
+		errors.New("outgoing HTLC ID must be set"),
+	)
+	if err != nil {
+		return err
+	}
+
 	return WriteElements(
 		w, f.IncomingChanID, f.OutgoingChanID, f.AmtIn, f.AmtOut,
+		incomingID, outgoingID,
 	)
 }
 
@@ -94,9 +132,32 @@ func encodeForwardingEvent(w io.Writer, f *ForwardingEvent) error {
 // won't be decoded, as the caller is expected to set this due to the bucket
 // structure of the forwarding log.
 func decodeForwardingEvent(r io.Reader, f *ForwardingEvent) error {
-	return ReadElements(
+	// Decode the original fields of the forwarding event.
+	err := ReadElements(
 		r, &f.IncomingChanID, &f.OutgoingChanID, &f.AmtIn, &f.AmtOut,
 	)
+	if err != nil {
+		return err
+	}
+
+	// Decode the incoming and outgoing htlc IDs. For backward compatibility
+	// with older records that don't have these fields, we handle EOF by
+	// setting the ID to nil. Any other error is treated as a read failure.
+	var incomingHtlcID, outgoingHtlcID uint64
+	err = ReadElements(r, &incomingHtlcID, &outgoingHtlcID)
+	switch {
+	case err == nil:
+		f.IncomingHtlcID = fn.Some(incomingHtlcID)
+		f.OutgoingHtlcID = fn.Some(outgoingHtlcID)
+
+		return nil
+
+	case errors.Is(err, io.EOF):
+		return nil
+
+	default:
+		return err
+	}
 }
 
 // AddForwardingEvents adds a series of forwarding events to the database.
@@ -200,6 +261,16 @@ type ForwardingEventQuery struct {
 
 	// NumMaxEvents is the max number of events to return.
 	NumMaxEvents uint32
+
+	// IncomingChanIds is the list of channels to filter HTLCs being
+	// received from a particular channel.
+	// If the list is empty, then it is ignored.
+	IncomingChanIDs fn.Set[uint64]
+
+	// OutgoingChanIds is the list of channels to filter HTLCs being
+	// forwarded to a particular channel.
+	// If the list is empty, then it is ignored.
+	OutgoingChanIDs fn.Set[uint64]
 }
 
 // ForwardingLogTimeSlice is the response to a forwarding query. It includes
@@ -227,7 +298,9 @@ type ForwardingLogTimeSlice struct {
 // the number of events to be returned.
 //
 // TODO(roasbeef): rename?
-func (f *ForwardingLog) Query(q ForwardingEventQuery) (ForwardingLogTimeSlice, error) {
+func (f *ForwardingLog) Query(q ForwardingEventQuery) (ForwardingLogTimeSlice,
+	error) {
+
 	var resp ForwardingLogTimeSlice
 
 	// If the user provided an index offset, then we'll not know how many
@@ -256,18 +329,32 @@ func (f *ForwardingLog) Query(q ForwardingEventQuery) (ForwardingLogTimeSlice, e
 		// We'll continue until either we reach the end of the range,
 		// or reach our max number of events.
 		logCursor := logBucket.ReadCursor()
-		timestamp, events := logCursor.Seek(startTime[:])
-		for ; timestamp != nil && bytes.Compare(timestamp, endTime[:]) <= 0; timestamp, events = logCursor.Next() {
+		timestamp, eventBytes := logCursor.Seek(startTime[:])
+		//nolint:ll
+		for ; timestamp != nil && bytes.Compare(timestamp, endTime[:]) <= 0; timestamp, eventBytes = logCursor.Next() {
 			// If our current return payload exceeds the max number
 			// of events, then we'll exit now.
 			if uint32(len(resp.ForwardingEvents)) >= q.NumMaxEvents {
 				return nil
 			}
 
-			// If we're not yet past the user defined offset, then
+			// If no incoming or outgoing channel IDs were provided
+			// and we're not yet past the user defined offset, then
 			// we'll continue to seek forward.
-			if recordsToSkip > 0 {
+			if recordsToSkip > 0 &&
+				q.IncomingChanIDs.IsEmpty() &&
+				q.OutgoingChanIDs.IsEmpty() {
+
 				recordsToSkip--
+				continue
+			}
+
+			// At this point, we've skipped enough records to start
+			// to collate our query. For each record, we'll
+			// increment the final record offset so the querier can
+			// utilize pagination to seek further.
+			readBuf := bytes.NewReader(eventBytes)
+			if readBuf.Len() == 0 {
 				continue
 			}
 
@@ -275,23 +362,48 @@ func (f *ForwardingLog) Query(q ForwardingEventQuery) (ForwardingLogTimeSlice, e
 				0, int64(byteOrder.Uint64(timestamp)),
 			)
 
-			// At this point, we've skipped enough records to start
-			// to collate our query. For each record, we'll
-			// increment the final record offset so the querier can
-			// utilize pagination to seek further.
-			readBuf := bytes.NewReader(events)
-			for readBuf.Len() != 0 {
-				var event ForwardingEvent
-				err := decodeForwardingEvent(readBuf, &event)
-				if err != nil {
-					return err
-				}
-
-				event.Timestamp = currentTime
-				resp.ForwardingEvents = append(resp.ForwardingEvents, event)
-
-				recordOffset++
+			var event ForwardingEvent
+			err := decodeForwardingEvent(readBuf, &event)
+			if err != nil {
+				return err
 			}
+
+			// Check if the incoming channel ID matches the
+			// filter criteria. Either no filtering is
+			// applied (IsEmpty), or the ID is explicitly
+			// included.
+			incomingMatch := q.IncomingChanIDs.IsEmpty() ||
+				q.IncomingChanIDs.Contains(
+					event.IncomingChanID.ToUint64(),
+				)
+
+			// Check if the outgoing channel ID matches the
+			// filter criteria. Either no filtering is
+			// applied (IsEmpty), or  the ID is explicitly
+			// included.
+			outgoingMatch := q.OutgoingChanIDs.IsEmpty() ||
+				q.OutgoingChanIDs.Contains(
+					event.OutgoingChanID.ToUint64(),
+				)
+
+			// Skip this event if it doesn't match the
+			// filters.
+			if !incomingMatch || !outgoingMatch {
+				continue
+			}
+			// If we're not yet past the user defined offset
+			// then we'll continue to seek forward.
+			if recordsToSkip > 0 {
+				recordsToSkip--
+				continue
+			}
+
+			event.Timestamp = currentTime
+			resp.ForwardingEvents = append(
+				resp.ForwardingEvents,
+				event,
+			)
+			recordOffset++
 		}
 
 		return nil
@@ -307,6 +419,161 @@ func (f *ForwardingLog) Query(q ForwardingEventQuery) (ForwardingLogTimeSlice, e
 	resp.LastIndexOffset = recordOffset
 
 	return resp, nil
+}
+
+// DeleteStats contains statistics about a forwarding history deletion
+// operation.
+type DeleteStats struct {
+	// NumEventsDeleted is the total number of forwarding events that were
+	// deleted from the database.
+	NumEventsDeleted uint64
+
+	// TotalFeeMsat is the sum of all fees (AmtIn - AmtOut) from the
+	// deleted events, expressed in millisatoshis.
+	TotalFeeMsat int64
+}
+
+// DeleteForwardingEvents deletes all forwarding events with a timestamp at or
+// before the specified endTime from the database. The deletion is performed in
+// batches to avoid holding large database transactions. This method returns
+// statistics about the deletion including the number of events deleted and the
+// total fees earned from those events.
+//
+// The batchSize parameter controls how many events are deleted per database
+// transaction. If batchSize is 0, a default of 10000 is used. The maximum
+// allowed batch size is MaxResponseEvents (50000) to prevent resource
+// exhaustion.
+//
+// If the context is cancelled between batches, the method returns the partial
+// statistics accumulated so far along with the context error. Callers can
+// safely re-run the operation with the same parameters to resume deletion since
+// committed batches are not rolled back.
+func (f *ForwardingLog) DeleteForwardingEvents(ctx context.Context,
+	endTime time.Time, batchSize int) (DeleteStats, error) {
+
+	// Set default batch size if not specified, and enforce maximum.
+	if batchSize <= 0 {
+		batchSize = defaultDeleteBatchSize
+	}
+	if batchSize > MaxResponseEvents {
+		batchSize = MaxResponseEvents
+	}
+
+	// Encode the end time once outside the loop since it does not change
+	// between batches.
+	var endTimeBytes [8]byte
+	byteOrder.PutUint64(endTimeBytes[:], uint64(endTime.UnixNano()))
+
+	var stats DeleteStats
+
+	// We'll continue deleting batches until there are no more events to
+	// delete or the context is cancelled.
+	for {
+		// Check for cancellation between batches so callers can abort
+		// cleanly. Partial stats are returned so the caller knows how
+		// much was deleted before the abort.
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+
+		var (
+			batchDeleted int
+			batchFees    int64
+		)
+
+		err := kvdb.Update(f.db, func(tx kvdb.RwTx) error {
+			// Fetch the forwarding log bucket. If it doesn't exist,
+			// there's nothing to delete.
+			logBucket := tx.ReadWriteBucket(forwardingLogBucket)
+			if logBucket == nil {
+				return ErrNoForwardingEvents
+			}
+
+			// We'll use a cursor to iterate through events in time
+			// order.
+			cursor := logBucket.ReadWriteCursor()
+
+			// Collect keys to delete in this batch. We can't delete
+			// while iterating as it may corrupt the cursor.
+			keysToDelete := make([][]byte, 0, batchSize)
+
+			// Seek to the beginning and iterate through events
+			// until we reach the end time or batch limit.
+			//
+			//nolint:ll
+			for timestamp, eventBytes := cursor.First(); timestamp != nil; timestamp, eventBytes = cursor.Next() {
+				// Stop if we've passed the end time.
+				//
+				//nolint:ll
+				if bytes.Compare(timestamp, endTimeBytes[:]) > 0 {
+					break
+				}
+
+				// Stop if we've reached the batch size limit.
+				if len(keysToDelete) >= batchSize {
+					break
+				}
+
+				// Decode the event to obtain the fee.
+				readBuf := bytes.NewReader(eventBytes)
+				if readBuf.Len() > 0 {
+					var event ForwardingEvent
+					err := decodeForwardingEvent(
+						readBuf, &event,
+					)
+					if err != nil {
+						return err
+					}
+
+					// Calculate the fee for this event. Cast
+					// before subtracting to avoid uint64
+					// underflow if AmtOut > AmtIn.
+					fee := int64(event.AmtIn) -
+						int64(event.AmtOut)
+					batchFees += fee
+				}
+
+				// Make a copy of the key to delete later.
+				keyCopy := make([]byte, len(timestamp))
+				copy(keyCopy, timestamp)
+				keysToDelete = append(keysToDelete, keyCopy)
+			}
+
+			// Now delete all the collected keys.
+			for _, key := range keysToDelete {
+				if err := logBucket.Delete(key); err != nil {
+					return err
+				}
+			}
+
+			batchDeleted = len(keysToDelete)
+
+			return nil
+		}, func() {
+			batchDeleted = 0
+			batchFees = 0
+		})
+
+		if err != nil {
+			// If the bucket doesn't exist, we're done.
+			if errors.Is(err, ErrNoForwardingEvents) {
+				break
+			}
+
+			return stats, err
+		}
+
+		// Update our running statistics.
+		stats.NumEventsDeleted += uint64(batchDeleted)
+		stats.TotalFeeMsat += batchFees
+
+		// If we deleted fewer events than the batch size, we're done.
+		if batchDeleted < batchSize {
+			break
+		}
+	}
+
+	return stats, nil
 }
 
 // makeUniqueTimestamps takes a slice of forwarding events, sorts it by the

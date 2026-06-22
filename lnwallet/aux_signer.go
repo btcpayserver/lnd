@@ -2,16 +2,59 @@ package lnwallet
 
 import (
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
-// htlcCustomSigType is the TLV type that is used to encode the custom HTLC
-// signatures within the custom data for an existing HTLC.
-var htlcCustomSigType tlv.TlvType65543
+var (
+	// htlcCustomSigType is the TLV type that is used to encode the custom
+	// HTLC signatures within the custom data for an existing HTLC.
+	htlcCustomSigType tlv.TlvType65543
+
+	// NoOpHtlcTLVEntry is the TLV that that's used in the update_add_htlc
+	// message to indicate the presence of a noop HTLC. This has no encoded
+	// value, its presence is used to indicate that the HTLC is a noop.
+	NoOpHtlcTLVEntry tlv.TlvType65544
+)
+
+// NoOpHtlcTLVType is the (golang) type of the TLV record that's used to signal
+// that an HTLC should be a noop HTLC.
+type NoOpHtlcTLVType = tlv.TlvType65544
+
+// AuxHtlcView is a struct that contains a safe copy of an HTLC view that can
+// be used by aux components.
+type AuxHtlcView struct {
+	// NextHeight is the height of the commitment transaction that will be
+	// created using this view.
+	NextHeight uint64
+
+	// Updates is a Dual of the Local and Remote HTLCs.
+	Updates lntypes.Dual[[]AuxHtlcDescriptor]
+
+	// FeePerKw is the fee rate in sat/kw of the commitment transaction.
+	FeePerKw chainfee.SatPerKWeight
+}
+
+// newAuxHtlcView creates a new safe copy of the HTLC view that can be used by
+// aux components.
+//
+// NOTE: This function should only be called while holding the channel's read
+// lock, since the underlying local/remote payment descriptors are accessed
+// directly.
+func newAuxHtlcView(v *HtlcView) AuxHtlcView {
+	return AuxHtlcView{
+		NextHeight: v.NextHeight,
+		Updates: lntypes.Dual[[]AuxHtlcDescriptor]{
+			Local:  fn.Map(v.Updates.Local, newAuxHtlcDescriptor),
+			Remote: fn.Map(v.Updates.Remote, newAuxHtlcDescriptor),
+		},
+		FeePerKw: v.FeePerKw,
+	}
+}
 
 // AuxHtlcDescriptor is a struct that contains the information needed to sign or
 // verify an HTLC for custom channels.
@@ -84,6 +127,18 @@ func (a *AuxHtlcDescriptor) AddHeight(
 	return a.addCommitHeightLocal
 }
 
+// IsAdd checks if the entry type of the Aux HTLC Descriptor is an add type.
+func (a *AuxHtlcDescriptor) IsAdd() bool {
+	switch a.EntryType {
+	case Add:
+		fallthrough
+	case NoOpAdd:
+		return true
+	default:
+		return false
+	}
+}
+
 // RemoveHeight returns the height at which the HTLC was removed from the
 // commitment chain. The height is returned based on the chain the HTLC is being
 // removed from (local or remote chain).
@@ -99,6 +154,9 @@ func (a *AuxHtlcDescriptor) RemoveHeight(
 
 // newAuxHtlcDescriptor creates a new AuxHtlcDescriptor from a payment
 // descriptor.
+//
+// NOTE: This function should only be called while holding the channel's read
+// lock, since the underlying payment descriptors are accessed directly.
 func newAuxHtlcDescriptor(p *paymentDescriptor) AuxHtlcDescriptor {
 	return AuxHtlcDescriptor{
 		ChanID:                   p.ChanID,
@@ -109,10 +167,10 @@ func newAuxHtlcDescriptor(p *paymentDescriptor) AuxHtlcDescriptor {
 		ParentIndex:              p.ParentIndex,
 		EntryType:                p.EntryType,
 		CustomRecords:            p.CustomRecords.Copy(),
-		addCommitHeightRemote:    p.addCommitHeightRemote,
-		addCommitHeightLocal:     p.addCommitHeightLocal,
-		removeCommitHeightRemote: p.removeCommitHeightRemote,
-		removeCommitHeightLocal:  p.removeCommitHeightLocal,
+		addCommitHeightRemote:    p.addCommitHeights.Remote,
+		addCommitHeightLocal:     p.addCommitHeights.Local,
+		removeCommitHeightRemote: p.removeCommitHeights.Remote,
+		removeCommitHeightLocal:  p.removeCommitHeights.Local,
 	}
 }
 

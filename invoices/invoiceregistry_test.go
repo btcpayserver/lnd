@@ -1,7 +1,6 @@
 package invoices_test
 
 import (
-	"context"
 	"crypto/rand"
 	"database/sql"
 	"fmt"
@@ -20,13 +19,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/sqldb"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-)
-
-var (
-	// htlcModifierMock is a mock implementation of the invoice HtlcModifier
-	// interface.
-	htlcModifierMock = &invpkg.MockHtlcModifier{}
 )
 
 // TestInvoiceRegistry is a master test which encompasses all tests using an
@@ -108,12 +102,24 @@ func TestInvoiceRegistry(t *testing.T) {
 			name: "SpontaneousAmpPayment",
 			test: testSpontaneousAmpPayment,
 		},
+		{
+			name: "FailPartialMPPPaymentExternal",
+			test: testFailPartialMPPPaymentExternal,
+		},
+		{
+			name: "FailPartialAMPPayment",
+			test: testFailPartialAMPPayment,
+		},
+		{
+			name: "CancelAMPInvoicePendingHTLCs",
+			test: testCancelAMPInvoicePendingHTLCs,
+		},
 	}
 
 	makeKeyValueDB := func(t *testing.T) (invpkg.InvoiceDB,
 		*clock.TestClock) {
 
-		testClock := clock.NewTestClock(testNow)
+		testClock := clock.NewTestClock(testTime)
 		db, err := channeldb.MakeTestInvoiceDB(
 			t, channeldb.OptionClock(testClock),
 		)
@@ -147,7 +153,7 @@ func TestInvoiceRegistry(t *testing.T) {
 			},
 		)
 
-		testClock := clock.NewTestClock(testNow)
+		testClock := clock.NewTestClock(testTime)
 
 		return invpkg.NewSQLStore(executor, testClock), testClock
 	}
@@ -187,7 +193,7 @@ func testSettleInvoice(t *testing.T,
 
 	ctx := newTestContext(t, nil, makeDB)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.Nil(t, err)
 	defer allSubscriptions.Cancel()
@@ -204,7 +210,7 @@ func testSettleInvoice(t *testing.T,
 	require.Equal(t, subscription.PayHash(), &testInvoicePaymentHash)
 
 	// Add the invoice.
-	testInvoice := newInvoice(t, false)
+	testInvoice := newInvoice(t, false, false)
 	addIdx, err := ctx.registry.AddInvoice(
 		ctxb, testInvoice, testInvoicePaymentHash,
 	)
@@ -376,7 +382,7 @@ func testCancelInvoiceImpl(t *testing.T, gc bool,
 	cfg.GcCanceledInvoicesOnTheFly = gc
 	ctx := newTestContext(t, &cfg, makeDB)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.Nil(t, err)
 	defer allSubscriptions.Cancel()
@@ -395,7 +401,7 @@ func testCancelInvoiceImpl(t *testing.T, gc bool,
 	require.Equal(t, subscription.PayHash(), &testInvoicePaymentHash)
 
 	// Add the invoice.
-	testInvoice := newInvoice(t, false)
+	testInvoice := newInvoice(t, false, false)
 	_, err = ctx.registry.AddInvoice(
 		ctxb, testInvoice, testInvoicePaymentHash,
 	)
@@ -528,7 +534,7 @@ func testSettleHoldInvoice(t *testing.T,
 	cfg := invpkg.RegistryConfig{
 		FinalCltvRejectDelta: testFinalCltvRejectDelta,
 		Clock:                clock,
-		HtlcInterceptor:      htlcModifierMock,
+		HtlcInterceptor:      &invpkg.MockHtlcModifier{},
 	}
 
 	expiryWatcher := invpkg.NewInvoiceExpiryWatcher(
@@ -540,7 +546,7 @@ func testSettleHoldInvoice(t *testing.T,
 	require.NoError(t, err)
 	defer registry.Stop()
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	allSubscriptions, err := registry.SubscribeNotifications(ctxb, 0, 0)
 	require.Nil(t, err)
 	defer allSubscriptions.Cancel()
@@ -555,7 +561,7 @@ func testSettleHoldInvoice(t *testing.T,
 	require.Equal(t, subscription.PayHash(), &testInvoicePaymentHash)
 
 	// Add the invoice.
-	invoice := newInvoice(t, true)
+	invoice := newInvoice(t, true, false)
 	_, err = registry.AddInvoice(ctxb, invoice, testInvoicePaymentHash)
 	require.NoError(t, err)
 
@@ -698,7 +704,7 @@ func testCancelHoldInvoice(t *testing.T,
 	cfg := invpkg.RegistryConfig{
 		FinalCltvRejectDelta: testFinalCltvRejectDelta,
 		Clock:                testClock,
-		HtlcInterceptor:      htlcModifierMock,
+		HtlcInterceptor:      &invpkg.MockHtlcModifier{},
 	}
 	expiryWatcher := invpkg.NewInvoiceExpiryWatcher(
 		cfg.Clock, 0, uint32(testCurrentHeight), nil, newMockNotifier(),
@@ -713,10 +719,10 @@ func testCancelHoldInvoice(t *testing.T,
 		require.NoError(t, registry.Stop())
 	})
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// Add the invoice.
-	invoice := newInvoice(t, true)
+	invoice := newInvoice(t, true, false)
 	_, err = registry.AddInvoice(ctxb, invoice, testInvoicePaymentHash)
 	require.NoError(t, err)
 
@@ -817,7 +823,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	ctx := newTestContext(t, &cfg, makeDB)
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(
-		context.Background(), 0, 0,
+		t.Context(), 0, 0,
 	)
 	require.NoError(t, err)
 	defer allSubscriptions.Cancel()
@@ -904,7 +910,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	}
 
 	// Finally, test that we can properly fulfill a second keysend payment
-	// with a unique preiamge.
+	// with a unique preimage.
 	preimage2 := lntypes.Preimage{1, 2, 3, 4}
 	hash2 := preimage2.Hash()
 
@@ -952,7 +958,7 @@ func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 	cfg.KeysendHoldTime = holdDuration
 	ctx := newTestContext(t, &cfg, makeDB)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.NoError(t, err)
 	defer allSubscriptions.Cancel()
@@ -1040,10 +1046,10 @@ func testMppPayment(t *testing.T,
 	defer timeout()()
 
 	ctx := newTestContext(t, nil, makeDB)
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	// Add the invoice.
-	testInvoice := newInvoice(t, false)
+	testInvoice := newInvoice(t, false, false)
 	_, err := ctx.registry.AddInvoice(
 		ctxb, testInvoice, testInvoicePaymentHash,
 	)
@@ -1136,12 +1142,12 @@ func testMppPaymentWithOverpayment(t *testing.T,
 
 	t.Parallel()
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	f := func(overpaymentRand uint64) bool {
 		ctx := newTestContext(t, nil, makeDB)
 
 		// Add the invoice.
-		testInvoice := newInvoice(t, false)
+		testInvoice := newInvoice(t, false, false)
 		_, err := ctx.registry.AddInvoice(
 			ctxb, testInvoice, testInvoicePaymentHash,
 		)
@@ -1218,7 +1224,7 @@ func testInvoiceExpiryWithRegistry(t *testing.T,
 	cfg := invpkg.RegistryConfig{
 		FinalCltvRejectDelta: testFinalCltvRejectDelta,
 		Clock:                testClock,
-		HtlcInterceptor:      htlcModifierMock,
+		HtlcInterceptor:      &invpkg.MockHtlcModifier{},
 	}
 
 	expiryWatcher := invpkg.NewInvoiceExpiryWatcher(
@@ -1234,7 +1240,7 @@ func testInvoiceExpiryWithRegistry(t *testing.T,
 		t, testTime, 0, numExpired, numPending,
 	)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	var expectedCancellations []lntypes.Hash
 	expiredInvoices := existingInvoices.expiredInvoices
@@ -1329,7 +1335,7 @@ func testOldInvoiceRemovalOnStart(t *testing.T,
 		FinalCltvRejectDelta:        testFinalCltvRejectDelta,
 		Clock:                       testClock,
 		GcCanceledInvoicesOnStartup: true,
-		HtlcInterceptor:             htlcModifierMock,
+		HtlcInterceptor:             &invpkg.MockHtlcModifier{},
 	}
 
 	expiryWatcher := invpkg.NewInvoiceExpiryWatcher(
@@ -1344,7 +1350,7 @@ func testOldInvoiceRemovalOnStart(t *testing.T,
 		t, testTime, 0, numExpired, numPending,
 	)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	i := 0
 	for paymentHash, invoice := range existingInvoices.expiredInvoices {
@@ -1432,11 +1438,11 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 
 	// Add a hold invoice, we set a non-nil payment request so that this
 	// invoice is not considered a keysend by the expiry watcher.
-	testInvoice := newInvoice(t, false)
+	testInvoice := newInvoice(t, false, false)
 	testInvoice.HodlInvoice = true
 	testInvoice.PaymentRequest = []byte{1, 2, 3}
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	_, err := ctx.registry.AddInvoice(
 		ctxb, testInvoice, testInvoicePaymentHash,
 	)
@@ -1545,9 +1551,9 @@ func testMultipleSetHeightExpiry(t *testing.T,
 	ctx := newTestContext(t, nil, makeDB)
 
 	// Add a hold invoice.
-	testInvoice := newInvoice(t, true)
+	testInvoice := newInvoice(t, true, false)
 
-	ctxb := context.Background()
+	ctxb := t.Context()
 	_, err := ctx.registry.AddInvoice(
 		ctxb, testInvoice, testInvoicePaymentHash,
 	)
@@ -1639,7 +1645,7 @@ func testSettleInvoicePaymentAddrRequired(t *testing.T,
 	t.Parallel()
 
 	ctx := newTestContext(t, nil, makeDB)
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.NoError(t, err)
@@ -1731,7 +1737,7 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 	t.Parallel()
 
 	ctx := newTestContext(t, nil, makeDB)
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.NoError(t, err)
@@ -1939,7 +1945,7 @@ func testSpontaneousAmpPaymentImpl(
 	cfg := defaultRegistryConfig()
 	cfg.AcceptAMP = ampEnabled
 	ctx := newTestContext(t, &cfg, makeDB)
-	ctxb := context.Background()
+	ctxb := t.Context()
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(ctxb, 0, 0)
 	require.Nil(t, err)
@@ -1996,7 +2002,7 @@ func testSpontaneousAmpPaymentImpl(
 	}
 
 	// Record the hodl channels of all HTLCs but the last one, which
-	// received its resolution directly from NotifyExistHopHtlc.
+	// received its resolution directly from NotifyExitHopHtlc.
 	hodlChans := make(map[lntypes.Preimage]chan interface{})
 	for i := 0; i < numShards; i++ {
 		isFinalShard := i == numShards-1
@@ -2107,5 +2113,455 @@ func testSpontaneousAmpPaymentImpl(
 		} else {
 			checkSettleResolution(t, resolution, preimage)
 		}
+	}
+}
+
+// testFailPartialMPPPaymentExternal tests that the HTLC set is cancelled back
+// as soon as the HTLC interceptor denies one of the HTLCs.
+func testFailPartialMPPPaymentExternal(t *testing.T,
+	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
+
+	t.Parallel()
+
+	mockHtlcInterceptor := &invpkg.MockHtlcModifier{}
+	cfg := defaultRegistryConfig()
+	cfg.HtlcInterceptor = mockHtlcInterceptor
+	ctx := newTestContext(t, &cfg, makeDB)
+
+	// Add an invoice which we are going to pay via a MPP set.
+	testInvoice := newInvoice(t, false, false)
+
+	ctxb := t.Context()
+	_, err := ctx.registry.AddInvoice(
+		ctxb, testInvoice, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	mppPayload := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, [32]byte{}),
+	}
+
+	// Send first HTLC which pays part of the invoice but keeps the invoice
+	// in an open state because the amount is less than the invoice amount.
+	hodlChan1 := make(chan interface{}, 1)
+	resolution, err := ctx.registry.NotifyExitHopHtlc(
+		testInvoicePaymentHash, testInvoice.Terms.Value/3,
+		testHtlcExpiry, testCurrentHeight, getCircuitKey(1),
+		hodlChan1, nil, mppPayload,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	// Register the expected response from the interceptor so that the
+	// whole HTLC set is cancelled.
+	expectedResponse := invpkg.HtlcModifyResponse{
+		CancelSet: true,
+	}
+	mockHtlcInterceptor.On("Intercept", mock.Anything, mock.Anything).
+		Return(nil, expectedResponse)
+
+	// Send htlc 2. We expect the HTLC to be cancelled because the
+	// interceptor will deny it.
+	resolution, err = ctx.registry.NotifyExitHopHtlc(
+		testInvoicePaymentHash, testInvoice.Terms.Value/2,
+		testHtlcExpiry, testCurrentHeight, getCircuitKey(2), nil,
+		nil, mppPayload,
+	)
+	require.NoError(t, err)
+	failResolution, ok := resolution.(*invpkg.HtlcFailResolution)
+	require.True(t, ok, "expected fail resolution, got: %T", resolution)
+
+	// Make sure the resolution includes the custom error msg.
+	require.Equal(t, invpkg.ExternalValidationFailed,
+		failResolution.Outcome, "expected ExternalValidationFailed, "+
+			"got: %v", failResolution.Outcome)
+
+	// Expect HLTC 1 also to be cancelled because it is part of the cancel
+	// set and the interceptor cancelled the whole set after receiving the
+	// second HTLC.
+	select {
+	case resolution := <-hodlChan1:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		failResolution, ok = htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T",
+			htlcResolution,
+		)
+		require.Equal(
+			t, invpkg.ExternalValidationFailed,
+			failResolution.Outcome, "expected "+
+				"ExternalValidationFailed, got: %v",
+			failResolution.Outcome,
+		)
+
+	case <-time.After(testTimeout):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	// Assert that the invoice is still open.
+	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractOpen, inv.State, "expected "+
+		"OPEN invoice")
+
+	// Now let the invoice expire.
+	currentTime := ctx.clock.Now()
+	ctx.clock.SetTime(currentTime.Add(61 * time.Minute))
+
+	// Make sure the invoices changes to the canceled state.
+	require.Eventuallyf(t, func() bool {
+		inv, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+
+		return inv.State == invpkg.ContractCanceled
+	}, testTimeout, time.Millisecond*100, "invoice not canceled")
+
+	// Fetch the invoice again and compare the number of cancelled HTLCs.
+	inv, err = ctx.registry.LookupInvoice(
+		ctxb, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	// Make sure all HTLCs are in the canceled state which in our case is
+	// only the first one because the second HTLC was never added to the
+	// invoice registry in the first place.
+	require.Len(t, inv.Htlcs, 1)
+	require.Equal(
+		t, invpkg.HtlcStateCanceled, inv.Htlcs[getCircuitKey(1)].State,
+	)
+}
+
+// testFailPartialAMPPayment tests the MPP timeout logic for AMP invoices. It
+// makes sure that all HTLCs are cancelled if the full invoice amount is not
+// received. Moreover it points out some TODOs to make AMP invoices more robust.
+func testFailPartialAMPPayment(t *testing.T,
+	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
+
+	t.Parallel()
+
+	ctx := newTestContext(t, nil, makeDB)
+	ctxb := t.Context()
+
+	const (
+		expiry    = uint32(testCurrentHeight + 20)
+		numShards = 4
+	)
+
+	var (
+		shardAmt = testInvoiceAmount / lnwire.MilliSatoshi(numShards)
+		setID    [32]byte
+		payAddr  [32]byte
+	)
+	_, err := rand.Read(payAddr[:])
+	require.NoError(t, err)
+
+	// Create an AMP invoice we are going to pay via a multi-part payment.
+	ampInvoice := newInvoice(t, false, true)
+
+	// An AMP invoice is referenced by the payment address.
+	ampInvoice.Terms.PaymentAddr = payAddr
+
+	_, err = ctx.registry.AddInvoice(
+		ctxb, ampInvoice, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	// Generate a random setID for the HTLCs.
+	_, err = rand.Read(setID[:])
+	require.NoError(t, err)
+
+	htlcPayload1 := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, payAddr),
+		// We are not interested in settling the AMP HTLC so we don't
+		// use valid shares.
+		amp: record.NewAMP([32]byte{1}, setID, 1),
+	}
+
+	// Send first HTLC which pays part of the invoice.
+	hodlChan1 := make(chan interface{}, 1)
+	resolution, err := ctx.registry.NotifyExitHopHtlc(
+		lntypes.Hash{1}, shardAmt, expiry, testCurrentHeight,
+		getCircuitKey(1), hodlChan1, nil, htlcPayload1,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	htlcPayload2 := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, payAddr),
+		// We are not interested in settling the AMP HTLC so we don't
+		// use valid shares.
+		amp: record.NewAMP([32]byte{2}, setID, 2),
+	}
+
+	// Send htlc 2 which should be added to the invoice as expected.
+	hodlChan2 := make(chan interface{}, 1)
+	resolution, err = ctx.registry.NotifyExitHopHtlc(
+		lntypes.Hash{2}, shardAmt, expiry, testCurrentHeight,
+		getCircuitKey(2), hodlChan2, nil, htlcPayload2,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	// Now time-out the HTLCs. The HoldDuration is 30 seconds after the
+	// HTLC will be cancelled.
+	currentTime := ctx.clock.Now()
+	ctx.clock.SetTime(currentTime.Add(35 * time.Second))
+
+	// Expect HLTC 1 to be canceled via the MPPTimeout fail resolution.
+	select {
+	case resolution := <-hodlChan1:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		failRes, ok := htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T", resolution,
+		)
+		require.Equal(
+			t, invpkg.ResultMppTimeout, failRes.Outcome,
+			"expected MPPTimeout, got: %v", failRes.Outcome,
+		)
+
+	case <-time.After(testTimeoutLong):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	// Expect HLTC 2 to be canceled via the MPPTimeout fail resolution.
+	select {
+	case resolution := <-hodlChan2:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		failRes, ok := htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T", resolution,
+		)
+		require.Equal(
+			t, invpkg.ResultMppTimeout, failRes.Outcome,
+			"expected MPPTimeout, got: %v", failRes.Outcome,
+		)
+
+	case <-time.After(testTimeoutLong):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	// The AMP invoice should still be open.
+	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractOpen, inv.State, "expected "+
+		"OPEN invoice")
+
+	// Because one HTLC of the set was cancelled we expect the AMPState to
+	// be set to canceled.
+	ampState, ok := inv.AMPState[setID]
+	require.True(t, ok, "expected AMPState to be set")
+	require.Equal(t, invpkg.HtlcStateCanceled, ampState.State, "expected "+
+		"AMPState CANCELED")
+
+	// The following is a bug and should not be allowed because the sub
+	// AMP invoice is already marked as canceled. However LND will accept
+	// other HTLCs to the AMP sub-invoice.
+	//
+	// TODO(ziggie): Fix this bug.
+	htlcPayload3 := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, payAddr),
+		// We are not interested in settling the AMP HTLC so we don't
+		// use valid shares.
+		amp: record.NewAMP([32]byte{3}, setID, 3),
+	}
+
+	// Send htlc 3 which should be added to the invoice as expected.
+	hodlChan3 := make(chan interface{}, 1)
+	resolution, err = ctx.registry.NotifyExitHopHtlc(
+		lntypes.Hash{3}, shardAmt, expiry, testCurrentHeight,
+		getCircuitKey(3), hodlChan3, nil, htlcPayload3,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	// TODO(ziggie): This is a race condition between the invoice being
+	// cancelled and the htlc being added to the invoice. If we do not wait
+	// here until the HTLC is added to the invoice, the test might fail
+	// because the HTLC will not be resolved.
+	require.Eventuallyf(t, func() bool {
+		inv, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+
+		return len(inv.Htlcs) == 3
+	}, testTimeout, time.Millisecond*100, "HTLC 3 not added to invoice")
+
+	// Now also let the invoice expire the invoice expiry is 1 hour.
+	currentTime = ctx.clock.Now()
+	ctx.clock.SetTime(currentTime.Add(1 * time.Minute))
+
+	// Expect HLTC 3 to be canceled either via the cancelation of the
+	// invoice or because the MPP timeout kicks in.
+	select {
+	case resolution := <-hodlChan3:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		failRes, ok := htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T", resolution,
+		)
+		require.Equal(
+			t, invpkg.ResultMppTimeout, failRes.Outcome,
+			"expected MPPTimeout, got: %v", failRes.Outcome,
+		)
+
+	case <-time.After(testTimeoutLong):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	// expire the invoice here.
+	currentTime = ctx.clock.Now()
+	ctx.clock.SetTime(currentTime.Add(61 * time.Minute))
+
+	require.Eventuallyf(t, func() bool {
+		inv, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+
+		return inv.State == invpkg.ContractCanceled
+	}, testTimeout, time.Millisecond*100, "invoice not canceled")
+
+	// Fetch the invoice again and compare the number of cancelled HTLCs.
+	inv, err = ctx.registry.LookupInvoice(
+		ctxb, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	// Make sure all HTLCs are in the cancelled state.
+	require.Len(t, inv.Htlcs, 3)
+	for _, htlc := range inv.Htlcs {
+		require.Equal(t, invpkg.HtlcStateCanceled, htlc.State,
+			"expected HTLC to be canceled")
+	}
+}
+
+// testCancelAMPInvoicePendingHTLCs tests the case where an AMP invoice is
+// canceled and the remaining HTLCs are also canceled so that no HTLCs are left
+// in the accepted state.
+func testCancelAMPInvoicePendingHTLCs(t *testing.T,
+	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
+
+	t.Parallel()
+
+	ctx := newTestContext(t, nil, makeDB)
+	ctxb := t.Context()
+
+	const (
+		expiry    = uint32(testCurrentHeight + 20)
+		numShards = 4
+	)
+
+	var (
+		shardAmt = testInvoiceAmount / lnwire.MilliSatoshi(numShards)
+		payAddr  [32]byte
+	)
+	_, err := rand.Read(payAddr[:])
+	require.NoError(t, err)
+
+	// Create an AMP invoice we are going to pay via a multi-part payment.
+	ampInvoice := newInvoice(t, false, true)
+
+	// An AMP invoice is referenced by the payment address.
+	ampInvoice.Terms.PaymentAddr = payAddr
+
+	_, err = ctx.registry.AddInvoice(
+		ctxb, ampInvoice, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	htlcPayloadSet1 := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, payAddr),
+		// We are not interested in settling the AMP HTLC so we don't
+		// use valid shares.
+		amp: record.NewAMP([32]byte{1}, [32]byte{1}, 1),
+	}
+
+	// Send first HTLC which pays part of the invoice.
+	hodlChan1 := make(chan interface{}, 1)
+	resolution, err := ctx.registry.NotifyExitHopHtlc(
+		lntypes.Hash{1}, shardAmt, expiry, testCurrentHeight,
+		getCircuitKey(1), hodlChan1, nil, htlcPayloadSet1,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	htlcPayloadSet2 := &mockPayload{
+		mpp: record.NewMPP(testInvoiceAmount, payAddr),
+		// We are not interested in settling the AMP HTLC so we don't
+		// use valid shares.
+		amp: record.NewAMP([32]byte{2}, [32]byte{2}, 1),
+	}
+
+	// Send htlc 2 which should be added to the invoice as expected.
+	hodlChan2 := make(chan interface{}, 1)
+	resolution, err = ctx.registry.NotifyExitHopHtlc(
+		lntypes.Hash{2}, shardAmt, expiry, testCurrentHeight,
+		getCircuitKey(2), hodlChan2, nil, htlcPayloadSet2,
+	)
+	require.NoError(t, err)
+	require.Nil(t, resolution, "did not expect direct resolution")
+
+	require.Eventuallyf(t, func() bool {
+		inv, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+
+		return len(inv.Htlcs) == 2
+	}, testTimeout, time.Millisecond*100, "HTLCs not added to invoice")
+
+	// expire the invoice here.
+	ctx.clock.SetTime(testTime.Add(65 * time.Minute))
+
+	// Expect HLTC 1 to be canceled via the MPPTimeout fail resolution.
+	select {
+	case resolution := <-hodlChan1:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		_, ok := htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T", resolution,
+		)
+
+	case <-time.After(testTimeout):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	// Expect HLTC 2 to be canceled via the MPPTimeout fail resolution.
+	select {
+	case resolution := <-hodlChan2:
+		htlcResolution, _ := resolution.(invpkg.HtlcResolution)
+		_, ok := htlcResolution.(*invpkg.HtlcFailResolution)
+		require.True(
+			t, ok, "expected fail resolution, got: %T", resolution,
+		)
+
+	case <-time.After(testTimeout):
+		t.Fatal("timeout waiting for HTLC resolution")
+	}
+
+	require.Eventuallyf(t, func() bool {
+		inv, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+
+		return inv.State == invpkg.ContractCanceled
+	}, testTimeout, time.Millisecond*100, "invoice not canceled")
+
+	// Fetch the invoice again and compare the number of cancelled HTLCs.
+	inv, err := ctx.registry.LookupInvoice(
+		ctxb, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	// Make sure all HTLCs are in the cancelled state.
+	require.Len(t, inv.Htlcs, 2)
+	for _, htlc := range inv.Htlcs {
+		require.Equal(t, invpkg.HtlcStateCanceled, htlc.State,
+			"expected HTLC to be canceled")
 	}
 }

@@ -1,10 +1,11 @@
 package batch
 
 import (
+	"context"
 	"errors"
 	"sync"
 
-	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/sqldb"
 )
 
 // errSolo is a sentinel error indicating that the requester should re-run the
@@ -13,28 +14,31 @@ var errSolo = errors.New(
 	"batch function returned an error and should be re-run solo",
 )
 
-type request struct {
-	*Request
+type request[Q any] struct {
+	*Request[Q]
 	errChan chan error
 }
 
-type batch struct {
-	db     kvdb.Backend
+type batch[Q any] struct {
+	db     sqldb.BatchedTx[Q]
 	start  sync.Once
-	reqs   []*request
-	clear  func(b *batch)
+	reqs   []*request[Q]
+	clear  func(b *batch[Q])
 	locker sync.Locker
+	txOpts sqldb.TxOptions
 }
 
 // trigger is the entry point for the batch and ensures that run is started at
 // most once.
-func (b *batch) trigger() {
-	b.start.Do(b.run)
+func (b *batch[Q]) trigger(ctx context.Context) {
+	b.start.Do(func() {
+		b.run(ctx)
+	})
 }
 
 // run executes the current batch of requests. If any individual requests fail
 // alongside others they will be retried by the caller.
-func (b *batch) run() {
+func (b *batch[Q]) run(ctx context.Context) {
 	// Clear the batch from its scheduler, ensuring that no new requests are
 	// added to this batch.
 	b.clear(b)
@@ -51,12 +55,24 @@ func (b *batch) run() {
 	// that fail will be retried individually.
 	for len(b.reqs) > 0 {
 		var failIdx = -1
-		err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
+		err := b.db.ExecTx(ctx, b.txOpts, func(tx Q) error {
 			for i, req := range b.reqs {
-				err := req.Update(tx)
+				err := req.Do(tx)
 				if err != nil {
-					failIdx = i
-					return err
+					// If we get a serialization error, we
+					// want the underlying SQL retry
+					// mechanism to retry the entire batch.
+					// Otherwise, we can succeed in an
+					// sqldb retry and still re-execute the
+					// failing request individually.
+					dbErr := sqldb.MapSQLError(err)
+					if !sqldb.IsSerializationError(dbErr) {
+						failIdx = i
+
+						return err
+					}
+
+					return dbErr
 				}
 			}
 			return nil

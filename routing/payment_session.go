@@ -1,16 +1,17 @@
 package routing
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btclog"
-	"github.com/lightningnetwork/lnd/build"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/graph"
+	"github.com/btcsuite/btclog/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/netann"
+	paymentsdb "github.com/lightningnetwork/lnd/payments/db"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
@@ -104,7 +105,7 @@ func (e noRouteError) Error() string {
 }
 
 // FailureReason converts a path finding error into a payment-level failure.
-func (e noRouteError) FailureReason() channeldb.FailureReason {
+func (e noRouteError) FailureReason() paymentsdb.FailureReason {
 	switch e {
 	case
 		errNoTlvPayload,
@@ -114,13 +115,13 @@ func (e noRouteError) FailureReason() channeldb.FailureReason {
 		errUnknownRequiredFeature,
 		errMissingDependentFeature:
 
-		return channeldb.FailureReasonNoRoute
+		return paymentsdb.FailureReasonNoRoute
 
 	case errInsufficientBalance:
-		return channeldb.FailureReasonInsufficientBalance
+		return paymentsdb.FailureReasonInsufficientBalance
 
 	default:
-		return channeldb.FailureReasonError
+		return paymentsdb.FailureReasonError
 	}
 }
 
@@ -147,8 +148,8 @@ type PaymentSession interface {
 	// (private channels) and applies the update from the message. Returns
 	// a boolean to indicate whether the update has been applied without
 	// error.
-	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate, pubKey *btcec.PublicKey,
-		policy *models.CachedEdgePolicy) bool
+	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
+		pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool
 
 	// GetAdditionalEdgePolicy uses the public key and channel ID to query
 	// the ephemeral channel edge policy for additional edges. Returns a nil
@@ -159,7 +160,7 @@ type PaymentSession interface {
 
 // paymentSession is used during an HTLC routings session to prune the local
 // chain view in response to failures, and also report those failures back to
-// MissionControl. The snapshot copied for this session will only ever grow,
+// MissionController. The snapshot copied for this session will only ever grow,
 // and will now be pruned after a decay like the main view within mission
 // control. We do this as we want to avoid the case where we continually try a
 // bad edge or route multiple times in a session. This can lead to an infinite
@@ -184,7 +185,7 @@ type paymentSession struct {
 	// trade-off in path finding between fees and probability.
 	pathFindingConfig PathFindingConfig
 
-	missionControl MissionController
+	missionControl MissionControlQuerier
 
 	// minShardAmt is the amount beyond which we won't try to further split
 	// the payment if no route is found. If the maximum number of htlcs
@@ -199,7 +200,8 @@ type paymentSession struct {
 // newPaymentSession instantiates a new payment session.
 func newPaymentSession(p *LightningPayment, selfNode route.Vertex,
 	getBandwidthHints func(Graph) (bandwidthHints, error),
-	graphSessFactory GraphSessionFactory, missionControl MissionController,
+	graphSessFactory GraphSessionFactory,
+	missionControl MissionControlQuerier,
 	pathFindingConfig PathFindingConfig) (*paymentSession, error) {
 
 	edges, err := RouteHintsToEdges(p.RouteHints, p.Target)
@@ -231,8 +233,19 @@ func newPaymentSession(p *LightningPayment, selfNode route.Vertex,
 		pathFindingConfig: pathFindingConfig,
 		missionControl:    missionControl,
 		minShardAmt:       DefaultShardMinAmt,
-		log:               build.NewPrefixLog(logPrefix, log),
+		log:               log.WithPrefix(logPrefix),
 	}, nil
+}
+
+// pathFindingError is a wrapper error type that is used to distinguish path
+// finding errors from other errors in path finding loop.
+type pathFindingError struct {
+	error
+}
+
+// Unwrap returns the underlying error.
+func (e *pathFindingError) Unwrap() error {
+	return e.error
 }
 
 // RequestRoute returns a route which is likely to be capable for successfully
@@ -266,7 +279,7 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 
 	// Taking into account this prune view, we'll attempt to locate a path
 	// to our destination, respecting the recommendations from
-	// MissionControl.
+	// MissionController.
 	restrictions := &RestrictParams{
 		ProbabilitySource:     p.missionControl.GetProbability,
 		FeeLimit:              feeLimit,
@@ -295,13 +308,8 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		maxAmt = *p.payment.MaxShardAmt
 	}
 
-	for {
-		// Get a routing graph session.
-		graph, closeGraph, err := p.graphSessFactory.NewGraphSession()
-		if err != nil {
-			return nil, err
-		}
-
+	var path []*unifiedEdge
+	findPath := func(graph graphdb.NodeTraverser) error {
 		// We'll also obtain a set of bandwidthHints from the lower
 		// layer for each of our outbound channels. This will allow the
 		// path finding to skip any links that aren't active or just
@@ -310,19 +318,13 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 		// attempt, because concurrent payments may change balances.
 		bandwidthHints, err := p.getBandwidthHints(graph)
 		if err != nil {
-			// Close routing graph session.
-			if graphErr := closeGraph(); graphErr != nil {
-				log.Errorf("could not close graph session: %v",
-					graphErr)
-			}
-
-			return nil, err
+			return err
 		}
 
 		p.log.Debugf("pathfinding for amt=%v", maxAmt)
 
 		// Find a route for the current amount.
-		path, _, err := p.pathFinder(
+		path, _, err = p.pathFinder(
 			&graphParams{
 				additionalEdges: p.additionalEdges,
 				bandwidthHints:  bandwidthHints,
@@ -332,12 +334,36 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 			p.selfNode, p.selfNode, p.payment.Target,
 			maxAmt, p.payment.TimePref, finalHtlcExpiry,
 		)
-
-		// Close routing graph session.
-		if err := closeGraph(); err != nil {
-			log.Errorf("could not close graph session: %v", err)
+		if err != nil {
+			// Wrap the error to distinguish path finding errors
+			// from other errors in this closure.
+			return &pathFindingError{err}
 		}
 
+		return nil
+	}
+
+	for {
+		err := p.graphSessFactory.GraphSession(
+			context.TODO(),
+			findPath, func() {
+				path = nil
+			},
+		)
+		// If there is an error, and it is not a path finding error, we
+		// return it immediately.
+		if err != nil && !lnutils.ErrorAs[*pathFindingError](err) {
+			return nil, err
+		} else if err != nil {
+			// If the error is a path finding error, we'll unwrap it
+			// to check the underlying error.
+			//
+			//nolint:errorlint
+			pErr, _ := err.(*pathFindingError)
+			err = pErr.Unwrap()
+		}
+
+		// Otherwise, we'll switch on the path finding error.
 		switch {
 		case err == errNoPathFound:
 			// Don't split if this is a legacy payment without mpp
@@ -436,11 +462,11 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 // validates the message signature and checks it's up to date, then applies the
 // updates to the supplied policy. It returns a boolean to indicate whether
 // there's an error when applying the updates.
-func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
+func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
 	pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool {
 
 	// Validate the message signature.
-	if err := graph.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
+	if err := netann.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
 		log.Errorf(
 			"Unable to validate channel update signature: %v", err,
 		)

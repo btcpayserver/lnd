@@ -12,10 +12,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lnutils"
@@ -242,6 +242,71 @@ func NewUtxoNursery(cfg *NurseryConfig) *UtxoNursery {
 	}
 }
 
+// patchZeroHeightHint handles the edge case where a crib output has expiry=0
+// due to a historical bug. This should never happen in normal operation, but
+// we provide a fallback mechanism using the channel close height to determine
+// a valid height hint for the chain notifier.
+//
+// This function returns a height hint that ensures we don't miss confirmations
+// while avoiding the chain notifier's requirement that height hints must
+// be > 0.
+func (u *UtxoNursery) patchZeroHeightHint(baby *babyOutput,
+	classHeight uint32) (uint32, error) {
+
+	if classHeight != 0 {
+		// Normal case - return the original height.
+		return classHeight, nil
+	}
+
+	utxnLog.Warnf("Detected crib output %v with expiry=0, "+
+		"attempting to use fallback height hint from channel "+
+		"close summary", baby.OutPoint())
+
+	// Try to get the channel close height as a fallback.
+	chanPoint := baby.OriginChanPoint()
+	closeSummary, err := u.cfg.FetchClosedChannel(chanPoint)
+	if err != nil {
+		return 0, fmt.Errorf("cannot fetch close summary for "+
+			"channel %v to determine fallback height hint: %w",
+			chanPoint, err)
+	}
+
+	heightHint := closeSummary.CloseHeight
+
+	// If the close height is 0, we try to use the short channel ID block
+	// height as a fallback.
+	if heightHint == 0 {
+		if closeSummary.ShortChanID.BlockHeight == 0 {
+			return 0, fmt.Errorf("cannot use fallback height " +
+				"hint: close height is 0 and short " +
+				"channel ID block height is 0")
+		}
+
+		heightHint = closeSummary.ShortChanID.BlockHeight
+	}
+
+	// At this point the height hint should normally be greater than the
+	// conf depth since channels should have a minimum close height of the
+	// segwit activation height and the conf depth which is a config
+	// parameter should be in the single digit range.
+	if heightHint <= u.cfg.ConfDepth {
+		return 0, fmt.Errorf("cannot use fallback height hint: "+
+			"fallback height hint %v <= confirmation depth %v",
+			heightHint, u.cfg.ConfDepth)
+	}
+
+	// Use the close height minus the confirmation depth as a conservative
+	// height hint. This ensures we don't miss the confirmation even if it
+	// happened around the close height.
+	heightHint -= u.cfg.ConfDepth
+
+	utxnLog.Infof("Using fallback height hint %v for crib output "+
+		"%v (channel closed at height %v, conf depth %v)", heightHint,
+		baby.OutPoint(), closeSummary.CloseHeight, u.cfg.ConfDepth)
+
+	return heightHint, nil
+}
+
 // Start launches all goroutines the UtxoNursery needs to properly carry out
 // its duties.
 func (u *UtxoNursery) Start() error {
@@ -285,19 +350,18 @@ func (u *UtxoNursery) Start() error {
 	// 2. Restart spend ntfns for any preschool outputs, which are waiting
 	// for the force closed commitment txn to confirm, or any second-layer
 	// HTLC success transactions.
-	//
-	// NOTE: The next two steps *may* spawn go routines, thus from this
-	// point forward, we must close the nursery's quit channel if we detect
-	// any failures during startup to ensure they terminate.
+	// NOTE: The next two steps *may* spawn go routines.
 	if err := u.reloadPreschool(); err != nil {
-		close(u.quit)
+		utxnLog.Errorf("Failed to reload preschool: %v", err)
+
 		return err
 	}
 
 	// 3. Replay all crib and kindergarten outputs up to the current best
 	// height.
 	if err := u.reloadClasses(uint32(bestHeight)); err != nil {
-		close(u.quit)
+		utxnLog.Errorf("Failed to reload class: %v", err)
+
 		return err
 	}
 
@@ -308,7 +372,8 @@ func (u *UtxoNursery) Start() error {
 		Hash:   bestHash,
 	})
 	if err != nil {
-		close(u.quit)
+		utxnLog.Errorf("RegisterBlockEpochNtfn failed: %v", err)
+
 		return err
 	}
 
@@ -334,6 +399,26 @@ func (u *UtxoNursery) Stop() error {
 	return nil
 }
 
+// IncubateConfig holds optional configuration for IncubateOutputs.
+type IncubateConfig struct {
+	// chanType is the channel type, used to determine which witness type
+	// to select for taproot channels.
+	chanType fn.Option[channeldb.ChannelType]
+}
+
+// IncubateOption is a functional option that can be used to modify the behavior
+// of IncubateOutputs.
+type IncubateOption func(*IncubateConfig)
+
+// WithChanType returns an IncubateOption that sets the channel type for the
+// incubation request, enabling correct witness type selection for production
+// taproot channels.
+func WithChanType(ct channeldb.ChannelType) IncubateOption {
+	return func(cfg *IncubateConfig) {
+		cfg.chanType = fn.Some(ct)
+	}
+}
+
 // IncubateOutputs sends a request to the UtxoNursery to incubate a set of
 // outputs from an existing commitment transaction. Outputs need to incubate if
 // they're CLTV absolute time locked, or if they're CSV relative time locked.
@@ -341,7 +426,17 @@ func (u *UtxoNursery) Stop() error {
 func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 	outgoingHtlc fn.Option[lnwallet.OutgoingHtlcResolution],
 	incomingHtlc fn.Option[lnwallet.IncomingHtlcResolution],
-	broadcastHeight uint32, deadlineHeight fn.Option[int32]) error {
+	broadcastHeight uint32, deadlineHeight fn.Option[int32],
+	opts ...IncubateOption) error {
+
+	cfg := IncubateConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Determine if this is a production taproot channel based on the
+	// channel type passed via functional options.
+	isFinalTaproot := cfg.chanType.UnwrapOr(0).IsTaprootFinal()
 
 	// Add to wait group because nursery might shut down during execution of
 	// this function. Otherwise it could happen that nursery thinks it is
@@ -383,9 +478,12 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 		)
 
 		var witType input.StandardWitnessType
-		if isTaproot {
+		switch {
+		case isFinalTaproot:
+			witType = input.TaprootHtlcAcceptedSuccessSecondLevelFinal //nolint:ll
+		case isTaproot:
 			witType = input.TaprootHtlcAcceptedSuccessSecondLevel
-		} else {
+		default:
 			witType = input.HtlcAcceptedSuccessSecondLevel
 		}
 
@@ -410,6 +508,7 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 		if htlcRes.SignedTimeoutTx != nil {
 			htlcOutput := makeBabyOutput(
 				&chanPoint, &htlcRes, deadlineHeight,
+				isFinalTaproot,
 			)
 
 			if htlcOutput.Amount() > 0 {
@@ -427,12 +526,14 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 		)
 
 		var witType input.StandardWitnessType
-		if isTaproot {
+		switch {
+		case isFinalTaproot:
+			witType = input.TaprootHtlcOfferedRemoteTimeoutFinal
+		case isTaproot:
 			witType = input.TaprootHtlcOfferedRemoteTimeout
-		} else {
+		default:
 			witType = input.HtlcOfferedRemoteTimeout
 		}
-
 		// Otherwise, this is actually a kid output as we can sweep it
 		// once the commitment transaction confirms, and the absolute
 		// CLTV lock has expired. We set the CSV delay what the
@@ -554,7 +655,9 @@ func (u *UtxoNursery) NurseryReport(
 				// confirmation of the commitment transaction.
 				switch kid.WitnessType() {
 
-				//nolint:lll
+				//nolint:ll
+				case input.TaprootHtlcAcceptedSuccessSecondLevelFinal:
+					fallthrough
 				case input.TaprootHtlcAcceptedSuccessSecondLevel:
 					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
@@ -565,6 +668,7 @@ func (u *UtxoNursery) NurseryReport(
 					report.AddLimboStage1SuccessHtlc(&kid)
 
 				case input.HtlcOfferedRemoteTimeout,
+					input.TaprootHtlcOfferedRemoteTimeoutFinal, //nolint:ll
 					input.TaprootHtlcOfferedRemoteTimeout:
 					// This is an HTLC output on the
 					// commitment transaction of the remote
@@ -581,6 +685,7 @@ func (u *UtxoNursery) NurseryReport(
 				switch kid.WitnessType() {
 
 				case input.HtlcOfferedRemoteTimeout,
+					input.TaprootHtlcOfferedRemoteTimeoutFinal, //nolint:ll
 					input.TaprootHtlcOfferedRemoteTimeout:
 					// This is an HTLC output on the
 					// commitment transaction of the remote
@@ -589,10 +694,14 @@ func (u *UtxoNursery) NurseryReport(
 					// it.
 					report.AddLimboDirectHtlc(&kid)
 
-				//nolint:lll
+				//nolint:ll
 				case input.TaprootHtlcAcceptedSuccessSecondLevel:
 					fallthrough
 				case input.TaprootHtlcOfferedTimeoutSecondLevel:
+					fallthrough
+				case input.TaprootHtlcAcceptedSuccessSecondLevelFinal: //nolint:ll
+					fallthrough
+				case input.TaprootHtlcOfferedTimeoutSecondLevelFinal: //nolint:ll
 					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
 					fallthrough
@@ -608,16 +717,23 @@ func (u *UtxoNursery) NurseryReport(
 				// been swept back into the wallet. Each output
 				// will contribute towards the recovered
 				// balance.
+				//
+				//nolint:ll
 				switch kid.WitnessType() {
 
-				//nolint:lll
+				case input.TaprootHtlcAcceptedSuccessSecondLevelFinal:
+					fallthrough
 				case input.TaprootHtlcAcceptedSuccessSecondLevel:
+					fallthrough
+				case input.TaprootHtlcOfferedTimeoutSecondLevelFinal:
 					fallthrough
 				case input.TaprootHtlcOfferedTimeoutSecondLevel:
 					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
 					fallthrough
 				case input.HtlcOfferedTimeoutSecondLevel:
+					fallthrough
+				case input.TaprootHtlcOfferedRemoteTimeoutFinal:
 					fallthrough
 				case input.TaprootHtlcOfferedRemoteTimeout:
 					fallthrough
@@ -793,7 +909,7 @@ func (u *UtxoNursery) graduateClass(classHeight uint32) error {
 		return err
 	}
 
-	utxnLog.Infof("Attempting to graduate height=%v: num_kids=%v, "+
+	utxnLog.Debugf("Attempting to graduate height=%v: num_kids=%v, "+
 		"num_babies=%v", classHeight, len(kgtnOutputs), len(cribOutputs))
 
 	// Offer the outputs to the sweeper and set up notifications that will
@@ -963,11 +1079,23 @@ func (u *UtxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) erro
 		!errors.Is(err, lnwallet.ErrMempoolFee) {
 
 		utxnLog.Errorf("Unable to broadcast baby tx: "+
-			"%v, %v", err, spew.Sdump(baby.timeoutTx))
+			"%v, %v", err, lnutils.SpewLogClosure(baby.timeoutTx))
 		return err
 	}
 
-	return u.registerTimeoutConf(baby, classHeight)
+	// Determine the height hint to use for the confirmation notification.
+	// In the normal case, we use classHeight (which is the expiry height).
+	// However, due to a historical bug, some outputs were stored with
+	// expiry=0. For these cases, we need to use a fallback height hint
+	// based on the channel close height to avoid errors from the chain
+	// notifier which requires height hints > 0.
+	heightHint, err := u.patchZeroHeightHint(baby, classHeight)
+	if err != nil {
+		return fmt.Errorf("cannot determine height hint for "+
+			"crib output with expiry=0: %w", err)
+	}
+
+	return u.registerTimeoutConf(baby, heightHint)
 }
 
 // registerTimeoutConf is responsible for subscribing to confirmation
@@ -1304,7 +1432,8 @@ type babyOutput struct {
 // reaches the delay and claim stage.
 func makeBabyOutput(chanPoint *wire.OutPoint,
 	htlcResolution *lnwallet.OutgoingHtlcResolution,
-	deadlineHeight fn.Option[int32]) babyOutput {
+	deadlineHeight fn.Option[int32],
+	isFinalTaproot bool) babyOutput {
 
 	htlcOutpoint := htlcResolution.ClaimOutpoint
 	blocksToMaturity := htlcResolution.CsvDelay
@@ -1314,12 +1443,14 @@ func makeBabyOutput(chanPoint *wire.OutPoint,
 	)
 
 	var witnessType input.StandardWitnessType
-	if isTaproot {
+	switch {
+	case isFinalTaproot:
+		witnessType = input.TaprootHtlcOfferedTimeoutSecondLevelFinal
+	case isTaproot:
 		witnessType = input.TaprootHtlcOfferedTimeoutSecondLevel
-	} else {
+	default:
 		witnessType = input.HtlcOfferedTimeoutSecondLevel
 	}
-
 	kid := makeKidOutput(
 		&htlcOutpoint, chanPoint, blocksToMaturity, witnessType,
 		&htlcResolution.SweepSignDesc, 0, deadlineHeight,
@@ -1411,9 +1542,12 @@ func makeKidOutput(outpoint, originChanPoint *wire.OutPoint,
 	// This is an HTLC either if it's an incoming HTLC on our commitment
 	// transaction, or is an outgoing HTLC on the commitment transaction of
 	// the remote peer.
+	//nolint:ll
 	isHtlc := (witnessType == input.HtlcAcceptedSuccessSecondLevel ||
 		witnessType == input.TaprootHtlcAcceptedSuccessSecondLevel ||
+		witnessType == input.TaprootHtlcAcceptedSuccessSecondLevelFinal ||
 		witnessType == input.TaprootHtlcOfferedRemoteTimeout ||
+		witnessType == input.TaprootHtlcOfferedRemoteTimeoutFinal ||
 		witnessType == input.HtlcOfferedRemoteTimeout)
 
 	// heightHint can be safely set to zero here, because after this
@@ -1466,10 +1600,10 @@ func (k *kidOutput) Encode(w io.Writer) error {
 	}
 
 	op := k.OutPoint()
-	if err := writeOutpoint(w, &op); err != nil {
+	if err := graphdb.WriteOutpoint(w, &op); err != nil {
 		return err
 	}
-	if err := writeOutpoint(w, k.OriginChanPoint()); err != nil {
+	if err := graphdb.WriteOutpoint(w, k.OriginChanPoint()); err != nil {
 		return err
 	}
 
@@ -1513,20 +1647,70 @@ func (k *kidOutput) Encode(w io.Writer) error {
 // Decode takes a byte array representation of a kidOutput and converts it to an
 // struct. Note that the witnessFunc method isn't added during deserialization
 // and must be added later based on the value of the witnessType field.
+//
+// NOTE: We need to support both formats because we did not migrate the database
+// to the new format so the support for the legacy format is still needed.
 func (k *kidOutput) Decode(r io.Reader) error {
+	// Read all available data into a buffer first so we can try both
+	// formats.
+	//
+	// NOTE: We can consume the whole reader here because every kidOutput is
+	// saved separately via a key-value pair and we are only decoding them
+	// individually so there is no risk of reading multiple kidOutputs.
+	var buf bytes.Buffer
+	_, err := io.Copy(&buf, r)
+	if err != nil {
+		return err
+	}
+
+	data := buf.Bytes()
+	bufReader := bytes.NewReader(data)
+
+	// Try the new format first. A successful decode must consume all bytes.
+	newErr := k.decodeNewFormat(bufReader)
+	if newErr == nil && bufReader.Len() == 0 {
+		return nil
+	}
+
+	// If that fails, reset the reader and try the legacy format.
+	_, err = bufReader.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	legacyErr := k.decodeLegacyFormat(bufReader)
+	if legacyErr != nil {
+		return fmt.Errorf("failed to decode with both new and "+
+			"legacy formats: new=%v, legacy=%v", newErr, legacyErr)
+	}
+
+	// The legacy format must also consume all bytes.
+	if bufReader.Len() > 0 {
+		return fmt.Errorf("legacy decode has %d trailing bytes",
+			bufReader.Len())
+	}
+
+	return nil
+}
+
+// decodeNewFormat decodes using the new format with variable-length outpoint
+// encoding.
+func (k *kidOutput) decodeNewFormat(r *bytes.Reader) error {
 	var scratch [8]byte
 
-	if _, err := r.Read(scratch[:]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:]); err != nil {
 		return err
 	}
 	k.amt = btcutil.Amount(byteOrder.Uint64(scratch[:]))
 
-	if err := readOutpoint(io.LimitReader(r, 40), &k.outpoint); err != nil {
+	// The outpoint does use the new format without a preceding varint.
+	if err := graphdb.ReadOutpoint(r, &k.outpoint); err != nil {
 		return err
 	}
 
-	err := readOutpoint(io.LimitReader(r, 40), &k.originChanPoint)
-	if err != nil {
+	// The origin chan point does use the new format without a preceding
+	// varint..
+	if err := graphdb.ReadOutpoint(r, &k.originChanPoint); err != nil {
 		return err
 	}
 
@@ -1534,22 +1718,22 @@ func (k *kidOutput) Decode(r io.Reader) error {
 		return err
 	}
 
-	if _, err := r.Read(scratch[:4]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
 		return err
 	}
 	k.blocksToMaturity = byteOrder.Uint32(scratch[:4])
 
-	if _, err := r.Read(scratch[:4]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
 		return err
 	}
 	k.absoluteMaturity = byteOrder.Uint32(scratch[:4])
 
-	if _, err := r.Read(scratch[:4]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
 		return err
 	}
 	k.confHeight = byteOrder.Uint32(scratch[:4])
 
-	if _, err := r.Read(scratch[:2]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:2]); err != nil {
 		return err
 	}
 	k.witnessType = input.StandardWitnessType(byteOrder.Uint16(scratch[:2]))
@@ -1577,24 +1761,75 @@ func (k *kidOutput) Decode(r io.Reader) error {
 	return nil
 }
 
-// TODO(bvu): copied from channeldb, remove repetition
-func writeOutpoint(w io.Writer, o *wire.OutPoint) error {
-	// TODO(roasbeef): make all scratch buffers on the stack
-	scratch := make([]byte, 4)
+// decodeLegacyFormat decodes using the legacy format with fixed-length outpoint
+// encoding.
+func (k *kidOutput) decodeLegacyFormat(r *bytes.Reader) error {
+	var scratch [8]byte
 
-	// TODO(roasbeef): write raw 32 bytes instead of wasting the extra
-	// byte.
-	if err := wire.WriteVarBytes(w, 0, o.Hash[:]); err != nil {
+	if _, err := io.ReadFull(r, scratch[:]); err != nil {
+		return err
+	}
+	k.amt = btcutil.Amount(byteOrder.Uint64(scratch[:]))
+
+	// Outpoint uses the legacy format with a preceding varint.
+	if err := readOutpointVarBytes(r, &k.outpoint); err != nil {
 		return err
 	}
 
-	byteOrder.PutUint32(scratch, o.Index)
-	_, err := w.Write(scratch)
-	return err
+	// Origin chan point uses the legacy format with a preceding varint.
+	if err := readOutpointVarBytes(r, &k.originChanPoint); err != nil {
+		return err
+	}
+
+	if err := binary.Read(r, byteOrder, &k.isHtlc); err != nil {
+		return err
+	}
+
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
+		return err
+	}
+	k.blocksToMaturity = byteOrder.Uint32(scratch[:4])
+
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
+		return err
+	}
+	k.absoluteMaturity = byteOrder.Uint32(scratch[:4])
+
+	if _, err := io.ReadFull(r, scratch[:4]); err != nil {
+		return err
+	}
+	k.confHeight = byteOrder.Uint32(scratch[:4])
+
+	if _, err := io.ReadFull(r, scratch[:2]); err != nil {
+		return err
+	}
+	k.witnessType = input.StandardWitnessType(byteOrder.Uint16(scratch[:2]))
+
+	if err := input.ReadSignDescriptor(r, &k.signDesc); err != nil {
+		return err
+	}
+
+	// If there's anything left in the reader, then this is a taproot
+	// output that also wrote a control block.
+	ctrlBlock, err := wire.ReadVarBytes(r, 0, 1000, "control block")
+	switch {
+	// If there're no bytes remaining, then we'll return early.
+	case errors.Is(err, io.EOF):
+		fallthrough
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return nil
+
+	case err != nil:
+		return err
+	}
+
+	k.signDesc.ControlBlock = ctrlBlock
+
+	return nil
 }
 
-// TODO(bvu): copied from channeldb, remove repetition
-func readOutpoint(r io.Reader, o *wire.OutPoint) error {
+// readOutpointVarBytes reads an outpoint using the variable-length encoding.
+func readOutpointVarBytes(r io.Reader, o *wire.OutPoint) error {
 	scratch := make([]byte, 4)
 
 	txid, err := wire.ReadVarBytes(r, 0, 32, "prevout")

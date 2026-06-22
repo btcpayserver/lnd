@@ -8,8 +8,8 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -22,13 +22,7 @@ import (
 func TestChainArbitratorRepublishCloses(t *testing.T) {
 	t.Parallel()
 
-	db, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
 	// Create 10 test channels and sync them to the database.
 	const numChans = 10
@@ -83,7 +77,6 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 		ChainIO: &mock.ChainIO{},
 		Notifier: &mock.ChainNotifier{
 			SpendChan: make(chan *chainntnfs.SpendDetail),
-			EpochChan: make(chan *chainntnfs.BlockEpoch),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
 		},
 		PublishTx: func(tx *wire.MsgTx, _ string) error {
@@ -97,7 +90,8 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 		chainArbCfg, db,
 	)
 
-	if err := chainArb.Start(); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chainArb.Start(beat); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -139,11 +133,7 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 func TestResolveContract(t *testing.T) {
 	t.Parallel()
 
-	db, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err, "unable to open db")
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
 	// With the DB created, we'll make a new channel, and mark it as
 	// pending open within the database.
@@ -168,7 +158,6 @@ func TestResolveContract(t *testing.T) {
 		ChainIO: &mock.ChainIO{},
 		Notifier: &mock.ChainNotifier{
 			SpendChan: make(chan *chainntnfs.SpendDetail),
-			EpochChan: make(chan *chainntnfs.BlockEpoch),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
 		},
 		PublishTx: func(tx *wire.MsgTx, _ string) error {
@@ -185,7 +174,8 @@ func TestResolveContract(t *testing.T) {
 	chainArb := NewChainArbitrator(
 		chainArbCfg, db,
 	)
-	if err := chainArb.Start(); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chainArb.Start(beat); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -228,4 +218,70 @@ func TestResolveContract(t *testing.T) {
 	// error, as there is no more state to be cleaned up.
 	err = chainArb.ResolveContract(channel.FundingOutpoint)
 	require.NoError(t, err, "second resolve call shouldn't fail")
+}
+
+// TestShouldSuppressClosedChannelNotify pins down the gate that prevents
+// MarkChannelClosed from firing a duplicate NotifyClosedChannel after the
+// chain watcher has already emitted a preliminary CLOSED_CHANNEL via the
+// early-dispatch path. Only the cooperative-close path can be suppressed;
+// every other CloseType (force, breach, abandon) must always notify here
+// regardless of the early-dispatched flag. The fast path (numConfs==1)
+// never sets the early-dispatched flag, so cooperative closes on that path
+// also fall through to NotifyClosedChannel.
+func TestShouldSuppressClosedChannelNotify(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		closeType       channeldb.ClosureType
+		earlyDispatched bool
+		wantSuppress    bool
+	}{
+		{
+			name:            "coop close with early dispatch",
+			closeType:       channeldb.CooperativeClose,
+			earlyDispatched: true,
+			wantSuppress:    true,
+		},
+		{
+			name: "coop close without early dispatch " +
+				"(fast path or no watcher)",
+			closeType:       channeldb.CooperativeClose,
+			earlyDispatched: false,
+			wantSuppress:    false,
+		},
+		{
+			name:            "local force close",
+			closeType:       channeldb.LocalForceClose,
+			earlyDispatched: true,
+			wantSuppress:    false,
+		},
+		{
+			name:            "remote force close",
+			closeType:       channeldb.RemoteForceClose,
+			earlyDispatched: true,
+			wantSuppress:    false,
+		},
+		{
+			name:            "breach close",
+			closeType:       channeldb.BreachClose,
+			earlyDispatched: true,
+			wantSuppress:    false,
+		},
+		{
+			name:            "abandoned close",
+			closeType:       channeldb.Abandoned,
+			earlyDispatched: true,
+			wantSuppress:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldSuppressClosedChannelNotify(
+				tc.closeType, tc.earlyDispatched,
+			)
+			require.Equal(t, tc.wantSuppress, got)
+		})
+	}
 }

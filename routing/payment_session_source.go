@@ -1,10 +1,8 @@
 package routing
 
 import (
-	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -12,7 +10,7 @@ import (
 	"github.com/lightningnetwork/lnd/zpay32"
 )
 
-// A compile time assertion to ensure MissionControl meets the
+// A compile time assertion to ensure SessionSource meets the
 // PaymentSessionSource interface.
 var _ PaymentSessionSource = (*SessionSource)(nil)
 
@@ -25,7 +23,7 @@ type SessionSource struct {
 	GraphSessionFactory GraphSessionFactory
 
 	// SourceNode is the graph's source node.
-	SourceNode *channeldb.LightningNode
+	SourceNode *models.Node
 
 	// GetLink is a method that allows querying the lower link layer
 	// to determine the up to date available bandwidth at a prospective link
@@ -41,7 +39,7 @@ type SessionSource struct {
 	// then take into account this set of pruned vertexes/edges to reduce
 	// route failure and pass on graph information gained to the next
 	// execution.
-	MissionControl MissionController
+	MissionControl MissionControlQuerier
 
 	// PathFindingConfig defines global parameters that control the
 	// trade-off in path finding between fees and probability.
@@ -103,17 +101,13 @@ func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
 			// we'll need to look at the next hint's start node. If
 			// we've reached the end of the hints list, we can
 			// assume we've reached the destination.
-			endNode := &channeldb.LightningNode{}
+			endNode := target
 			if i != len(routeHint)-1 {
-				endNode.AddPubKey(routeHint[i+1].NodeID)
-			} else {
-				targetPubKey, err := btcec.ParsePubKey(
-					target[:],
+				nodeID := routeHint[i+1].NodeID
+				copy(
+					endNode[:],
+					nodeID.SerializeCompressed(),
 				)
-				if err != nil {
-					return nil, err
-				}
-				endNode.AddPubKey(targetPubKey)
 			}
 
 			// Finally, create the channel edge from the hop hint
@@ -121,7 +115,7 @@ func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
 			// at the start of the channel.
 			edgePolicy := &models.CachedEdgePolicy{
 				ToNodePubKey: func() route.Vertex {
-					return endNode.PubKeyBytes
+					return endNode
 				},
 				ToNodeFeatures: lnwire.EmptyFeatureVector(),
 				ChannelID:      hopHint.ChannelID,

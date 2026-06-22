@@ -2,9 +2,10 @@ package invoices
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 )
 
 var (
@@ -136,9 +137,6 @@ func (s *HtlcModificationInterceptor) Intercept(clientRequest HtlcModifyRequest,
 	// Wait for the client to respond or an error to occur.
 	select {
 	case response := <-responseChan:
-		log.Debugf("Received invoice HTLC interceptor response: %v",
-			response)
-
 		responseCallback(*response)
 
 		return nil
@@ -167,20 +165,30 @@ func (s *HtlcModificationInterceptor) RegisterInterceptor(
 
 // Start starts the service.
 func (s *HtlcModificationInterceptor) Start() error {
+	log.Info("HtlcModificationInterceptor starting...")
+
 	if !s.started.CompareAndSwap(false, true) {
-		return nil
+		return fmt.Errorf("HtlcModificationInterceptor started more" +
+			"than once")
 	}
+
+	log.Debugf("HtlcModificationInterceptor started")
 
 	return nil
 }
 
 // Stop stops the service.
 func (s *HtlcModificationInterceptor) Stop() error {
+	log.Info("HtlcModificationInterceptor stopping...")
+
 	if !s.stopped.CompareAndSwap(false, true) {
-		return nil
+		return fmt.Errorf("HtlcModificationInterceptor stopped more" +
+			"than once")
 	}
 
 	close(s.quit)
+
+	log.Debug("HtlcModificationInterceptor stopped")
 
 	return nil
 }

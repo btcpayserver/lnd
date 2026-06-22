@@ -3,8 +3,11 @@ package commands
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -12,8 +15,11 @@ import (
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/urfave/cli"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -26,6 +32,13 @@ var (
 		Name:  "save_to",
 		Usage: "save returned admin macaroon to this file",
 	}
+	macRootKeyFlag = cli.StringFlag{
+		Name: "mac_root_key",
+		Usage: "macaroon root key to use when initializing the " +
+			"macaroon store; allows for deterministic macaroon " +
+			"generation; if not set, a random one will be " +
+			"created",
+	}
 )
 
 var createCommand = cli.Command{
@@ -34,17 +47,16 @@ var createCommand = cli.Command{
 	Usage:    "Initialize a wallet when starting lnd for the first time.",
 	Description: `
 	The create command is used to initialize an lnd wallet from scratch for
-	the very first time. This is interactive command with one required
-	argument (the password), and one optional argument (the mnemonic
-	passphrase).
+	the very first time. This is an interactive command with one required
+	input (the password), and one optional input (the mnemonic passphrase).
 
-	The first argument (the password) is required and MUST be greater than
-	8 characters. This will be used to encrypt the wallet within lnd. This
+	The first input (the password) is required and MUST be greater than 8
+	characters. This will be used to encrypt the wallet within lnd. This
 	MUST be remembered as it will be required to fully start up the daemon.
 
-	The second argument is an optional 24-word mnemonic derived from BIP
-	39. If provided, then the internal wallet will use the seed derived
-	from this mnemonic to generate all keys.
+	The second input is an optional 24-word mnemonic derived from BIP 39.
+	If provided, then the internal wallet will use the seed derived from
+	this mnemonic to generate all keys.
 
 	This command returns a 24-word seed in the scenario that NO mnemonic
 	was provided by the user. This should be written down as it can be used
@@ -82,6 +94,7 @@ var createCommand = cli.Command{
 		},
 		statelessInitFlag,
 		saveToFlag,
+		macRootKeyFlag,
 	},
 	Action: actionDecorator(create),
 }
@@ -262,6 +275,7 @@ mnemonicCheck:
 		extendedRootKey         string
 		extendedRootKeyBirthday uint64
 		recoveryWindow          int32
+		macRootKey              []byte
 	)
 	switch {
 	// Use an existing cipher seed mnemonic in the aezeed format.
@@ -367,6 +381,23 @@ mnemonicCheck:
 		printCipherSeedWords(cipherSeedMnemonic)
 	}
 
+	// Parse the macaroon root key if it was specified by the user.
+	if ctx.IsSet(macRootKeyFlag.Name) {
+		macRootKey, err = hex.DecodeString(
+			ctx.String(macRootKeyFlag.Name),
+		)
+		if err != nil {
+			return fmt.Errorf("unable to parse macaroon root key: "+
+				"%w", err)
+		}
+
+		if len(macRootKey) != macaroons.RootKeyLen {
+			return fmt.Errorf("macaroon root key must be exactly "+
+				"%v bytes, got %v", macaroons.RootKeyLen,
+				len(macRootKey))
+		}
+	}
+
 	// With either the user's prior cipher seed, or a newly generated one,
 	// we'll go ahead and initialize the wallet.
 	req := &lnrpc.InitWalletRequest{
@@ -378,6 +409,7 @@ mnemonicCheck:
 		RecoveryWindow:                     recoveryWindow,
 		ChannelBackups:                     chanBackups,
 		StatelessInit:                      statelessInit,
+		MacaroonRootKey:                    macRootKey,
 	}
 	response, err := client.InitWallet(ctxc, req)
 	if err != nil {
@@ -475,10 +507,31 @@ var unlockCommand = cli.Command{
 	Action: actionDecorator(unlock),
 }
 
+// unlock is the lncli entry point for unlocking the wallet using the
+// WalletUnlocker service.
 func unlock(ctx *cli.Context) error {
-	ctxc := getContext()
-	client, cleanUp := getWalletUnlockerClient(ctx)
+	return unlockWithDeps(
+		ctx, readPassword, getWalletUnlockerClient,
+		getStateServiceClient, getContext, os.Stdin,
+	)
+}
+
+// unlockWithDeps performs the unlock flow with injected dependencies to
+// simplify unit testing.
+func unlockWithDeps(ctx *cli.Context,
+	readPasswordFn func(string) ([]byte, error),
+	getUnlockerClientFn func(*cli.Context) (lnrpc.WalletUnlockerClient,
+		func()),
+	getStateClientFn func(*cli.Context) (lnrpc.StateClient, func()),
+	getContextFn func() context.Context, stdin io.Reader) error {
+
+	ctxc := getContextFn()
+	client, cleanUp := getUnlockerClientFn(ctx)
 	defer cleanUp()
+
+	// Use the always-on state service to wait for unlock readiness.
+	stateClient, stateCleanUp := getStateClientFn(ctx)
+	defer stateCleanUp()
 
 	var (
 		pw  []byte
@@ -490,7 +543,7 @@ func unlock(ctx *cli.Context) error {
 	// password manager. If the user types the password instead, it will be
 	// echoed in the console.
 	case ctx.IsSet("stdin"):
-		reader := bufio.NewReader(os.Stdin)
+		reader := bufio.NewReader(stdin)
 		pw, err = reader.ReadBytes('\n')
 
 		// Remove carriage return and newline characters.
@@ -500,7 +553,7 @@ func unlock(ctx *cli.Context) error {
 	// terminal to be a real tty and will fail if a string is piped into
 	// lncli.
 	default:
-		pw, err = readPassword("Input wallet password: ")
+		pw, err = readPasswordFn("Input wallet password: ")
 	}
 	if err != nil {
 		return err
@@ -528,7 +581,26 @@ func unlock(ctx *cli.Context) error {
 		RecoveryWindow: recoveryWindow,
 		StatelessInit:  ctx.Bool(statelessInitFlag.Name),
 	}
+
+	// Wait until lnd reports the wallet is locked and ready to accept
+	// an unlock request.
+	waitCtx, cancel := context.WithCancel(ctxc)
+	err = waitForWalletLocked(waitCtx, stateClient)
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	// Submit the unlock request once the wallet is ready.
 	_, err = client.UnlockWallet(ctxc, req)
+	if err != nil {
+		return err
+	}
+
+	// Wait until the wallet is fully unlocked (or RPC/server active).
+	waitCtx, cancel = context.WithCancel(ctxc)
+	err = waitForWalletUnlocked(waitCtx, stateClient)
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -538,6 +610,138 @@ func unlock(ctx *cli.Context) error {
 	// TODO(roasbeef): add ability to accept hex single and multi backups
 
 	return nil
+}
+
+// waitForWalletState consumes the StateService stream until the check function
+// reports completion or the stream ends.
+func waitForWalletState(ctx context.Context, client lnrpc.StateClient,
+	check func(lnrpc.WalletState) (bool, error)) error {
+
+	stream, err := client.SubscribeState(
+		ctx, &lnrpc.SubscribeStateRequest{},
+	)
+	if err != nil {
+		return err
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return errors.New("lnd shut down before " +
+					"reaching expected wallet state")
+			}
+
+			return err
+		}
+
+		state := resp.GetState()
+		fmt.Printf("wallet state: %s\n", state)
+
+		done, err := check(state)
+		if done {
+			return err
+		}
+	}
+}
+
+// waitForWalletLocked blocks until the wallet reaches LOCKED, or errors if the
+// wallet is missing or already unlocked.
+func waitForWalletLocked(ctx context.Context, client lnrpc.StateClient) error {
+	check := func(state lnrpc.WalletState) (bool, error) {
+		switch state {
+		case lnrpc.WalletState_LOCKED:
+			return true, nil
+
+		case lnrpc.WalletState_NON_EXISTING:
+			return true, errors.New("wallet is not initialized - " +
+				"please run 'lncli create'")
+
+		case lnrpc.WalletState_UNLOCKED,
+			lnrpc.WalletState_RPC_ACTIVE,
+			lnrpc.WalletState_SERVER_ACTIVE:
+
+			return true, errors.New("wallet is already unlocked")
+
+		default:
+			return false, nil
+		}
+	}
+
+	err := waitForWalletState(ctx, client, check)
+	if err == nil {
+		return nil
+	}
+
+	if s, ok := status.FromError(err); ok {
+		switch s.Code() {
+		case codes.Unimplemented:
+			fmt.Println("StateService not available, " +
+				"skipping wait for locked state")
+
+			return nil
+
+		case codes.Unavailable:
+			// The state service may be temporarily unreachable.
+			fmt.Println("StateService unavailable, " +
+				"skipping wait for locked state")
+
+			return nil
+
+		default:
+		}
+	}
+
+	return err
+}
+
+// waitForWalletUnlocked blocks until the wallet reaches UNLOCKED or beyond,
+// or errors if the wallet is missing.
+func waitForWalletUnlocked(ctx context.Context,
+	client lnrpc.StateClient) error {
+
+	check := func(state lnrpc.WalletState) (bool, error) {
+		switch state {
+		case lnrpc.WalletState_UNLOCKED,
+			lnrpc.WalletState_RPC_ACTIVE,
+			lnrpc.WalletState_SERVER_ACTIVE:
+
+			return true, nil
+
+		case lnrpc.WalletState_NON_EXISTING:
+			return true, errors.New("wallet is not initialized - " +
+				"please run 'lncli create'")
+
+		default:
+			return false, nil
+		}
+	}
+
+	err := waitForWalletState(ctx, client, check)
+	if err == nil {
+		return nil
+	}
+
+	if s, ok := status.FromError(err); ok {
+		switch s.Code() {
+		case codes.Unimplemented:
+			fmt.Println("StateService not available, " +
+				"skipping wait for unlocked state")
+
+			return nil
+
+		case codes.Unavailable:
+			// The state service may be temporarily unreachable.
+			fmt.Println("StateService unavailable, " +
+				"skipping wait for unlocked state")
+
+			return nil
+
+		default:
+		}
+	}
+
+	return err
 }
 
 var changePasswordCommand = cli.Command{
@@ -688,6 +892,7 @@ var createWatchOnlyCommand = cli.Command{
 	Flags: []cli.Flag{
 		statelessInitFlag,
 		saveToFlag,
+		macRootKeyFlag,
 	},
 	Action: actionDecorator(createWatchOnly),
 }
@@ -765,11 +970,30 @@ func createWatchOnly(ctx *cli.Context) error {
 		}
 	}
 
+	// Parse the macaroon root key if it was specified by the user.
+	var macRootKey []byte
+	if ctx.IsSet(macRootKeyFlag.Name) {
+		macRootKey, err = hex.DecodeString(
+			ctx.String(macRootKeyFlag.Name),
+		)
+		if err != nil {
+			return fmt.Errorf("unable to parse macaroon root key: "+
+				"%w", err)
+		}
+
+		if len(macRootKey) != macaroons.RootKeyLen {
+			return fmt.Errorf("macaroon root key must be exactly "+
+				"%v bytes, got %v", macaroons.RootKeyLen,
+				len(macRootKey))
+		}
+	}
+
 	initResp, err := client.InitWallet(ctxc, &lnrpc.InitWalletRequest{
-		WalletPassword: walletPassword,
-		WatchOnly:      rpcResp,
-		RecoveryWindow: recoveryWindow,
-		StatelessInit:  statelessInit,
+		WalletPassword:  walletPassword,
+		WatchOnly:       rpcResp,
+		RecoveryWindow:  recoveryWindow,
+		StatelessInit:   statelessInit,
+		MacaroonRootKey: macRootKey,
 	})
 	if err != nil {
 		return err
@@ -888,4 +1112,6 @@ func printCipherSeedWords(mnemonicWords []string) {
 
 	fmt.Println("\n!!!YOU MUST WRITE DOWN THIS SEED TO BE ABLE TO " +
 		"RESTORE THE WALLET!!!")
+	fmt.Println("\n!!! DO NOT UNDER ANY CIRCUMSTANCES SHARE THIS SEED " +
+		"WITH ANYONE AS IT MAY RESULT IN LOSS OF YOUR FUNDS !!!")
 }

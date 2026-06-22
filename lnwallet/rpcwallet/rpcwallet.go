@@ -22,7 +22,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	basewallet "github.com/btcsuite/btcwallet/wallet"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -154,7 +154,7 @@ func (r *RPCKeyRing) SendOutputs(inputs fn.Set[wire.OutPoint],
 		// watch-only wallet if it can map this outpoint into a coin we
 		// own. If not, then we can't continue because our wallet state
 		// is out of sync.
-		info, err := r.WalletController.FetchInputInfo(
+		info, err := r.WalletController.FetchOutpointInfo(
 			&txIn.PreviousOutPoint,
 		)
 		if err != nil {
@@ -289,7 +289,7 @@ func (r *RPCKeyRing) FinalizePsbt(packet *psbt.Packet, _ string) error {
 		// We can only sign this input if it's ours, so we try to map it
 		// to a coin we own. If we can't, then we'll continue as it
 		// isn't our input.
-		utxo, err := r.FetchInputInfo(&txIn.PreviousOutPoint)
+		utxo, err := r.FetchOutpointInfo(&txIn.PreviousOutPoint)
 		if err != nil {
 			continue
 		}
@@ -780,6 +780,59 @@ func (r *RPCKeyRing) MuSig2RegisterNonces(sessionID input.MuSig2SessionID,
 	return resp.HaveAllNonces, nil
 }
 
+// MuSig2RegisterCombinedNonce registers a pre-aggregated combined nonce for a
+// session identified by its ID. This is an alternative to MuSig2RegisterNonces
+// and is used when a coordinator has already aggregated all individual nonces.
+func (r *RPCKeyRing) MuSig2RegisterCombinedNonce(
+	sessionID input.MuSig2SessionID,
+	combinedNonce [musig2.PubNonceSize]byte) error {
+
+	req := &signrpc.MuSig2RegisterCombinedNonceRequest{
+		SessionId:           sessionID[:],
+		CombinedPublicNonce: combinedNonce[:],
+	}
+
+	ctxt, cancel := context.WithTimeout(context.Background(), r.rpcTimeout)
+	defer cancel()
+
+	_, err := r.signerClient.MuSig2RegisterCombinedNonce(ctxt, req)
+	if err != nil {
+		considerShutdown(err)
+
+		return fmt.Errorf("error registering MuSig2 combined nonce "+
+			"in remote signer instance: %v", err)
+	}
+
+	return nil
+}
+
+// MuSig2GetCombinedNonce retrieves the combined nonce for a session identified
+// by its ID.
+func (r *RPCKeyRing) MuSig2GetCombinedNonce(sessionID input.MuSig2SessionID) (
+	[musig2.PubNonceSize]byte, error) {
+
+	req := &signrpc.MuSig2GetCombinedNonceRequest{
+		SessionId: sessionID[:],
+	}
+
+	ctxt, cancel := context.WithTimeout(context.Background(), r.rpcTimeout)
+	defer cancel()
+
+	resp, err := r.signerClient.MuSig2GetCombinedNonce(ctxt, req)
+	if err != nil {
+		considerShutdown(err)
+
+		return [musig2.PubNonceSize]byte{}, fmt.Errorf("error getting "+
+			"MuSig2 combined nonce from remote signer instance: %v",
+			err)
+	}
+
+	var combinedNonce [musig2.PubNonceSize]byte
+	copy(combinedNonce[:], resp.CombinedPublicNonce)
+
+	return combinedNonce, nil
+}
+
 // MuSig2Sign creates a partial signature using the local signing key
 // that was specified when the session was created. This can only be
 // called when all public nonces of all participants are known and have
@@ -898,42 +951,9 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 
 	// We need to add witness information for all inputs! Otherwise, we'll
 	// have a problem when attempting to sign a taproot input!
-	for idx := range packet.Inputs {
-		// Skip the input we're signing for, that will get a special
-		// treatment later on.
-		if idx == signDesc.InputIndex {
-			continue
-		}
-
-		txIn := tx.TxIn[idx]
-		info, err := r.WalletController.FetchInputInfo(
-			&txIn.PreviousOutPoint,
-		)
-		if err != nil {
-			// Maybe we have an UTXO in the previous output fetcher?
-			if signDesc.PrevOutputFetcher != nil {
-				utxo := signDesc.PrevOutputFetcher.FetchPrevOutput(
-					txIn.PreviousOutPoint,
-				)
-				if utxo != nil && utxo.Value != 0 &&
-					len(utxo.PkScript) > 0 {
-
-					packet.Inputs[idx].WitnessUtxo = utxo
-					continue
-				}
-			}
-
-			log.Warnf("No UTXO info found for index %d "+
-				"(prev_outpoint=%v), won't be able to sign "+
-				"for taproot output!", idx,
-				txIn.PreviousOutPoint)
-			continue
-		}
-		packet.Inputs[idx].WitnessUtxo = &wire.TxOut{
-			Value:    int64(info.Value),
-			PkScript: info.PkScript,
-		}
-	}
+	populateNonSignedInputWitnessUtxos(
+		packet, tx, signDesc, r.WalletController.FetchOutpointInfo,
+	)
 
 	// Catch incorrect signing input index, just in case.
 	if signDesc.InputIndex < 0 || signDesc.InputIndex >= len(packet.Inputs) {
@@ -1015,19 +1035,32 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 		signDesc.KeyDesc.PubKey = fullDesc.PubKey
 	}
 
+	var derivation *psbt.Bip32Derivation
+
 	// Make sure we actually know about the input. We either have been
 	// watching the UTXO on-chain or we have been given all the required
 	// info in the sign descriptor.
-	info, err := r.WalletController.FetchInputInfo(&txIn.PreviousOutPoint)
+	info, err := r.WalletController.FetchOutpointInfo(
+		&txIn.PreviousOutPoint,
+	)
+
+	// If the wallet is aware of this outpoint, we go ahead and fetch the
+	// derivation info.
+	if err == nil {
+		derivation, err = r.WalletController.FetchDerivationInfo(
+			info.PkScript,
+		)
+	}
+
 	switch {
-	// No error, we do have the full UTXO and derivation info available.
+	// No error, we do have the full UTXO info available.
 	case err == nil:
 		in.WitnessUtxo = &wire.TxOut{
 			Value:    int64(info.Value),
 			PkScript: info.PkScript,
 		}
 		in.NonWitnessUtxo = info.PrevTx
-		in.Bip32Derivation = []*psbt.Bip32Derivation{info.Derivation}
+		in.Bip32Derivation = []*psbt.Bip32Derivation{derivation}
 
 	// The wallet doesn't know about this UTXO, so it's probably a TX that
 	// we haven't published yet (e.g. a channel funding TX). So we need to
@@ -1304,6 +1337,72 @@ func connectRPC(hostPort, tlsCertPath, macaroonPath string,
 	}
 
 	return conn, nil
+}
+
+// fetchOutpointInfoFn looks up the wallet's local knowledge of an outpoint.
+// Mirrors lnwallet.WalletController.FetchOutpointInfo so the helper below can
+// be exercised in unit tests without standing up a full wallet.
+type fetchOutpointInfoFn func(*wire.OutPoint) (*lnwallet.Utxo, error)
+
+// populateNonSignedInputWitnessUtxos walks every non-signed PSBT input and
+// fills in its WitnessUtxo. The signing path that ultimately ships this PSBT
+// to the remote signer is walletkit.SignPsbt, which rejects any PSBT that
+// has an input without a WitnessUtxo or NonWitnessUtxo set — even when the
+// remote signer is only being asked to sign one of the inputs — because
+// taproot sighash computation requires all prev outputs.
+//
+// Resolution order for each non-signed input:
+//
+//  1. fetchInfo (the local wallet's knowledge of the outpoint).
+//  2. signDesc.PrevOutputFetcher, when the local wallet does not own or
+//     track the outpoint (e.g. funding-flow channel TXs that haven't been
+//     published yet, or BIP-322 virtual to_spend outputs).
+//
+// A zero Value is accepted from the fetcher. BIP-322 mandates that the
+// to_spend output is exactly value=0 with the message commitment as
+// pk_script, and that output is referenced as input 0 of every BIP-322
+// to_sign transaction. Refusing zero-value fetched outputs would silently
+// leave that input's WitnessUtxo unpopulated, causing walletkit.SignPsbt
+// to later reject the resulting PSBT with "input (index=N) doesn't specify
+// any UTXO info".
+func populateNonSignedInputWitnessUtxos(packet *psbt.Packet, tx *wire.MsgTx,
+	signDesc *input.SignDescriptor, fetchInfo fetchOutpointInfoFn) {
+
+	for idx := range packet.Inputs {
+		// Skip the input we're signing for, that will get a special
+		// treatment by the caller.
+		if idx == signDesc.InputIndex {
+			continue
+		}
+
+		txIn := tx.TxIn[idx]
+		info, err := fetchInfo(&txIn.PreviousOutPoint)
+		if err != nil {
+			// The wallet doesn't know about this outpoint. Fall
+			// back to the caller-supplied PrevOutputFetcher.
+			if signDesc.PrevOutputFetcher != nil {
+				fetcher := signDesc.PrevOutputFetcher
+				utxo := fetcher.FetchPrevOutput(
+					txIn.PreviousOutPoint,
+				)
+				if utxo != nil && len(utxo.PkScript) > 0 {
+					packet.Inputs[idx].WitnessUtxo = utxo
+					continue
+				}
+			}
+
+			log.Warnf("No UTXO info found for index %d "+
+				"(prev_outpoint=%v), won't be able to sign "+
+				"for taproot output!", idx,
+				txIn.PreviousOutPoint)
+
+			continue
+		}
+		packet.Inputs[idx].WitnessUtxo = &wire.TxOut{
+			Value:    int64(info.Value),
+			PkScript: info.PkScript,
+		}
+	}
 }
 
 // packetFromTx creates a PSBT from a tx that potentially already contains

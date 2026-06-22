@@ -5,6 +5,7 @@ package lncfg
 import (
 	"time"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 )
 
@@ -19,12 +20,16 @@ func IsDevBuild() bool {
 // DevConfig specifies configs used for integration tests. These configs can
 // only be used in tests and must NOT be exported for production usage.
 //
-//nolint:lll
+//nolint:ll
 type DevConfig struct {
-	ProcessChannelReadyWait time.Duration `long:"processchannelreadywait" description:"Time to sleep before processing remote node's channel_ready message."`
-	ReservationTimeout      time.Duration `long:"reservationtimeout" description:"The maximum time we keep a pending channel open flow in memory."`
-	ZombieSweeperInterval   time.Duration `long:"zombiesweeperinterval" description:"The time interval at which channel opening flows are evaluated for zombie status."`
-	UnsafeDisconnect        bool          `long:"unsafedisconnect" description:"Allows the rpcserver to intentionally disconnect from peers with open channels."`
+	ProcessChannelReadyWait     time.Duration `long:"processchannelreadywait" description:"Time to sleep before processing remote node's channel_ready message."`
+	ReservationTimeout          time.Duration `long:"reservationtimeout" description:"The maximum time we keep a pending channel open flow in memory."`
+	ZombieSweeperInterval       time.Duration `long:"zombiesweeperinterval" description:"The time interval at which channel opening flows are evaluated for zombie status."`
+	UnsafeDisconnect            bool          `long:"unsafedisconnect" description:"Allows the rpcserver to intentionally disconnect from peers with open channels."`
+	MaxWaitNumBlocksFundingConf uint32        `long:"maxwaitnumblocksfundingconf" description:"Maximum blocks to wait for funding confirmation before discarding non-initiated channels."`
+	UnsafeConnect               bool          `long:"unsafeconnect" description:"Allow the rpcserver to connect to a peer even if there's already a connection."`
+	ForceChannelCloseConfs      uint32        `long:"force-channel-close-confs" description:"Force a specific number of confirmations for channel closes (dev/test only)"`
+	MinFwdHistoryAge            time.Duration `long:"min-fwd-history-age" description:"Minimum age of forwarding events before they can be deleted via DeleteForwardingHistory (dev/test only, default: 1h)"`
 }
 
 // ChannelReadyWait returns the config value `ProcessChannelReadyWait`.
@@ -50,7 +55,38 @@ func (d *DevConfig) GetZombieSweeperInterval() time.Duration {
 	return d.ZombieSweeperInterval
 }
 
-// ChannelReadyWait returns the config value `UnsafeDisconnect`.
+// GetUnsafeDisconnect returns the config value `UnsafeDisconnect`.
 func (d *DevConfig) GetUnsafeDisconnect() bool {
 	return d.UnsafeDisconnect
+}
+
+// GetMaxWaitNumBlocksFundingConf returns the config value for
+// `MaxWaitNumBlocksFundingConf`.
+func (d *DevConfig) GetMaxWaitNumBlocksFundingConf() uint32 {
+	if d.MaxWaitNumBlocksFundingConf == 0 {
+		return DefaultMaxWaitNumBlocksFundingConf
+	}
+
+	return d.MaxWaitNumBlocksFundingConf
+}
+
+// GetUnsafeConnect returns the config value `UnsafeConnect`.
+func (d *DevConfig) GetUnsafeConnect() bool {
+	return d.UnsafeConnect
+}
+
+// GetMinFwdHistoryAge returns the minimum age for forwarding history deletion.
+// Returns 0 if unset, which causes the caller to use the default (1h).
+func (d *DevConfig) GetMinFwdHistoryAge() time.Duration {
+	return d.MinFwdHistoryAge
+}
+
+// ChannelCloseConfs returns the forced confirmation count if set, or None if
+// the default behavior should be used.
+func (d *DevConfig) ChannelCloseConfs() fn.Option[uint32] {
+	if d.ForceChannelCloseConfs == 0 {
+		return fn.None[uint32]()
+	}
+
+	return fn.Some(d.ForceChannelCloseConfs)
 }

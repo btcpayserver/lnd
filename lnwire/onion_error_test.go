@@ -9,19 +9,22 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/stretchr/testify/require"
 )
 
 var (
-	testOnionHash     = [OnionPacketSize]byte{}
-	testAmount        = MilliSatoshi(1)
-	testCtlvExpiry    = uint32(2)
-	testFlags         = uint16(2)
-	testType          = uint64(3)
-	testOffset        = uint16(24)
-	sig, _            = NewSigFromSignature(testSig)
-	testChannelUpdate = ChannelUpdate{
+	testOnionHash  = [OnionPacketSize]byte{}
+	testAmount     = MilliSatoshi(1)
+	testCtlvExpiry = uint32(2)
+	testFlags      = uint16(2)
+	testType       = uint64(3)
+	testOffset     = uint16(24)
+	sig, _         = NewSigFromSignature(testSig)
+)
+
+func makeTestChannelUpdate() *ChannelUpdate1 {
+	return &ChannelUpdate1{
 		Signature:       sig,
 		ShortChannelID:  NewShortChanIDFromInt(1),
 		Timestamp:       1,
@@ -29,7 +32,7 @@ var (
 		ChannelFlags:    1,
 		ExtraOpaqueData: make([]byte, 0),
 	}
-)
+}
 
 var onionFailures = []FailureMessage{
 	&FailInvalidRealm{},
@@ -47,13 +50,13 @@ var onionFailures = []FailureMessage{
 	NewInvalidOnionVersion(testOnionHash[:]),
 	NewInvalidOnionHmac(testOnionHash[:]),
 	NewInvalidOnionKey(testOnionHash[:]),
-	NewTemporaryChannelFailure(&testChannelUpdate),
+	NewTemporaryChannelFailure(makeTestChannelUpdate()),
 	NewTemporaryChannelFailure(nil),
-	NewAmountBelowMinimum(testAmount, testChannelUpdate),
-	NewFeeInsufficient(testAmount, testChannelUpdate),
-	NewIncorrectCltvExpiry(testCtlvExpiry, testChannelUpdate),
-	NewExpiryTooSoon(testChannelUpdate),
-	NewChannelDisabled(testFlags, testChannelUpdate),
+	NewAmountBelowMinimum(testAmount, *makeTestChannelUpdate()),
+	NewFeeInsufficient(testAmount, *makeTestChannelUpdate()),
+	NewIncorrectCltvExpiry(testCtlvExpiry, *makeTestChannelUpdate()),
+	NewExpiryTooSoon(*makeTestChannelUpdate()),
+	NewChannelDisabled(testFlags, *makeTestChannelUpdate()),
 	NewFinalIncorrectCltvExpiry(testCtlvExpiry),
 	NewFinalIncorrectHtlcAmount(testAmount),
 	NewInvalidOnionPayload(testType, testOffset),
@@ -128,6 +131,8 @@ func testEncodeDecodeTlv(t *testing.T, testFailure FailureMessage) {
 func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 	t.Parallel()
 
+	testChannelUpdate := *makeTestChannelUpdate()
+
 	// We'll start by taking out test channel update, and encoding it into
 	// a set of raw bytes.
 	var b bytes.Buffer
@@ -138,7 +143,7 @@ func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 	// Now that we have the set of bytes encoded, we'll ensure that we're
 	// able to decode it using our compatibility method, as it's a regular
 	// encoded channel update message.
-	var newChanUpdate ChannelUpdate
+	var newChanUpdate ChannelUpdate1
 	err := parseChannelUpdateCompatibilityMode(
 		&b, uint16(b.Len()), &newChanUpdate, 0,
 	)
@@ -146,9 +151,7 @@ func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 
 	// At this point, we'll ensure that we get the exact same failure out
 	// on the other side.
-	if !reflect.DeepEqual(testChannelUpdate, newChanUpdate) {
-		t.Fatalf("mismatched channel updates: %v", err)
-	}
+	require.Equal(t, testChannelUpdate, newChanUpdate)
 
 	// We'll now reset then re-encoded the same channel update to try it in
 	// the proper compatible mode.
@@ -165,7 +168,7 @@ func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 
 	// We should be able to properly parse the encoded channel update
 	// message even with the extra two bytes.
-	var newChanUpdate2 ChannelUpdate
+	var newChanUpdate2 ChannelUpdate1
 	err = parseChannelUpdateCompatibilityMode(
 		&b, uint16(b.Len()), &newChanUpdate2, 0,
 	)
@@ -185,7 +188,7 @@ func TestWriteOnionErrorChanUpdate(t *testing.T) {
 	// First, we'll write out the raw channel update so we can obtain the
 	// raw serialized length.
 	var b bytes.Buffer
-	update := testChannelUpdate
+	update := *makeTestChannelUpdate()
 	trueUpdateLength, err := WriteMessage(&b, &update, 0)
 	if err != nil {
 		t.Fatalf("unable to write update: %v", err)

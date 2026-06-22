@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/user"
@@ -41,6 +42,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/onionmessage"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/tor"
@@ -71,8 +73,6 @@ const (
 	defaultChanEnableTimeout             = 19 * time.Minute
 	defaultChanDisableTimeout            = 20 * time.Minute
 	defaultHeightHintCacheQueryDisable   = false
-	defaultMaxLogFiles                   = 3
-	defaultMaxLogFileSize                = 10
 	defaultMinBackoff                    = time.Second
 	defaultMaxBackoff                    = time.Hour
 	defaultLetsEncryptDirname            = "letsencrypt"
@@ -82,7 +82,6 @@ const (
 	defaultTorDNSHost              = "soa.nodes.lightning.directory"
 	defaultTorDNSPort              = 53
 	defaultTorControlPort          = 9051
-	defaultTorV2PrivateKeyFilename = "v2_onion_private_key"
 	defaultTorV3PrivateKeyFilename = "v3_onion_private_key"
 
 	// defaultZMQReadDeadline is the default read deadline to be used for
@@ -214,6 +213,10 @@ const (
 	// commitment.
 	defaultChannelCommitBatchSize = 10
 
+	// defaultFwdHistoryDeleteBatchSize is the default number of forwarding
+	// events deleted per database transaction when purging history.
+	defaultFwdHistoryDeleteBatchSize = 10_000
+
 	// defaultCoinSelectionStrategy is the coin selection strategy that is
 	// used by default to fund transactions.
 	defaultCoinSelectionStrategy = "largest"
@@ -240,12 +243,25 @@ const (
 	// defaultHTTPHeaderTimeout is the default timeout for HTTP requests.
 	DefaultHTTPHeaderTimeout = 5 * time.Second
 
+	// DefaultNumRestrictedSlots is the default max number of incoming
+	// connections allowed in the server. Outbound connections are not
+	// restricted.
+	DefaultNumRestrictedSlots = 100
+
 	// BitcoinChainName is a string that represents the Bitcoin blockchain.
 	BitcoinChainName = "bitcoin"
 
 	bitcoindBackendName = "bitcoind"
 	btcdBackendName     = "btcd"
 	neutrinoBackendName = "neutrino"
+
+	defaultPrunedNodeMaxPeers = 4
+	defaultNeutrinoMaxPeers   = 8
+
+	// defaultNoDisconnectOnPongFailure is the default value for whether we
+	// should *not* disconnect from a peer if we don't receive a pong
+	// response in time after we send a ping.
+	defaultNoDisconnectOnPongFailure = false
 )
 
 var (
@@ -283,8 +299,6 @@ var (
 	// estimatesmartfee RPC call.
 	defaultBitcoindEstimateMode = "CONSERVATIVE"
 	bitcoindEstimateModes       = [2]string{"ECONOMICAL", defaultBitcoindEstimateMode}
-
-	defaultPrunedNodeMaxPeers = 4
 )
 
 // Config defines the configuration options for lnd.
@@ -292,7 +306,7 @@ var (
 // See LoadConfig for further details regarding the configuration
 // loading+parsing process.
 //
-//nolint:lll
+//nolint:ll
 type Config struct {
 	ShowVersion bool `short:"V" long:"version" description:"Display version information and exit"`
 
@@ -315,8 +329,8 @@ type Config struct {
 	ReadMacPath     string        `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	InvoiceMacPath  string        `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	LogDir          string        `long:"logdir" description:"Directory to log output."`
-	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
-	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
+	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation). DEPRECATED: use --logging.file.max-files instead" hidden:"true"`
+	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB. DEPRECATED: use --logging.file.max-file-size instead" hidden:"true"`
 	AcceptorTimeout time.Duration `long:"acceptortimeout" description:"Time after which an RPCAcceptor will time out and return false if it hasn't yet received a response"`
 
 	LetsEncryptDir    string `long:"letsencryptdir" description:"The directory to store Let's Encrypt certificates within"`
@@ -330,7 +344,7 @@ type Config struct {
 	RawRPCListeners   []string `long:"rpclisten" description:"Add an interface/port/socket to listen for RPC connections"`
 	RawRESTListeners  []string `long:"restlisten" description:"Add an interface/port/socket to listen for REST connections"`
 	RawListeners      []string `long:"listen" description:"Add an interface/port to listen for peer connections"`
-	RawExternalIPs    []string `long:"externalip" description:"Add an ip:port to the list of local addresses we claim to listen on to peers. If a port is not specified, the default (9735) will be used regardless of other parameters"`
+	RawExternalIPs    []string `long:"externalip" description:"Add an ip:port (local addresses we listen on) to advertise to the network (default port 9735 is used if port is not specified). Note: Removing this option does not clear previously advertised addresses; remove them with 'lncli peers updatenodeannouncement --address_remove=host:port'."`
 	ExternalHosts     []string `long:"externalhosts" description:"Add a hostname:port that should be periodically resolved to announce IPs for. If a port is not specified, the default (9735) will be used."`
 	RPCListeners      []net.Addr
 	RESTListeners     []net.Addr
@@ -350,17 +364,19 @@ type Config struct {
 
 	DebugLevel string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <global-level>,<subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 
-	CPUProfile string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
+	CPUProfile      string `long:"cpuprofile" description:"DEPRECATED: Use 'pprof.cpuprofile' option. Write CPU profile to the specified file" hidden:"true"`
+	Profile         string `long:"profile" description:"DEPRECATED: Use 'pprof.profile' option. Enable HTTP profiling on either a port or host:port" hidden:"true"`
+	BlockingProfile int    `long:"blockingprofile" description:"DEPRECATED: Use 'pprof.blockingprofile' option. Used to enable a blocking profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every blocking event, and 0 including no events." hidden:"true"`
+	MutexProfile    int    `long:"mutexprofile" description:"DEPRECATED: Use 'pprof.mutexprofile' option. Used to Enable a mutex profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every mutex event, and 0 including no events." hidden:"true"`
 
-	Profile string `long:"profile" description:"Enable HTTP profiling on either a port or host:port"`
-
-	BlockingProfile int `long:"blockingprofile" description:"Used to enable a blocking profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every blocking event, and 0 including no events."`
-	MutexProfile    int `long:"mutexprofile" description:"Used to Enable a mutex profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every mutex event, and 0 including no events."`
+	Pprof *lncfg.Pprof `group:"Pprof" namespace:"pprof"`
 
 	UnsafeDisconnect   bool   `long:"unsafe-disconnect" description:"DEPRECATED: Allows the rpcserver to intentionally disconnect from peers with open channels. THIS FLAG WILL BE REMOVED IN 0.10.0" hidden:"true"`
 	UnsafeReplay       bool   `long:"unsafe-replay" description:"Causes a link to replay the adds on its commitment txn after starting up, this enables testing of the sphinx replay logic."`
 	MaxPendingChannels int    `long:"maxpendingchannels" description:"The maximum number of incoming pending channels permitted per peer."`
 	BackupFilePath     string `long:"backupfilepath" description:"The target location of the channel backup file"`
+
+	NoBackupArchive bool `long:"no-backup-archive" description:"If set to true, channel backups will be deleted or replaced rather than being archived to a separate location."`
 
 	FeeURL string `long:"feeurl" description:"DEPRECATED: Use 'fee.url' option. Optional URL for external fee estimation. If no URL is specified, the method for fee estimation will depend on the chosen backend and network. Must be set for neutrino on mainnet." hidden:"true"`
 
@@ -407,6 +423,8 @@ type Config struct {
 
 	ChannelCommitBatchSize uint32 `long:"channel-commit-batch-size" description:"The maximum number of channel state updates that is accumulated before signing a new commitment."`
 
+	FwdHistoryDeleteBatchSize int `long:"fwd-history-delete-batch-size" description:"The number of forwarding events deleted per database transaction when running deletefwdhistory. Lower this on resource-constrained nodes to reduce lock contention (max: 50000)."`
+
 	KeepFailedPaymentAttempts bool `long:"keep-failed-payment-attempts" description:"Keeps persistent record of all failed payment attempts for successfully settled payments."`
 
 	StoreFinalHtlcResolutions bool `long:"store-final-htlc-resolutions" description:"Persistently store the final resolution of incoming htlcs."`
@@ -452,7 +470,9 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	MaxFeeExposure uint64 `long:"dust-threshold" description:"Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed."`
+	DustThreshold uint64 `long:"dust-threshold" description:"DEPRECATED: Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed." hidden:"true"`
+
+	MaxFeeExposure uint64 `long:"channel-max-fee-exposure" description:" Limits the maximum fee exposure in satoshis of a channel. This value is enforced for all channels and is independent of the channel initiator."`
 
 	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
@@ -492,9 +512,11 @@ type Config struct {
 
 	GRPC *GRPCConfig `group:"grpc" namespace:"grpc"`
 
-	// LogWriter is the root logger that all of the daemon's subloggers are
+	// SubLogMgr is the root logger that all the daemon's subloggers are
 	// hooked up to.
-	LogWriter *build.RotatingLogWriter
+	SubLogMgr  *build.SubLoggerManager
+	LogRotator *build.RotatingLogWriter
+	LogConfig  *build.LogConfig `group:"logging" namespace:"logging"`
 
 	// networkDir is the path to the directory of the currently active
 	// network. This path will hold the files related to each different
@@ -514,6 +536,23 @@ type Config struct {
 	// HTTPHeaderTimeout is the maximum duration that the server will wait
 	// before timing out reading the headers of an HTTP request.
 	HTTPHeaderTimeout time.Duration `long:"http-header-timeout" description:"The maximum duration that the server will wait before timing out reading the headers of an HTTP request."`
+
+	// NumRestrictedSlots is the max number of incoming connections allowed
+	// in the server. Outbound connections are not restricted.
+	NumRestrictedSlots uint64 `long:"num-restricted-slots" description:"The max number of incoming connections allowed in the server. Outbound connections are not restricted."`
+
+	// NoDisconnectOnPongFailure controls if we'll disconnect if a peer
+	// doesn't respond to a pong in time.
+	NoDisconnectOnPongFailure bool `long:"no-disconnect-on-pong-failure" description:"If true, a peer will *not* be disconnected if a pong is not received in time or is mismatched. Defaults to false, meaning peers *will* be disconnected on pong failure."`
+
+	// UpfrontShutdownAddr specifies an address that our funds will be paid
+	// out to on cooperative channel close. This applies to all new channel
+	// opens unless overridden by an option in openchannel or by a channel
+	// acceptor.
+	// Note: If this field is set when opening a channel with a peer that
+	// does not advertise support for the upfront shutdown feature, the
+	// channel open will fail.
+	UpfrontShutdownAddr string `long:"upfront-shutdown-address" description:"The address to which funds will be paid out during a cooperative channel close. This applies to all channels opened after this option is set, unless overridden for a specific channel opening. Note: If this option is set, any channel opening will fail if the peer does not explicitly advertise support for the upfront-shutdown feature bit."`
 }
 
 // GRPCConfig holds the configuration options for the gRPC server.
@@ -521,7 +560,7 @@ type Config struct {
 // for more details. Any value of 0 means we use the gRPC internal default
 // values.
 //
-//nolint:lll
+//nolint:ll
 type GRPCConfig struct {
 	// ServerPingTime is a duration for the amount of time of no activity
 	// after which the server pings the client to see if the transport is
@@ -545,9 +584,46 @@ type GRPCConfig struct {
 	ClientAllowPingWithoutStream bool `long:"client-allow-ping-without-stream" description:"If true, the server allows keepalive pings from the client even when there are no active gRPC streams. This might be useful to keep the underlying HTTP/2 connection open for future requests."`
 }
 
+// maxOnionMsgWireSize is the largest on-the-wire size in bytes, including
+// the 2-byte message type prefix, that an OnionMessage can take. This is
+// the value the rate limiter charges via OnionMessage.WireSize() for a
+// max-sized message and therefore the tightest meaningful lower bound on
+// the configured burst: anything smaller would reject every max-sized
+// message even though the configured rate is positive.
+const maxOnionMsgWireSize = 2 + lnwire.MaxMsgBody
+
+// validateOnionMsgLimiter validates a single onion message rate limiter
+// kbps/burst-bytes pair. Both zero means "disabled"; both strictly positive
+// means "enabled"; a mismatched pair is rejected so that operator typos
+// surface at startup instead of silently disabling the limiter via the
+// constructor fallback path. When enabled, burst-bytes must also be at
+// least maxOnionMsgWireSize so that a single max-sized onion message
+// (lnwire.MaxMsgBody bytes of body plus the 2-byte message-type prefix
+// that WireSize charges for) can always fit in the token bucket;
+// otherwise rate.Limiter.AllowN would reject every call and silently
+// disable onion message forwarding.
+func validateOnionMsgLimiter(name string, kbps, burstBytes uint64) error {
+	if (kbps > 0) != (burstBytes > 0) {
+		return fmt.Errorf("%s kbps and burst-bytes must both be "+
+			"positive or both be zero; got kbps=%v "+
+			"burst-bytes=%v", name, kbps, burstBytes)
+	}
+	if burstBytes > 0 && burstBytes < maxOnionMsgWireSize {
+		return fmt.Errorf("%s burst-bytes=%v must be at least %v "+
+			"so a single max-sized onion message can fit in "+
+			"the bucket", name, burstBytes, maxOnionMsgWireSize)
+	}
+	if burstBytes > uint64(math.MaxInt) {
+		return fmt.Errorf("%s burst-bytes=%v exceeds maximum %v",
+			name, burstBytes, math.MaxInt)
+	}
+
+	return nil
+}
+
 // DefaultConfig returns all default values for the Config struct.
 //
-//nolint:lll
+//nolint:ll
 func DefaultConfig() Config {
 	return Config{
 		LndDir:            DefaultLndDir,
@@ -560,8 +636,6 @@ func DefaultConfig() Config {
 		LetsEncryptDir:    defaultLetsEncryptDir,
 		LetsEncryptListen: defaultLetsEncryptListen,
 		LogDir:            defaultLogDir,
-		MaxLogFiles:       defaultMaxLogFiles,
-		MaxLogFileSize:    defaultMaxLogFileSize,
 		AcceptorTimeout:   defaultAcceptorTimeout,
 		WSPingInterval:    lnrpc.DefaultPingInterval,
 		WSPongWait:        lnrpc.DefaultPongWait,
@@ -589,6 +663,7 @@ func DefaultConfig() Config {
 		NeutrinoMode: &lncfg.Neutrino{
 			UserAgentName:    neutrino.UserAgentName,
 			UserAgentVersion: neutrino.UserAgentVersion,
+			MaxPeers:         defaultNeutrinoMaxPeers,
 		},
 		BlockCacheSize:     defaultBlockCacheSize,
 		MaxPendingChannels: lncfg.DefaultMaxPendingChannels,
@@ -690,10 +765,26 @@ func DefaultConfig() Config {
 				Backoff:  defaultLeaderCheckBackoff,
 			},
 		},
+		// Only the onion message rate limiter fields are explicitly
+		// initialized here; all other ProtocolOptions fields rely on
+		// Go zero values, which happen to be the historical defaults
+		// for those flags.
+		ProtocolOptions: &lncfg.ProtocolOptions{
+			OnionMsgPeerKbps:         onionmessage.DefaultPeerOnionMsgKbps,
+			OnionMsgPeerBurstBytes:   onionmessage.DefaultPeerOnionMsgBurstBytes,
+			OnionMsgGlobalKbps:       onionmessage.DefaultGlobalOnionMsgKbps,
+			OnionMsgGlobalBurstBytes: onionmessage.DefaultGlobalOnionMsgBurstBytes,
+		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
 			ChannelUpdateInterval: discovery.DefaultChannelUpdateInterval,
 			SubBatchDelay:         discovery.DefaultSubBatchDelay,
+			AnnouncementConf:      discovery.DefaultProofMatureDelta,
+			MsgRateBytes:          discovery.DefaultMsgBytesPerSecond,
+			MsgBurstBytes:         discovery.DefaultMsgBytesBurst,
+			FilterConcurrency:     discovery.DefaultFilterConcurrency,
+			BanThreshold:          discovery.DefaultBanThreshold,
+			PeerMsgRateBytes:      discovery.DefaultPeerMsgBytesPerSecond,
 		},
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
@@ -710,8 +801,7 @@ func DefaultConfig() Config {
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		MaxFeeExposure:            uint64(htlcswitch.DefaultMaxFeeExposure.ToSatoshis()),
-		LogWriter:                 build.NewRotatingLogWriter(),
+		LogRotator:                build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
 		RPCMiddleware:             lncfg.DefaultRPCMiddleware(),
@@ -719,6 +809,7 @@ func DefaultConfig() Config {
 		ChannelCommitInterval:     defaultChannelCommitInterval,
 		PendingCommitInterval:     defaultPendingCommitInterval,
 		ChannelCommitBatchSize:    defaultChannelCommitBatchSize,
+		FwdHistoryDeleteBatchSize: defaultFwdHistoryDeleteBatchSize,
 		CoinSelectionStrategy:     defaultCoinSelectionStrategy,
 		KeepFailedPaymentAttempts: defaultKeepFailedPaymentAttempts,
 		RemoteSigner: &lncfg.RemoteSigner{
@@ -727,14 +818,18 @@ func DefaultConfig() Config {
 		Sweeper: lncfg.DefaultSweeperConfig(),
 		Htlcswitch: &lncfg.Htlcswitch{
 			MailboxDeliveryTimeout: htlcswitch.DefaultMailboxDeliveryTimeout,
+			QuiescenceTimeout:      lncfg.DefaultQuiescenceTimeout,
 		},
 		GRPC: &GRPCConfig{
 			ServerPingTime:    defaultGrpcServerPingTime,
 			ServerPingTimeout: defaultGrpcServerPingTimeout,
 			ClientPingMinWait: defaultGrpcClientPingMinWait,
 		},
-		WtClient:          lncfg.DefaultWtClientCfg(),
-		HTTPHeaderTimeout: DefaultHTTPHeaderTimeout,
+		LogConfig:                 build.DefaultLogConfig(),
+		WtClient:                  lncfg.DefaultWtClientCfg(),
+		HTTPHeaderTimeout:         DefaultHTTPHeaderTimeout,
+		NumRestrictedSlots:        DefaultNumRestrictedSlots,
+		NoDisconnectOnPongFailure: defaultNoDisconnectOnPongFailure,
 	}
 }
 
@@ -818,7 +913,8 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 	cleanCfg, err := ValidateConfig(
 		cfg, interceptor, fileParser, flagParser,
 	)
-	if usageErr, ok := err.(*usageError); ok {
+	var usageErr *lncfg.UsageError
+	if errors.As(err, &usageErr) {
 		// The logging system might not yet be initialized, so we also
 		// write to stderr to make sure the error appears somewhere.
 		_, _ = fmt.Fprintln(os.Stderr, usageMessage)
@@ -827,9 +923,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 		// The log subsystem might not yet be initialized. But we still
 		// try to log the error there since some packaging solutions
 		// might only look at the log and not stdout/stderr.
-		ltndLog.Warnf("Error validating config: %v", usageErr.err)
+		ltndLog.Warnf("Error validating config: %v", err)
 
-		return nil, usageErr.err
+		return nil, err
 	}
 	if err != nil {
 		// The log subsystem might not yet be initialized. But we still
@@ -853,23 +949,23 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 	return cleanCfg, nil
 }
 
-// usageError is an error type that signals a problem with the supplied flags.
-type usageError struct {
-	err error
-}
-
-// Error returns the error string.
-//
-// NOTE: This is part of the error interface.
-func (u *usageError) Error() string {
-	return u.err.Error()
-}
-
 // ValidateConfig check the given configuration to be sane. This makes sure no
 // illegal values or combination of values are set. All file system paths are
 // normalized. The cleaned up config is returned on success.
 func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	flagParser *flags.Parser) (*Config, error) {
+
+	// Special show command to list supported subsystems and exit.
+	if cfg.DebugLevel == "show" {
+		subLogMgr := build.NewSubLoggerManager()
+
+		// Initialize logging at the default logging level.
+		SetupLoggers(subLogMgr, interceptor)
+
+		fmt.Println("Supported subsystems",
+			subLogMgr.SupportedSubsystems())
+		os.Exit(0)
+	}
 
 	// If the provided lnd directory is not the default, we'll modify the
 	// path to all of the files and directories that will live within it.
@@ -1028,6 +1124,27 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error validating autopilot: %v", err)
 	}
 
+	// Validate the onion message rate limiter configuration. We reject
+	// the mismatched case where one of kbps/burst-bytes is strictly
+	// positive but the other is zero, which would silently disable the
+	// limiter and leave the operator unprotected. Both zero is fine and
+	// explicitly means "disabled"; both positive is fine and enables
+	// the limiter.
+	if err := validateOnionMsgLimiter(
+		"protocol.onion-msg-peer",
+		cfg.ProtocolOptions.OnionMsgPeerKbps,
+		cfg.ProtocolOptions.OnionMsgPeerBurstBytes,
+	); err != nil {
+		return nil, mkErr("%s", err)
+	}
+	if err := validateOnionMsgLimiter(
+		"protocol.onion-msg-global",
+		cfg.ProtocolOptions.OnionMsgGlobalKbps,
+		cfg.ProtocolOptions.OnionMsgGlobalBurstBytes,
+	); err != nil {
+		return nil, mkErr("%s", err)
+	}
+
 	// Ensure that --maxchansize is properly handled when set by user.
 	// For non-Wumbo channels this limit remains 16777215 satoshis by default
 	// as specified in BOLT-02. For wumbo channels this limit is 1,000,000,000.
@@ -1121,41 +1238,22 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr(str)
 	}
 
-	switch {
-	case cfg.Tor.V2 && cfg.Tor.V3:
-		return nil, mkErr("either tor.v2 or tor.v3 can be set, " +
-			"but not both")
-	case cfg.DisableListen && (cfg.Tor.V2 || cfg.Tor.V3):
+	if cfg.DisableListen && cfg.Tor.V3 {
 		return nil, mkErr("listening must be enabled when enabling " +
 			"inbound connections over Tor")
 	}
 
-	if cfg.Tor.PrivateKeyPath == "" {
-		switch {
-		case cfg.Tor.V2:
-			cfg.Tor.PrivateKeyPath = filepath.Join(
-				lndDir, defaultTorV2PrivateKeyFilename,
-			)
-		case cfg.Tor.V3:
-			cfg.Tor.PrivateKeyPath = filepath.Join(
-				lndDir, defaultTorV3PrivateKeyFilename,
-			)
-		}
+	if cfg.Tor.PrivateKeyPath == "" && cfg.Tor.V3 {
+		cfg.Tor.PrivateKeyPath = filepath.Join(
+			lndDir, defaultTorV3PrivateKeyFilename,
+		)
 	}
 
-	if cfg.Tor.WatchtowerKeyPath == "" {
-		switch {
-		case cfg.Tor.V2:
-			cfg.Tor.WatchtowerKeyPath = filepath.Join(
-				cfg.Watchtower.TowerDir,
-				defaultTorV2PrivateKeyFilename,
-			)
-		case cfg.Tor.V3:
-			cfg.Tor.WatchtowerKeyPath = filepath.Join(
-				cfg.Watchtower.TowerDir,
-				defaultTorV3PrivateKeyFilename,
-			)
-		}
+	if cfg.Tor.WatchtowerKeyPath == "" && cfg.Tor.V3 {
+		cfg.Tor.WatchtowerKeyPath = filepath.Join(
+			cfg.Watchtower.TowerDir,
+			defaultTorV3PrivateKeyFilename,
+		)
 	}
 
 	// Set up the network-related functions that will be used throughout
@@ -1192,6 +1290,10 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	if cfg.Bitcoin.TestNet3 {
 		numNets++
 		cfg.ActiveNetParams = chainreg.BitcoinTestNetParams
+	}
+	if cfg.Bitcoin.TestNet4 {
+		numNets++
+		cfg.ActiveNetParams = chainreg.BitcoinTestNet4Params
 	}
 	if cfg.Bitcoin.RegTest {
 		numNets++
@@ -1250,8 +1352,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.ActiveNetParams.Params = &chainParams
 	}
 	if numNets > 1 {
-		str := "The mainnet, testnet, regtest, simnet and signet " +
-			"params can't be used together -- choose one " +
+		str := "The mainnet, testnet, testnet4, regtest, simnet and " +
+			"signet params can't be used together -- choose one " +
 			"of the five"
 
 		return nil, mkErr(str)
@@ -1260,9 +1362,10 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	// The target network must be provided, otherwise, we won't
 	// know how to initialize the daemon.
 	if numNets == 0 {
-		str := "either --bitcoin.mainnet, or bitcoin.testnet," +
-			"bitcoin.simnet, bitcoin.regtest or bitcoin.signet " +
-			"must be specified"
+		str := "either --bitcoin.mainnet, or --bitcoin.testnet, " +
+			"--bitcoin.testnet4, --bitcoin.simnet, " +
+			"--bitcoin.regtest or --bitcoin.signet must be " +
+			"specified"
 
 		return nil, mkErr(str)
 	}
@@ -1344,31 +1447,6 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.Autopilot.MaxChannelSize = int64(MaxFundingAmount)
 	}
 
-	// Validate profile port or host:port.
-	if cfg.Profile != "" {
-		str := "%s: The profile port must be between 1024 and 65535"
-
-		// Try to parse Profile as a host:port.
-		_, hostPort, err := net.SplitHostPort(cfg.Profile)
-		if err == nil {
-			// Determine if the port is valid.
-			profilePort, err := strconv.Atoi(hostPort)
-			if err != nil || profilePort < 1024 || profilePort > 65535 {
-				return nil, &usageError{mkErr(str)}
-			}
-		} else {
-			// Try to parse Profile as a port.
-			profilePort, err := strconv.Atoi(cfg.Profile)
-			if err != nil || profilePort < 1024 || profilePort > 65535 {
-				return nil, &usageError{mkErr(str)}
-			}
-
-			// Since the user just set a port, we will serve debugging
-			// information over localhost.
-			cfg.Profile = net.JoinHostPort("127.0.0.1", cfg.Profile)
-		}
-	}
-
 	// We'll now construct the network directory which will be where we
 	// store all the data specific to this chain/network.
 	cfg.networkDir = filepath.Join(
@@ -1433,24 +1511,47 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		lncfg.NormalizeNetwork(cfg.ActiveNetParams.Name),
 	)
 
-	// A log writer must be passed in, otherwise we can't function and would
-	// run into a panic later on.
-	if cfg.LogWriter == nil {
-		return nil, mkErr("log writer missing in config")
+	if err := cfg.LogConfig.Validate(); err != nil {
+		return nil, mkErr("error validating logging config: %w", err)
 	}
 
-	// Special show command to list supported subsystems and exit.
-	if cfg.DebugLevel == "show" {
-		fmt.Println("Supported subsystems",
-			cfg.LogWriter.SupportedSubsystems())
-		os.Exit(0)
+	// If a sub-log manager was not already created, then we'll create one
+	// now using the default log handlers.
+	if cfg.SubLogMgr == nil {
+		cfg.SubLogMgr = build.NewSubLoggerManager(
+			build.NewDefaultLogHandlers(
+				cfg.LogConfig, cfg.LogRotator,
+			)...,
+		)
 	}
 
 	// Initialize logging at the default logging level.
-	SetupLoggers(cfg.LogWriter, interceptor)
-	err = cfg.LogWriter.InitLogRotator(
+	SetupLoggers(cfg.SubLogMgr, interceptor)
+
+	if cfg.MaxLogFiles != 0 {
+		if cfg.LogConfig.File.MaxLogFiles !=
+			build.DefaultMaxLogFiles {
+
+			return nil, mkErr("cannot set both maxlogfiles and "+
+				"logging.file.max-files", err)
+		}
+
+		cfg.LogConfig.File.MaxLogFiles = cfg.MaxLogFiles
+	}
+	if cfg.MaxLogFileSize != 0 {
+		if cfg.LogConfig.File.MaxLogFileSize !=
+			build.DefaultMaxLogFileSize {
+
+			return nil, mkErr("cannot set both maxlogfilesize and "+
+				"logging.file.max-file-size", err)
+		}
+
+		cfg.LogConfig.File.MaxLogFileSize = cfg.MaxLogFileSize
+	}
+
+	err = cfg.LogRotator.InitLogRotator(
+		cfg.LogConfig.File,
 		filepath.Join(cfg.LogDir, defaultLogFilename),
-		cfg.MaxLogFileSize, cfg.MaxLogFiles,
 	)
 	if err != nil {
 		str := "log rotation setup failed: %v"
@@ -1458,10 +1559,10 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	}
 
 	// Parse, validate, and set debug log level(s).
-	err = build.ParseAndSetDebugLevels(cfg.DebugLevel, cfg.LogWriter)
+	err = build.ParseAndSetDebugLevels(cfg.DebugLevel, cfg.SubLogMgr)
 	if err != nil {
 		str := "error parsing debug level: %v"
-		return nil, &usageError{mkErr(str, err)}
+		return nil, &lncfg.UsageError{Err: mkErr(str, err)}
 	}
 
 	// At least one RPCListener is required. So listen on localhost per
@@ -1678,6 +1779,19 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 			maxPendingCommitInterval)
 	}
 
+	// Warn and clamp fwd-history-delete-batch-size if it exceeds the DB
+	// layer maximum. The DB silently clamps anyway, but surfacing this at
+	// startup gives the operator immediate feedback that their configured
+	// value is not being honoured.
+	if cfg.FwdHistoryDeleteBatchSize > channeldb.MaxResponseEvents {
+		ltndLog.Warnf("fwd-history-delete-batch-size=%d exceeds "+
+			"maximum (%d), clamping to maximum",
+			cfg.FwdHistoryDeleteBatchSize,
+			channeldb.MaxResponseEvents)
+
+		cfg.FwdHistoryDeleteBatchSize = channeldb.MaxResponseEvents
+	}
+
 	if err := cfg.Gossip.Parse(); err != nil {
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
@@ -1690,6 +1804,60 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	// startup is blocked on config parsing.
 	if err := lnwire.SetCustomOverrides(customMsg); err != nil {
 		return nil, mkErr("custom-message: %v", err)
+	}
+
+	// Map old pprof flags to new pprof group flags.
+	//
+	// NOTE: This is a temporary measure to ensure compatibility with old
+	// flags.
+	if cfg.CPUProfile != "" {
+		if cfg.Pprof.CPUProfile != "" {
+			return nil, mkErr("cpuprofile and pprof.cpuprofile " +
+				"are mutually exclusive")
+		}
+		cfg.Pprof.CPUProfile = cfg.CPUProfile
+	}
+	if cfg.Profile != "" {
+		if cfg.Pprof.Profile != "" {
+			return nil, mkErr("profile and pprof.profile " +
+				"are mutually exclusive")
+		}
+		cfg.Pprof.Profile = cfg.Profile
+	}
+	if cfg.BlockingProfile != 0 {
+		if cfg.Pprof.BlockingProfile != 0 {
+			return nil, mkErr("blockingprofile and " +
+				"pprof.blockingprofile are mutually exclusive")
+		}
+		cfg.Pprof.BlockingProfile = cfg.BlockingProfile
+	}
+	if cfg.MutexProfile != 0 {
+		if cfg.Pprof.MutexProfile != 0 {
+			return nil, mkErr("mutexprofile and " +
+				"pprof.mutexprofile are mutually exclusive")
+		}
+		cfg.Pprof.MutexProfile = cfg.MutexProfile
+	}
+
+	// Don't allow both the old dust-threshold and the new
+	// channel-max-fee-exposure to be set.
+	if cfg.DustThreshold != 0 && cfg.MaxFeeExposure != 0 {
+		return nil, mkErr("cannot set both dust-threshold and " +
+			"channel-max-fee-exposure")
+	}
+
+	switch {
+	// Use the old dust-threshold as the max fee exposure if it is set and
+	// the new option is not.
+	case cfg.DustThreshold != 0:
+		cfg.MaxFeeExposure = cfg.DustThreshold
+
+	// Use the default max fee exposure if the new option is not set and
+	// the old one is not set either.
+	case cfg.MaxFeeExposure == 0:
+		cfg.MaxFeeExposure = uint64(
+			htlcswitch.DefaultMaxFeeExposure.ToSatoshis(),
+		)
 	}
 
 	// Validate the subconfigs for workers, caches, and the tower client.
@@ -1706,6 +1874,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.Htlcswitch,
 		cfg.Invoices,
 		cfg.Routing,
+		cfg.Pprof,
+		cfg.Gossip,
 	)
 	if err != nil {
 		return nil, err
@@ -1717,6 +1887,15 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	_, err = lncfg.ParseHexColor(cfg.Color)
 	if err != nil {
 		return nil, mkErr("unable to parse node color: %v", err)
+	}
+
+	// Validate TrickleDelay and default to 1ms if non-positive to ensure
+	// the trickle timer can still function.
+	if cfg.TrickleDelay <= 0 {
+		srvrLog.Infof("TrickleDelay is non-positive (%v ms), "+
+			"setting to 1ms", cfg.TrickleDelay)
+
+		cfg.TrickleDelay = 1
 	}
 
 	// All good, return the sanitized result.
@@ -2133,7 +2312,7 @@ func extractBitcoindRPCParams(networkName, bitcoindDataDir, bitcoindConfigPath,
 	switch networkName {
 	case "mainnet":
 		chainDir = ""
-	case "regtest", "testnet3", "signet":
+	case "regtest", "testnet3", "testnet4", "signet":
 		chainDir = networkName
 	default:
 		return "", "", "", "", fmt.Errorf("unexpected networkname %v", networkName)

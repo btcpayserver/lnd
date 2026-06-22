@@ -21,7 +21,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -914,11 +914,8 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 	)
 
 	// Create temporary databases.
-	dbRemote, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
-
-	dbLocal, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
+	dbRemote := channeldb.OpenForTesting(t, t.TempDir())
+	dbLocal := channeldb.OpenForTesting(t, t.TempDir())
 
 	// Create the initial commitment transactions for the channel.
 	feePerKw := chainfee.SatPerKWeight(feeRate)

@@ -37,10 +37,44 @@
         "parameters": [
           {
             "name": "body",
+            "description": "Returns a new instance of the directed channel graph.",
             "in": "body",
             "required": true,
             "schema": {
               "$ref": "#/definitions/lnrpcChannelGraph"
+            }
+          }
+        ],
+        "tags": [
+          "Dev"
+        ]
+      }
+    },
+    "/v2/dev/quiesce": {
+      "post": {
+        "summary": "Quiesce instructs a channel to initiate the quiescence (stfu) protocol. This\nRPC is for testing purposes only. The commit that adds it will be removed\nonce interop is confirmed.",
+        "operationId": "Dev_Quiesce",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/devrpcQuiescenceResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/devrpcQuiescenceRequest"
             }
           }
         ],
@@ -53,6 +87,50 @@
   "definitions": {
     "devrpcImportGraphResponse": {
       "type": "object"
+    },
+    "devrpcQuiescenceRequest": {
+      "type": "object",
+      "properties": {
+        "chan_id": {
+          "$ref": "#/definitions/lnrpcChannelPoint",
+          "title": "The channel point of the channel we wish to quiesce"
+        }
+      }
+    },
+    "devrpcQuiescenceResponse": {
+      "type": "object",
+      "properties": {
+        "initiator": {
+          "type": "boolean",
+          "title": "Indicates whether or not we hold the initiator role or not once the\nnegotiation completes"
+        }
+      }
+    },
+    "lnrpcChannelAuthProof": {
+      "type": "object",
+      "properties": {
+        "node_sig1": {
+          "type": "string",
+          "format": "byte",
+          "description": "node_sig1 are the raw bytes of the first node signature encoded\nin DER format."
+        },
+        "bitcoin_sig1": {
+          "type": "string",
+          "format": "byte",
+          "description": "bitcoin_sig1 are the raw bytes of the first bitcoin signature of the\nMultiSigKey key of the channel encoded in DER format."
+        },
+        "node_sig2": {
+          "type": "string",
+          "format": "byte",
+          "description": "node_sig2 are the raw bytes of the second node signature encoded\nin DER format."
+        },
+        "bitcoin_sig2": {
+          "type": "string",
+          "format": "byte",
+          "description": "bitcoin_sig2 are the raw bytes of the second bitcoin signature of the\nMultiSigKey key of the channel encoded in DER format."
+        }
+      },
+      "description": "ChannelAuthProof is the authentication proof (the signature portion) for a\nchannel. Using the four signatures contained in the struct, and some\nauxiliary knowledge (the funding script, node identities, and outpoint) nodes\non the network are able to validate the authenticity and existence of a\nchannel."
     },
     "lnrpcChannelEdge": {
       "type": "object",
@@ -92,6 +170,10 @@
             "format": "byte"
           },
           "description": "Custom channel announcement tlv records."
+        },
+        "auth_proof": {
+          "$ref": "#/definitions/lnrpcChannelAuthProof",
+          "description": "Authentication proof for this channel. This proof contains a set of\nsignatures binding four identities, which attests to the legitimacy of\nthe advertised channel. This only is available for advertised channels.\nThis field is not filled by default. Pass include_auth_proof flag to\nDescribeGraph, GetNodeInfo or GetChanInfo to get this data."
         }
       },
       "description": "A fully authenticated channel along with all its unique attributes.\nOnce an authenticated channel announcement has been processed on the network,\nthen an instance of ChannelEdgeInfo encapsulating the channels attributes is\nstored. The other portions relevant to routing policy of a channel are stored\nwithin a ChannelEdgePolicy for each direction of the channel."
@@ -102,6 +184,7 @@
         "nodes": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcLightningNode"
           },
           "title": "The list of `LightningNode`s in this channel graph"
@@ -109,12 +192,32 @@
         "edges": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcChannelEdge"
           },
           "title": "The list of `ChannelEdge`s in this channel graph"
         }
       },
       "description": "Returns a new instance of the directed channel graph."
+    },
+    "lnrpcChannelPoint": {
+      "type": "object",
+      "properties": {
+        "funding_txid_bytes": {
+          "type": "string",
+          "format": "byte",
+          "description": "Txid of the funding transaction. When using REST, this field must be\nencoded as base64."
+        },
+        "funding_txid_str": {
+          "type": "string",
+          "description": "Hex-encoded string representing the byte-reversed hash of the funding\ntransaction."
+        },
+        "output_index": {
+          "type": "integer",
+          "format": "int64",
+          "title": "The index of the output of the funding transaction"
+        }
+      }
     },
     "lnrpcFeature": {
       "type": "object",
@@ -146,6 +249,7 @@
         "addresses": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/lnrpcNodeAddress"
           }
         },
@@ -216,7 +320,7 @@
             "type": "string",
             "format": "byte"
           },
-          "description": "Custom channel update tlv records."
+          "description": "Custom channel update tlv records. These are customized fields that are\nnot defined by LND and cannot be extracted."
         },
         "inbound_fee_base_msat": {
           "type": "integer",
@@ -231,14 +335,11 @@
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -253,6 +354,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }

@@ -5,10 +5,11 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -97,6 +98,10 @@ type AuxChanState struct {
 	// funding output.
 	TapscriptRoot fn.Option[chainhash.Hash]
 
+	// PeerPubKey is the peer pub key of the peer we've established this
+	// channel with.
+	PeerPubKey route.Vertex
+
 	// CustomBlob is an optional blob that can be used to store information
 	// specific to a custom channel type. This information is only created
 	// at channel funding time, and after wards is to be considered
@@ -106,6 +111,8 @@ type AuxChanState struct {
 
 // NewAuxChanState creates a new AuxChanState from the given channel state.
 func NewAuxChanState(chanState *channeldb.OpenChannel) AuxChanState {
+	peerPub := chanState.IdentityPub.SerializeCompressed()
+
 	return AuxChanState{
 		ChanType:        chanState.ChanType,
 		FundingOutpoint: chanState.FundingOutpoint,
@@ -116,6 +123,7 @@ func NewAuxChanState(chanState *channeldb.OpenChannel) AuxChanState {
 		RemoteChanCfg:   chanState.RemoteChanCfg,
 		ThawHeight:      chanState.ThawHeight,
 		TapscriptRoot:   chanState.TapscriptRoot,
+		PeerPubKey:      route.Vertex(peerPub),
 		CustomBlob:      chanState.CustomBlob,
 	}
 }
@@ -133,7 +141,7 @@ type CommitDiffAuxInput struct {
 	// UnfilteredView is the unfiltered, original HTLC view of the channel.
 	// Unfiltered in this context means that the view contains all HTLCs,
 	// including the canceled ones.
-	UnfilteredView *HtlcView
+	UnfilteredView AuxHtlcView
 
 	// WhoseCommit denotes whose commitment transaction we are computing the
 	// diff for.
@@ -177,9 +185,8 @@ type AuxLeafStore interface {
 	// correspond to the passed aux blob, and an existing channel
 	// commitment.
 	FetchLeavesFromCommit(chanState AuxChanState,
-		commit channeldb.ChannelCommitment,
-		keyRing CommitmentKeyRing, whoseCommit lntypes.ChannelParty,
-	) fn.Result[CommitDiffAuxResult]
+		commit channeldb.ChannelCommitment, keyRing CommitmentKeyRing,
+		whoseCommit lntypes.ChannelParty) fn.Result[CommitDiffAuxResult]
 
 	// FetchLeavesFromRevocation attempts to fetch the auxiliary leaves
 	// from a channel revocation that stores balance + blob information.
@@ -206,7 +213,7 @@ func auxLeavesFromView(leafStore AuxLeafStore, chanState *channeldb.OpenChannel,
 			return leafStore.FetchLeavesFromView(CommitDiffAuxInput{
 				ChannelState:   NewAuxChanState(chanState),
 				PrevBlob:       blob,
-				UnfilteredView: originalView,
+				UnfilteredView: newAuxHtlcView(originalView),
 				WhoseCommit:    whoseCommit,
 				OurBalance:     ourBalance,
 				TheirBalance:   theirBalance,
@@ -227,13 +234,15 @@ func updateAuxBlob(leafStore AuxLeafStore, chanState *channeldb.OpenChannel,
 	return fn.MapOptionZ(
 		prevBlob, func(blob tlv.Blob) fn.Result[fn.Option[tlv.Blob]] {
 			return leafStore.ApplyHtlcView(CommitDiffAuxInput{
-				ChannelState:   NewAuxChanState(chanState),
-				PrevBlob:       blob,
-				UnfilteredView: nextViewUnfiltered,
-				WhoseCommit:    whoseCommit,
-				OurBalance:     ourBalance,
-				TheirBalance:   theirBalance,
-				KeyRing:        keyRing,
+				ChannelState: NewAuxChanState(chanState),
+				PrevBlob:     blob,
+				UnfilteredView: newAuxHtlcView(
+					nextViewUnfiltered,
+				),
+				WhoseCommit:  whoseCommit,
+				OurBalance:   ourBalance,
+				TheirBalance: theirBalance,
+				KeyRing:      keyRing,
 			})
 		},
 	)

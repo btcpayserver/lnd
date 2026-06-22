@@ -18,7 +18,8 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 	// channel with Alice, and Carol with Dave. After this setup, the
 	// network topology should now look like:
 	//     Carol -> Dave -> Alice -> Bob
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
 
 	daveArgs := []string{"--protocol.legacy.onion"}
 	dave := ht.NewNode("Dave", daveArgs)
@@ -37,6 +38,7 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 	ht.AssertHtlcEventType(daveEvents, routerrpc.HtlcEvent_UNKNOWN)
 
 	// Connect the nodes.
+	ht.ConnectNodes(alice, bob)
 	ht.ConnectNodes(dave, alice)
 	ht.ConnectNodes(carol, dave)
 
@@ -211,6 +213,31 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 		require.Equal(ht, aliceAlias, event.PeerAliasOut)
 	}
 
+	// Verify HTLC IDs are not nil and unique across all forwarding events.
+	seenIDs := make(map[uint64]bool)
+	for _, event := range fwdingHistory.ForwardingEvents {
+		// We check that the incoming and outgoing htlc indices are not
+		// set to nil. The indices are required for any forwarding event
+		// recorded after v0.20.
+		require.NotNil(ht, event.IncomingHtlcId)
+		require.NotNil(ht, event.OutgoingHtlcId)
+
+		require.False(ht, seenIDs[*event.IncomingHtlcId])
+		require.False(ht, seenIDs[*event.OutgoingHtlcId])
+		seenIDs[*event.IncomingHtlcId] = true
+		seenIDs[*event.OutgoingHtlcId] = true
+	}
+
+	// The HTLC IDs should be exactly 0, 1, 2, 3, 4.
+	expectedIDs := map[uint64]bool{
+		0: true,
+		1: true,
+		2: true,
+		3: true,
+		4: true,
+	}
+	require.Equal(ht, expectedIDs, seenIDs)
+
 	// We expect Carol to have successful forwards and settles for
 	// her sends.
 	ht.AssertHtlcEvents(
@@ -221,11 +248,11 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 	// Dave and Alice should both have forwards and settles for
 	// their role as forwarding nodes.
 	ht.AssertHtlcEvents(
-		daveEvents, numPayments, 0, numPayments, 0,
+		daveEvents, numPayments, 0, numPayments*2, 0,
 		routerrpc.HtlcEvent_FORWARD,
 	)
 	ht.AssertHtlcEvents(
-		aliceEvents, numPayments, 0, numPayments, 0,
+		aliceEvents, numPayments, 0, numPayments*2, 0,
 		routerrpc.HtlcEvent_FORWARD,
 	)
 
@@ -233,11 +260,6 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 	ht.AssertHtlcEvents(
 		bobEvents, 0, 0, numPayments, 0, routerrpc.HtlcEvent_RECEIVE,
 	)
-
-	// Finally, close all channels.
-	ht.CloseChannel(alice, chanPointAlice)
-	ht.CloseChannel(dave, chanPointDave)
-	ht.CloseChannel(carol, chanPointCarol)
 }
 
 // updateChannelPolicy updates the channel policy of node to the given fees and

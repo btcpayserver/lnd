@@ -19,7 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -1811,8 +1811,10 @@ var clientTests = []clientTest{
 			require.NoError(h.t, err)
 
 			cancel := make(chan struct{})
+			dialStarted := make(chan struct{})
 			h.net.registerConnCallback(
 				h.server.addr, func(peer wtserver.Peer) {
+					close(dialStarted)
 					select {
 					case <-h.quit:
 					case <-cancel:
@@ -1846,6 +1848,16 @@ var clientTests = []clientTest{
 			// Also add the new tower address.
 			err = h.clientMgr.AddTower(towerAddr)
 			require.NoError(h.t, err)
+
+			// Wait for the dial to start so that we know the
+			// session negotiation has begun and the address is
+			// locked.
+			select {
+			case <-dialStarted:
+
+			case <-time.After(waitTime):
+				h.t.Fatal("timeout waiting for dial to start")
+			}
 
 			// Assert that if the client attempts to remove the
 			// tower's first address, then it will error due to
@@ -2354,10 +2366,23 @@ var clientTests = []clientTest{
 			}, waitTime)
 			require.NoError(h.t, err)
 
-			// Now remove the tower.
-			err = h.clientMgr.RemoveTower(
-				h.server.addr.IdentityKey, nil,
-			)
+			// Now remove the tower. We use wait.Predicate here
+			// because the address may still be locked by an active
+			// session.
+			err = wait.Predicate(func() bool {
+				err := h.clientMgr.RemoveTower(
+					h.server.addr.IdentityKey, nil,
+				)
+				if err != nil {
+					require.ErrorIs(
+						h.t, err, wtclient.ErrAddrInUse,
+					)
+
+					return false
+				}
+
+				return true
+			}, waitTime)
 			require.NoError(h.t, err)
 
 			// Add a new tower.

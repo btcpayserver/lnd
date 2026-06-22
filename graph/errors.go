@@ -1,6 +1,8 @@
 package graph
 
-import "github.com/go-errors/errors"
+import (
+	"fmt"
+)
 
 // ErrorCode is used to represent the various errors that can occur within this
 // package.
@@ -15,35 +17,13 @@ const (
 	// this update can't bring us something new, or because a node
 	// announcement was given for node not found in any channel.
 	ErrIgnored
-
-	// ErrChannelSpent is returned when we go to validate a channel, but
-	// the purported funding output has actually already been spent on
-	// chain.
-	ErrChannelSpent
-
-	// ErrNoFundingTransaction is returned when we are unable to find the
-	// funding transaction described by the short channel ID on chain.
-	ErrNoFundingTransaction
-
-	// ErrInvalidFundingOutput is returned if the channel funding output
-	// fails validation.
-	ErrInvalidFundingOutput
-
-	// ErrVBarrierShuttingDown signals that the barrier has been requested
-	// to shutdown, and that the caller should not treat the wait condition
-	// as fulfilled.
-	ErrVBarrierShuttingDown
-
-	// ErrParentValidationFailed signals that the validation of a
-	// dependent's parent failed, so the dependent must not be processed.
-	ErrParentValidationFailed
 )
 
 // Error is a structure that represent the error inside the graph package,
 // this structure carries additional information about error code in order to
 // be able distinguish errors outside of the current package.
 type Error struct {
-	err  *errors.Error
+	err  error
 	code ErrorCode
 }
 
@@ -61,7 +41,7 @@ var _ error = (*Error)(nil)
 func NewErrf(code ErrorCode, format string, a ...interface{}) *Error {
 	return &Error{
 		code: code,
-		err:  errors.Errorf(format, a...),
+		err:  fmt.Errorf(format, a...),
 	}
 }
 

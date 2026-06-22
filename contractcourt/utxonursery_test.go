@@ -2,7 +2,9 @@ package contractcourt
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"reflect"
@@ -18,10 +20,11 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/stretchr/testify/require"
 )
@@ -1111,5 +1114,521 @@ func (s *mockSweeperFull) sweepAll() {
 		case <-time.After(defaultTestTimeout):
 			s.t.Fatal("signal result timeout")
 		}
+	}
+}
+
+// writeOutpointVarBytes writes an outpoint using the variable-length encoding.
+func writeOutpointVarBytes(w io.Writer, o *wire.OutPoint) error {
+	if err := wire.WriteVarBytes(w, 0, o.Hash[:]); err != nil {
+		return err
+	}
+
+	var scratch [4]byte
+	byteOrder.PutUint32(scratch[:], o.Index)
+	_, err := w.Write(scratch[:])
+
+	return err
+}
+
+// encodeKidOutputLegacy encodes a kidOutput using the legacy format.
+func encodeKidOutputLegacy(w io.Writer, k *kidOutput) error {
+	var scratch [8]byte
+	byteOrder.PutUint64(scratch[:], uint64(k.Amount()))
+	if _, err := w.Write(scratch[:]); err != nil {
+		return err
+	}
+
+	op := k.OutPoint()
+	if err := writeOutpointVarBytes(w, &op); err != nil {
+		return err
+	}
+	if err := writeOutpointVarBytes(w, k.OriginChanPoint()); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, byteOrder, k.isHtlc); err != nil {
+		return err
+	}
+
+	byteOrder.PutUint32(scratch[:4], k.BlocksToMaturity())
+	if _, err := w.Write(scratch[:4]); err != nil {
+		return err
+	}
+
+	byteOrder.PutUint32(scratch[:4], k.absoluteMaturity)
+	if _, err := w.Write(scratch[:4]); err != nil {
+		return err
+	}
+
+	byteOrder.PutUint32(scratch[:4], k.ConfHeight())
+	if _, err := w.Write(scratch[:4]); err != nil {
+		return err
+	}
+
+	byteOrder.PutUint16(scratch[:2], uint16(k.witnessType))
+	if _, err := w.Write(scratch[:2]); err != nil {
+		return err
+	}
+
+	if err := input.WriteSignDescriptor(w, k.SignDesc()); err != nil {
+		return err
+	}
+
+	if k.SignDesc().ControlBlock == nil {
+		return nil
+	}
+
+	return wire.WriteVarBytes(w, 1000, k.SignDesc().ControlBlock)
+}
+
+// TestKidOutputDecode tests that we can decode a kidOutput from both the
+// new and legacy formats. It also checks that the decoded output matches the
+// original output, except for the deadlineHeight field, which is not encoded
+// in the legacy format.
+func TestKidOutputDecode(t *testing.T) {
+	t.Parallel()
+
+	op := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 1,
+	}
+	originOp := wire.OutPoint{
+		Hash:  chainhash.Hash{2},
+		Index: 2,
+	}
+	pkScript := []byte{
+		0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+		0x13, 0x14,
+	}
+	signDesc := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			Value:    12345,
+			PkScript: pkScript,
+		},
+		HashType:      txscript.SigHashAll,
+		WitnessScript: []byte{},
+	}
+
+	// Since makeKidOutput is not exported, we construct the kid output
+	// manually.
+	kid := kidOutput{
+		breachedOutput: breachedOutput{
+			amt:         btcutil.Amount(signDesc.Output.Value),
+			outpoint:    op,
+			witnessType: input.CommitmentRevoke,
+			signDesc:    *signDesc,
+			confHeight:  100,
+		},
+		originChanPoint:  originOp,
+		blocksToMaturity: 144,
+		isHtlc:           false,
+		absoluteMaturity: 0,
+	}
+
+	// Encode the kid output in both formats.
+	var newBuf bytes.Buffer
+	err := kid.Encode(&newBuf)
+	require.NoError(t, err)
+
+	var legacyBuf bytes.Buffer
+	err = encodeKidOutputLegacy(&legacyBuf, &kid)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "new format",
+			data: newBuf.Bytes(),
+		},
+		{
+			name: "legacy format",
+			data: legacyBuf.Bytes(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var decodedKid kidOutput
+			err := decodedKid.Decode(bytes.NewReader(tc.data))
+			require.NoError(t, err)
+
+			// The deadlineHeight field is not encoded, so we need
+			// to set it manually for the comparison.
+			kid.deadlineHeight = decodedKid.deadlineHeight
+
+			require.Equal(t, kid, decodedKid)
+		})
+	}
+}
+
+// TestPatchZeroHeightHint tests the patchZeroHeightHint function to ensure
+// it correctly handles both normal cases and the edge case where classHeight
+// is zero due to a historical bug.
+func TestPatchZeroHeightHint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		classHeight    uint32
+		closeHeight    uint32
+		confDepth      uint32
+		shortChanID    lnwire.ShortChannelID
+		fetchError     error
+		expectedHeight uint32
+		expectError    bool
+		errorContains  string
+	}{
+		{
+			name:           "normal case - non-zero class height",
+			classHeight:    100,
+			closeHeight:    200,
+			confDepth:      6,
+			shortChanID:    lnwire.ShortChannelID{BlockHeight: 50},
+			expectedHeight: 100,
+			expectError:    false,
+		},
+		{
+			name: "zero class height - fetch closed " +
+				"channel error",
+			classHeight:   0,
+			closeHeight:   100,
+			confDepth:     6,
+			shortChanID:   lnwire.ShortChannelID{BlockHeight: 50},
+			fetchError:    fmt.Errorf("channel not found"),
+			expectError:   true,
+			errorContains: "cannot fetch close summary",
+		},
+		{
+			name: "zero class height - both close " +
+				"height and short chan ID = 0",
+			classHeight:    0,
+			closeHeight:    0,
+			confDepth:      6,
+			shortChanID:    lnwire.ShortChannelID{BlockHeight: 0},
+			expectedHeight: 0,
+			expectError:    true,
+			errorContains: "cannot use fallback height hint: " +
+				"close height is 0 and short channel " +
+				"ID block height is 0",
+		},
+		{
+			name: "zero class height - fallback height hint " +
+				"= conf depth",
+			classHeight:    0,
+			closeHeight:    6,
+			confDepth:      6,
+			shortChanID:    lnwire.ShortChannelID{BlockHeight: 50},
+			expectedHeight: 0,
+			expectError:    true,
+			errorContains: "fallback height hint 6 <= " +
+				"confirmation depth 6",
+		},
+		{
+			name: "zero class height - fallback height hint " +
+				"< conf depth",
+			classHeight:    0,
+			closeHeight:    3,
+			confDepth:      6,
+			shortChanID:    lnwire.ShortChannelID{BlockHeight: 50},
+			expectedHeight: 0,
+			expectError:    true,
+			errorContains: "fallback height hint 3 <= " +
+				"confirmation depth 6",
+		},
+		{
+			name: "zero class height - close " +
+				"height = 0, fallback height hint = conf depth",
+			classHeight: 0,
+			closeHeight: 0,
+			confDepth:   6,
+			shortChanID: lnwire.ShortChannelID{BlockHeight: 6},
+			expectError: true,
+			errorContains: "fallback height hint 6 <= " +
+				"confirmation depth 6",
+		},
+		{
+			name: "zero class height - close " +
+				"height = 0, fallback height hint < conf depth",
+			classHeight:    0,
+			closeHeight:    0,
+			confDepth:      6,
+			shortChanID:    lnwire.ShortChannelID{BlockHeight: 3},
+			expectedHeight: 0,
+			expectError:    true,
+			errorContains: "fallback height hint 3 <= " +
+				"confirmation depth 6",
+		},
+		{
+			name: "zero class height, fallback height is " +
+				"valid",
+			classHeight: 0,
+			closeHeight: 100,
+			confDepth:   6,
+			shortChanID: lnwire.ShortChannelID{BlockHeight: 50},
+			// heightHint - confDepth = 100 - 6 = 94.
+			expectedHeight: 94,
+			expectError:    false,
+		},
+		{
+			name: "zero class height - close " +
+				"height = 0, fallback height is valid",
+			classHeight: 0,
+			closeHeight: 0,
+			confDepth:   6,
+			shortChanID: lnwire.ShortChannelID{BlockHeight: 50},
+			// heightHint - confDepth = 50 - 6 = 44.
+			expectedHeight: 44,
+			expectError:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Create a mock baby output.
+			chanPoint := &wire.OutPoint{
+				Hash: [chainhash.HashSize]byte{
+					0x51, 0xb6, 0x37, 0xd8, 0xfc, 0xd2,
+					0xc6, 0xda, 0x48, 0x59, 0xe6, 0x96,
+					0x31, 0x13, 0xa1, 0x17, 0x2d, 0xe7,
+					0x93, 0xe4, 0xb7, 0x25, 0xb8, 0x4d,
+					0x1f, 0xb, 0x4c, 0xf9, 0x9e, 0xc5,
+					0x8c, 0xe9,
+				},
+				Index: 9,
+			}
+
+			baby := &babyOutput{
+				expiry: tc.classHeight,
+				kidOutput: kidOutput{
+					breachedOutput: breachedOutput{
+						outpoint: *chanPoint,
+					},
+					originChanPoint: *chanPoint,
+				},
+			}
+
+			cfg := &NurseryConfig{
+				ConfDepth: tc.confDepth,
+				FetchClosedChannel: func(
+					chanID *wire.OutPoint) (
+					*channeldb.ChannelCloseSummary,
+					error) {
+
+					if tc.fetchError != nil {
+						return nil, tc.fetchError
+					}
+
+					return &channeldb.ChannelCloseSummary{
+						CloseHeight: tc.closeHeight,
+						ShortChanID: tc.shortChanID,
+					}, nil
+				},
+			}
+
+			nursery := &UtxoNursery{
+				cfg: cfg,
+			}
+
+			resultHeight, err := nursery.patchZeroHeightHint(
+				baby, tc.classHeight,
+			)
+
+			if tc.expectError {
+				require.Error(t, err)
+				if tc.errorContains != "" {
+					require.Contains(
+						t, err.Error(),
+						tc.errorContains,
+					)
+				}
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedHeight, resultHeight)
+		})
+	}
+}
+
+// TestMakeBabyOutputWitnessType verifies that makeBabyOutput selects the
+// correct witness type based on the channel type (non-taproot, staging taproot,
+// production taproot).
+func TestMakeBabyOutputWitnessType(t *testing.T) {
+	t.Parallel()
+
+	// A P2TR pkscript (OP_1 <32-byte-key>).
+	taprootPkScript := make([]byte, 34)
+	taprootPkScript[0] = txscript.OP_1
+	taprootPkScript[1] = 32
+
+	// A non-taproot pkscript (P2WSH).
+	legacyPkScript := make([]byte, 34)
+	legacyPkScript[0] = txscript.OP_0
+	legacyPkScript[1] = 32
+
+	chanPoint := wire.OutPoint{}
+
+	tests := []struct {
+		name            string
+		pkScript        []byte
+		isFinalTaproot  bool
+		expectedWitType input.StandardWitnessType
+	}{
+		{
+			name:            "non-taproot",
+			pkScript:        legacyPkScript,
+			isFinalTaproot:  false,
+			expectedWitType: input.HtlcOfferedTimeoutSecondLevel,
+		},
+		{
+			name:            "staging taproot",
+			pkScript:        taprootPkScript,
+			isFinalTaproot:  false,
+			expectedWitType: input.TaprootHtlcOfferedTimeoutSecondLevel, //nolint:ll
+		},
+		{
+			name:            "production taproot final",
+			pkScript:        taprootPkScript,
+			isFinalTaproot:  true,
+			expectedWitType: input.TaprootHtlcOfferedTimeoutSecondLevelFinal, //nolint:ll
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			htlcRes := &lnwallet.OutgoingHtlcResolution{
+				Expiry:   500,
+				CsvDelay: 144,
+				SweepSignDesc: input.SignDescriptor{
+					Output: &wire.TxOut{
+						Value:    10000,
+						PkScript: tc.pkScript,
+					},
+				},
+				SignedTimeoutTx: &wire.MsgTx{
+					TxIn: []*wire.TxIn{{
+						Witness: [][]byte{{}},
+					}},
+					TxOut: []*wire.TxOut{{}},
+				},
+			}
+
+			baby := makeBabyOutput(
+				&chanPoint, htlcRes, fn.None[int32](),
+				tc.isFinalTaproot,
+			)
+
+			require.Equal(
+				t, tc.expectedWitType,
+				baby.WitnessType(),
+				"wrong witness type for %s", tc.name,
+			)
+		})
+	}
+}
+
+// TestIncubateConfigWitnessTypeSelection verifies that the IncubateConfig
+// correctly determines isFinalTaproot based on the channel type passed via
+// WithChanType, which drives witness type selection in IncubateOutputs.
+func TestIncubateConfigWitnessTypeSelection(t *testing.T) {
+	t.Parallel()
+
+	// A P2TR pkscript (OP_1 <32-byte-key>).
+	taprootPkScript := make([]byte, 34)
+	taprootPkScript[0] = txscript.OP_1
+	taprootPkScript[1] = 32
+
+	// Non-taproot pkscript.
+	legacyPkScript := make([]byte, 34)
+	legacyPkScript[0] = txscript.OP_0
+	legacyPkScript[1] = 32
+
+	tests := []struct {
+		name string
+
+		// pkScript determines if the output looks like taproot.
+		pkScript []byte
+
+		// chanType to pass via WithChanType.
+		chanType channeldb.ChannelType
+
+		// Expected witness types for incoming and outgoing-remote.
+		expectedIncoming input.StandardWitnessType
+		expectedOutgoing input.StandardWitnessType
+	}{
+		{
+			name:             "non-taproot incoming+outgoing",
+			pkScript:         legacyPkScript,
+			expectedIncoming: input.HtlcAcceptedSuccessSecondLevel,
+			expectedOutgoing: input.HtlcOfferedRemoteTimeout,
+		},
+		{
+			name:             "staging taproot incoming+outgoing",
+			pkScript:         taprootPkScript,
+			expectedIncoming: input.TaprootHtlcAcceptedSuccessSecondLevel, //nolint:ll
+			expectedOutgoing: input.TaprootHtlcOfferedRemoteTimeout,
+		},
+		{
+			name:     "production taproot incoming+outgoing",
+			pkScript: taprootPkScript,
+			chanType: channeldb.SimpleTaprootFeatureBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.SingleFunderTweaklessBit |
+				channeldb.TaprootFinalBit,
+			expectedIncoming: input.TaprootHtlcAcceptedSuccessSecondLevelFinal, //nolint:ll
+			expectedOutgoing: input.TaprootHtlcOfferedRemoteTimeoutFinal,       //nolint:ll
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build the IncubateConfig to check witness type
+			// selection logic.
+			cfg := IncubateConfig{}
+			if tc.chanType != 0 {
+				opt := WithChanType(tc.chanType)
+				opt(&cfg)
+			}
+
+			isFinal := cfg.chanType.UnwrapOr(
+				0,
+			).IsTaprootFinal()
+
+			// Verify incoming HTLC witness type.
+			isTaproot := txscript.IsPayToTaproot(
+				tc.pkScript,
+			)
+
+			var inWit input.StandardWitnessType
+			switch {
+			case isFinal:
+				inWit = input.TaprootHtlcAcceptedSuccessSecondLevelFinal //nolint:ll
+			case isTaproot:
+				inWit = input.TaprootHtlcAcceptedSuccessSecondLevel //nolint:ll
+			default:
+				inWit = input.HtlcAcceptedSuccessSecondLevel //nolint:ll
+			}
+			require.Equal(t, tc.expectedIncoming, inWit)
+
+			// Verify outgoing remote HTLC witness type.
+			var outWit input.StandardWitnessType
+			switch {
+			case isFinal:
+				outWit = input.TaprootHtlcOfferedRemoteTimeoutFinal //nolint:ll
+			case isTaproot:
+				outWit = input.TaprootHtlcOfferedRemoteTimeout //nolint:ll
+			default:
+				outWit = input.HtlcOfferedRemoteTimeout
+			}
+			require.Equal(t, tc.expectedOutgoing, outWit)
+		})
 	}
 }

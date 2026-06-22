@@ -1,8 +1,8 @@
 package routing
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -13,19 +13,16 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/go-errors/errors"
-	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/amp"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	paymentsdb "github.com/lightningnetwork/lnd/payments/db"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/routing/shards"
@@ -57,8 +54,8 @@ const (
 	// creating incompatibilities during the upgrade process. For some time
 	// LND has used an explicit default final CLTV delta of 40 blocks for
 	// bitcoin, though we now clamp the lower end of this
-	// range for user-chosen deltas to 18 blocks to be conservative.
-	MinCLTVDelta = 18
+	// range for user-chosen deltas to 24 blocks to be conservative.
+	MinCLTVDelta = 24
 
 	// MaxCLTVDelta is the maximum CLTV value accepted by LND for all
 	// timelock deltas.
@@ -167,16 +164,16 @@ type PaymentSessionSource interface {
 	NewPaymentSessionEmpty() PaymentSession
 }
 
-// MissionController is an interface that exposes failure reporting and
+// MissionControlQuerier is an interface that exposes failure reporting and
 // probability estimation.
-type MissionController interface {
+type MissionControlQuerier interface {
 	// ReportPaymentFail reports a failed payment to mission control as
 	// input for future probability estimates. It returns a bool indicating
 	// whether this error is a final error and no further payment attempts
 	// need to be made.
 	ReportPaymentFail(attemptID uint64, rt *route.Route,
 		failureSourceIdx *int, failure lnwire.FailureMessage) (
-		*channeldb.FailureReason, error)
+		*paymentsdb.FailureReason, error)
 
 	// ReportPaymentSuccess reports a successful payment to mission control
 	// as input for future probability estimates.
@@ -260,7 +257,7 @@ type Config struct {
 	// Each run will then take into account this set of pruned
 	// vertexes/edges to reduce route failure and pass on graph information
 	// gained to the next execution.
-	MissionControl MissionController
+	MissionControl MissionControlQuerier
 
 	// SessionSource defines a source for the router to retrieve new payment
 	// sessions.
@@ -288,7 +285,7 @@ type Config struct {
 
 	// ApplyChannelUpdate can be called to apply a new channel update to the
 	// graph that we received from a payment failure.
-	ApplyChannelUpdate func(msg *lnwire.ChannelUpdate) bool
+	ApplyChannelUpdate func(msg *lnwire.ChannelUpdate1) bool
 
 	// ClosedSCIDs is used by the router to fetch closed channels.
 	//
@@ -298,6 +295,10 @@ type Config struct {
 	// TrafficShaper is an optional traffic shaper that can be used to
 	// control the outgoing channel of a payment.
 	TrafficShaper fn.Option[htlcswitch.AuxTrafficShaper]
+
+	// KeepFailedPaymentAttempts indicates whether to keep failed payment
+	// attempts in the database.
+	KeepFailedPaymentAttempts bool
 }
 
 // EdgeLocator is a struct used to identify a specific edge.
@@ -612,6 +613,11 @@ type BlindedPathRestrictions struct {
 	// NodeOmissionSet is a set of nodes that should not be used within any
 	// of the blinded paths that we generate.
 	NodeOmissionSet fn.Set[route.Vertex]
+
+	// IncomingChainedChannels holds the chained channels list (specified
+	// via channel id) starting from a channel which points to the receiver
+	// node.
+	IncomingChainedChannels []uint64
 }
 
 // FindBlindedPaths finds a selection of paths to the destination node that can
@@ -622,11 +628,14 @@ func (r *ChannelRouter) FindBlindedPaths(destination route.Vertex,
 
 	// First, find a set of candidate paths given the destination node and
 	// path length restrictions.
+	incomingChainedChannels := restrictions.IncomingChainedChannels
+	minDistanceFromIntroNode := restrictions.MinDistanceFromIntroNode
 	paths, err := findBlindedPaths(
 		r.cfg.RoutingGraph, destination, &blindedPathRestrictions{
-			minNumHops:      restrictions.MinDistanceFromIntroNode,
-			maxNumHops:      restrictions.NumHops,
-			nodeOmissionSet: restrictions.NodeOmissionSet,
+			minNumHops:              minDistanceFromIntroNode,
+			maxNumHops:              restrictions.NumHops,
+			nodeOmissionSet:         restrictions.NodeOmissionSet,
+			incomingChainedChannels: incomingChainedChannels,
 		},
 	)
 	if err != nil {
@@ -678,19 +687,27 @@ func (r *ChannelRouter) FindBlindedPaths(destination route.Vertex,
 			prevNode = path[j].vertex
 		}
 
-		// Don't bother adding a route if its success probability less
-		// minimum that can be assigned to any single pair.
-		if totalRouteProbability <= DefaultMinRouteProbability {
-			continue
-		}
-
-		routes = append(routes, &routeWithProbability{
+		routeWithProbability := &routeWithProbability{
 			route: &route.Route{
 				SourcePubKey: introNode,
 				Hops:         hops,
 			},
 			probability: totalRouteProbability,
-		})
+		}
+
+		// Don't bother adding a route if its success probability less
+		// minimum that can be assigned to any single pair.
+		if totalRouteProbability <= DefaultMinRouteProbability {
+			log.Debugf("Not using route (%v) as a blinded "+
+				"path since it resulted in an low "+
+				"probability path(%.3f)",
+				route.ChanIDString(routeWithProbability.route),
+				routeWithProbability.probability)
+
+			continue
+		}
+
+		routes = append(routes, routeWithProbability)
 	}
 
 	// Sort the routes based on probability.
@@ -720,71 +737,6 @@ func generateNewSessionKey() (*btcec.PrivateKey, error) {
 	//
 	// TODO(roasbeef): add more sources of randomness?
 	return btcec.NewPrivateKey()
-}
-
-// generateSphinxPacket generates then encodes a sphinx packet which encodes
-// the onion route specified by the passed layer 3 route. The blob returned
-// from this function can immediately be included within an HTLC add packet to
-// be sent to the first hop within the route.
-func generateSphinxPacket(rt *route.Route, paymentHash []byte,
-	sessionKey *btcec.PrivateKey) ([]byte, *sphinx.Circuit, error) {
-
-	// Now that we know we have an actual route, we'll map the route into a
-	// sphinx payment path which includes per-hop payloads for each hop
-	// that give each node within the route the necessary information
-	// (fees, CLTV value, etc.) to properly forward the payment.
-	sphinxPath, err := rt.ToSphinxPath()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	log.Tracef("Constructed per-hop payloads for payment_hash=%x: %v",
-		paymentHash, lnutils.NewLogClosure(func() string {
-			path := make(
-				[]sphinx.OnionHop, sphinxPath.TrueRouteLength(),
-			)
-			for i := range path {
-				hopCopy := sphinxPath[i]
-				path[i] = hopCopy
-			}
-
-			return spew.Sdump(path)
-		}),
-	)
-
-	// Next generate the onion routing packet which allows us to perform
-	// privacy preserving source routing across the network.
-	sphinxPacket, err := sphinx.NewOnionPacket(
-		sphinxPath, sessionKey, paymentHash,
-		sphinx.DeterministicPacketFiller,
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Finally, encode Sphinx packet using its wire representation to be
-	// included within the HTLC add packet.
-	var onionBlob bytes.Buffer
-	if err := sphinxPacket.Encode(&onionBlob); err != nil {
-		return nil, nil, err
-	}
-
-	log.Tracef("Generated sphinx packet: %v",
-		lnutils.NewLogClosure(func() string {
-			// We make a copy of the ephemeral key and unset the
-			// internal curve here in order to keep the logs from
-			// getting noisy.
-			key := *sphinxPacket.EphemeralKey
-			packetCopy := *sphinxPacket
-			packetCopy.EphemeralKey = &key
-			return spew.Sdump(packetCopy)
-		}),
-	)
-
-	return onionBlob.Bytes(), &sphinx.Circuit{
-		SessionKey:  sessionKey,
-		PaymentPath: sphinxPath.NodeKeys(),
-	}, nil
 }
 
 // LightningPayment describes a payment to be sent through the network to the
@@ -948,8 +900,8 @@ func (l *LightningPayment) Identifier() [32]byte {
 // will be returned which describes the path the successful payment traversed
 // within the network to reach the destination. Additionally, the payment
 // preimage will also be returned.
-func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte,
-	*route.Route, error) {
+func (r *ChannelRouter) SendPayment(ctx context.Context,
+	payment *LightningPayment) ([32]byte, *route.Route, error) {
 
 	paySession, shardTracker, err := r.PreparePayment(payment)
 	if err != nil {
@@ -960,7 +912,7 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte,
 		spewPayment(payment))
 
 	return r.sendPayment(
-		context.Background(), payment.FeeLimit, payment.Identifier(),
+		ctx, payment.FeeLimit, payment.Identifier(),
 		payment.PayAttemptTimeout, paySession, shardTracker,
 		payment.FirstHopCustomRecords,
 	)
@@ -1009,7 +961,8 @@ func spewPayment(payment *LightningPayment) lnutils.LogClosure {
 		}
 		p := *payment
 		p.RouteHints = routeHints
-		return spew.Sdump(p)
+
+		return lnutils.SpewLogClosure(p)()
 	})
 }
 
@@ -1017,6 +970,8 @@ func spewPayment(payment *LightningPayment) lnutils.LogClosure {
 // control tower.
 func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 	PaymentSession, shards.ShardTracker, error) {
+
+	ctx := context.TODO()
 
 	// Assemble any custom data we want to send to the first hop only.
 	var firstHopData fn.Option[tlv.Blob]
@@ -1049,7 +1004,7 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 	// already in-flight.
 	//
 	// TODO(roasbeef): store records as part of creation info?
-	info := &channeldb.PaymentCreationInfo{
+	info := &paymentsdb.PaymentCreationInfo{
 		PaymentIdentifier:     payment.Identifier(),
 		Value:                 payment.Amount,
 		CreationTime:          r.cfg.Clock.Now(),
@@ -1077,7 +1032,7 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 		)
 	}
 
-	err = r.cfg.Control.InitPayment(payment.Identifier(), info)
+	err = r.cfg.Control.InitPayment(ctx, payment.Identifier(), info)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1087,8 +1042,9 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 
 // SendToRoute sends a payment using the provided route and fails the payment
 // when an error is returned from the attempt.
-func (r *ChannelRouter) SendToRoute(htlcHash lntypes.Hash, rt *route.Route,
-	firstHopCustomRecords lnwire.CustomRecords) (*channeldb.HTLCAttempt,
+func (r *ChannelRouter) SendToRoute(_ context.Context, htlcHash lntypes.Hash,
+	rt *route.Route,
+	firstHopCustomRecords lnwire.CustomRecords) (*paymentsdb.HTLCAttempt,
 	error) {
 
 	return r.sendToRoute(htlcHash, rt, false, firstHopCustomRecords)
@@ -1096,9 +1052,9 @@ func (r *ChannelRouter) SendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 
 // SendToRouteSkipTempErr sends a payment using the provided route and fails
 // the payment ONLY when a terminal error is returned from the attempt.
-func (r *ChannelRouter) SendToRouteSkipTempErr(htlcHash lntypes.Hash,
-	rt *route.Route,
-	firstHopCustomRecords lnwire.CustomRecords) (*channeldb.HTLCAttempt,
+func (r *ChannelRouter) SendToRouteSkipTempErr(_ context.Context,
+	htlcHash lntypes.Hash, rt *route.Route,
+	firstHopCustomRecords lnwire.CustomRecords) (*paymentsdb.HTLCAttempt,
 	error) {
 
 	return r.sendToRoute(htlcHash, rt, true, firstHopCustomRecords)
@@ -1112,8 +1068,40 @@ func (r *ChannelRouter) SendToRouteSkipTempErr(htlcHash lntypes.Hash,
 // the payment won't be failed unless a terminal error has occurred.
 func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 	skipTempErr bool,
-	firstHopCustomRecords lnwire.CustomRecords) (*channeldb.HTLCAttempt,
+	firstHopCustomRecords lnwire.CustomRecords) (*paymentsdb.HTLCAttempt,
 	error) {
+
+	// TODO(ziggie): We cannot easily thread the context from the caller
+	// of this method because the payment lifecycle depends on the context
+	// to update the db. The Sending and Receiving of results is currently
+	// not cleanly separated which is the reason that we cannot easily
+	// cancel the context and therefore cancel the ongoing payment.
+	ctx := context.TODO()
+
+	// Helper function to fail a payment. It makes sure the payment is only
+	// failed once so that the failure reason is not overwritten.
+	failPayment := func(paymentIdentifier lntypes.Hash,
+		reason paymentsdb.FailureReason) error {
+
+		payment, fetchErr := r.cfg.Control.FetchPayment(
+			ctx, paymentIdentifier,
+		)
+		if fetchErr != nil {
+			return fetchErr
+		}
+
+		// NOTE: We cannot rely on the payment status to be failed here
+		// because it can still be in-flight although the payment is
+		// already failed.
+		_, failedReason := payment.TerminalInfo()
+		if failedReason != nil {
+			return nil
+		}
+
+		return r.cfg.Control.FailPayment(
+			ctx, paymentIdentifier, reason,
+		)
+	}
 
 	log.Debugf("SendToRoute for payment %v with skipTempErr=%v",
 		htlcHash, skipTempErr)
@@ -1149,7 +1137,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 
 	// Record this payment hash with the ControlTower, ensuring it is not
 	// already in-flight.
-	info := &channeldb.PaymentCreationInfo{
+	info := &paymentsdb.PaymentCreationInfo{
 		PaymentIdentifier:     paymentIdentifier,
 		Value:                 amt,
 		CreationTime:          r.cfg.Clock.Now(),
@@ -1157,12 +1145,12 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 		FirstHopCustomRecords: firstHopCustomRecords,
 	}
 
-	err := r.cfg.Control.InitPayment(paymentIdentifier, info)
+	err := r.cfg.Control.InitPayment(ctx, paymentIdentifier, info)
 	switch {
 	// If this is an MPP attempt and the hash is already registered with
 	// the database, we can go on to launch the shard.
-	case mpp != nil && errors.Is(err, channeldb.ErrPaymentInFlight):
-	case mpp != nil && errors.Is(err, channeldb.ErrPaymentExists):
+	case mpp != nil && errors.Is(err, paymentsdb.ErrPaymentInFlight):
+	case mpp != nil && errors.Is(err, paymentsdb.ErrPaymentExists):
 
 	// Any other error is not tolerated.
 	case err != nil:
@@ -1201,7 +1189,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 	// NOTE: we use zero `remainingAmt` here to simulate the same effect of
 	// setting the lastShard to be false, which is used by previous
 	// implementation.
-	attempt, err := p.registerAttempt(rt, 0)
+	attempt, err := p.registerAttempt(ctx, rt, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1210,29 +1198,15 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 	// the `err` returned here has already been processed by
 	// `handleSwitchErr`, which means if there's a terminal failure, the
 	// payment has been failed.
-	result, err := p.sendAttempt(attempt)
+	result, err := p.sendAttempt(ctx, attempt)
 	if err != nil {
 		return nil, err
-	}
-
-	// We now look up the payment to see if it's already failed.
-	payment, err := p.router.cfg.Control.FetchPayment(p.identifier)
-	if err != nil {
-		return result.attempt, err
-	}
-
-	// Exit if the above error has caused the payment to be failed, we also
-	// return the error from sending attempt to mimic the old behavior of
-	// this method.
-	_, failedReason := payment.TerminalInfo()
-	if failedReason != nil {
-		return result.attempt, result.err
 	}
 
 	// Since for SendToRoute we won't retry in case the shard fails, we'll
 	// mark the payment failed with the control tower immediately if the
 	// skipTempErr is false.
-	reason := channeldb.FailureReasonError
+	reason := paymentsdb.FailureReasonError
 
 	// If we failed to send the HTLC, we need to further decide if we want
 	// to fail the payment.
@@ -1242,8 +1216,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 			return result.attempt, result.err
 		}
 
-		// Otherwise we need to fail the payment.
-		err := r.cfg.Control.FailPayment(paymentIdentifier, reason)
+		err := failPayment(paymentIdentifier, reason)
 		if err != nil {
 			return nil, err
 		}
@@ -1253,7 +1226,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 
 	// The attempt was successfully sent, wait for the result to be
 	// available.
-	result, err = p.collectResult(attempt)
+	result, err = p.collectAndHandleResult(ctx, attempt)
 	if err != nil {
 		return nil, err
 	}
@@ -1266,7 +1239,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 	// An error returned from collecting the result, we'll mark the payment
 	// as failed if we don't skip temp error.
 	if !skipTempErr {
-		err := r.cfg.Control.FailPayment(paymentIdentifier, reason)
+		err := failPayment(paymentIdentifier, reason)
 		if err != nil {
 			return nil, err
 		}
@@ -1314,6 +1287,8 @@ func (r *ChannelRouter) sendPayment(ctx context.Context,
 	}
 
 	// Validate the custom records before we attempt to send the payment.
+	// TODO(ziggie): Move this check before registering the payment in the
+	// db (InitPayment).
 	if err := firstHopCustomRecords.Validate(); err != nil {
 		return [32]byte{}, nil, err
 	}
@@ -1330,9 +1305,9 @@ func (r *ChannelRouter) sendPayment(ctx context.Context,
 
 // extractChannelUpdate examines the error and extracts the channel update.
 func (r *ChannelRouter) extractChannelUpdate(
-	failure lnwire.FailureMessage) *lnwire.ChannelUpdate {
+	failure lnwire.FailureMessage) *lnwire.ChannelUpdate1 {
 
-	var update *lnwire.ChannelUpdate
+	var update *lnwire.ChannelUpdate1
 	switch onionErr := failure.(type) {
 	case *lnwire.FailExpiryTooSoon:
 		update = &onionErr.Update
@@ -1456,11 +1431,22 @@ func (r *ChannelRouter) BuildRoute(amt fn.Option[lnwire.MilliSatoshi],
 // resumePayments fetches inflight payments and resumes their payment
 // lifecycles.
 func (r *ChannelRouter) resumePayments() error {
+	ctx := context.TODO()
+
 	// Get all payments that are inflight.
-	payments, err := r.cfg.Control.FetchInFlightPayments()
+	log.Debugf("Scanning for inflight payments")
+	payments, err := r.cfg.Control.FetchInFlightPayments(ctx)
 	if err != nil {
 		return err
 	}
+
+	log.Debugf("Scanning finished, found %d inflight payments",
+		len(payments))
+
+	// TODO(ziggie): Also check for payments which have no HTLCs at all
+	// this can happen because we register an attempt after initializing the
+	// payment, so there is a small chance that we init a payment but never
+	// register an attempt for it.
 
 	// Before we restart existing payments and start accepting more
 	// payments to be made, we clean the network result store of the
@@ -1484,7 +1470,7 @@ func (r *ChannelRouter) resumePayments() error {
 	}
 
 	// launchPayment is a helper closure that handles resuming the payment.
-	launchPayment := func(payment *channeldb.MPPayment) {
+	launchPayment := func(payment *paymentsdb.MPPayment) {
 		defer r.wg.Done()
 
 		// Get the hashes used for the outstanding HTLCs.
@@ -1559,8 +1545,10 @@ func (r *ChannelRouter) resumePayments() error {
 // attempt to NOT be saved, resulting a payment being stuck forever. More info:
 // - https://github.com/lightningnetwork/lnd/issues/8146
 // - https://github.com/lightningnetwork/lnd/pull/8174
-func (r *ChannelRouter) failStaleAttempt(a channeldb.HTLCAttempt,
+func (r *ChannelRouter) failStaleAttempt(a paymentsdb.HTLCAttempt,
 	payHash lntypes.Hash) {
+
+	ctx := context.TODO()
 
 	// We can only fail inflight HTLCs so we skip the settled/failed ones.
 	if a.Failure != nil || a.Settle != nil {
@@ -1641,11 +1629,11 @@ func (r *ChannelRouter) failStaleAttempt(a channeldb.HTLCAttempt,
 
 	// Fail the attempt in db. If there's an error, there's nothing we can
 	// do here but logging it.
-	failInfo := &channeldb.HTLCFailInfo{
-		Reason:   channeldb.HTLCFailUnknown,
+	failInfo := &paymentsdb.HTLCFailInfo{
+		Reason:   paymentsdb.HTLCFailUnknown,
 		FailTime: r.cfg.Clock.Now(),
 	}
-	_, err = r.cfg.Control.FailAttempt(payHash, a.AttemptID, failInfo)
+	_, err = r.cfg.Control.FailAttempt(ctx, payHash, a.AttemptID, failInfo)
 	if err != nil {
 		log.Errorf("Fail attempt=%v got error: %v", a.AttemptID, err)
 	}
@@ -1874,7 +1862,7 @@ func outgoingFromIncoming(incomingAmt lnwire.MilliSatoshi,
 	PPM := big.NewInt(1_000_000)
 
 	// The following discussion was contributed by user feelancer21, see
-	//nolint:lll
+	//nolint:ll
 	// https://github.com/feelancer21/lnd/commit/f6f05fa930985aac0d27c3f6681aada1b599162a.
 
 	// The incoming amount Ai based on the outgoing amount Ao is computed by

@@ -8,28 +8,26 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
+	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
 
-// FetchInputInfo queries for the WalletController's knowledge of the passed
+// FetchOutpointInfo queries for the WalletController's knowledge of the passed
 // outpoint. If the base wallet determines this output is under its control,
 // then the original txout should be returned. Otherwise, a non-nil error value
 // of ErrNotMine should be returned instead.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) FetchInputInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
+func (b *BtcWallet) FetchOutpointInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
 	error) {
 
-	prevTx, txOut, bip32, confirmations, err := b.wallet.FetchInputInfo(
-		prevOut,
-	)
+	prevTx, txOut, confirmations, err := b.wallet.FetchOutpointInfo(prevOut)
 	if err != nil {
 		return nil, err
 	}
@@ -51,9 +49,16 @@ func (b *BtcWallet) FetchInputInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
 		PkScript:      txOut.PkScript,
 		Confirmations: confirmations,
 		OutPoint:      *prevOut,
-		Derivation:    bip32,
 		PrevTx:        prevTx,
 	}, nil
+}
+
+// FetchDerivationInfo queries for the wallet's knowledge of the passed
+// pkScript and constructs the derivation info and returns it.
+func (b *BtcWallet) FetchDerivationInfo(
+	pkScript []byte) (*psbt.Bip32Derivation, error) {
+
+	return b.wallet.FetchDerivationInfo(pkScript)
 }
 
 // ScriptForOutput returns the address, witness program and redeem script for a
@@ -63,26 +68,6 @@ func (b *BtcWallet) ScriptForOutput(output *wire.TxOut) (
 	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
 
 	return b.wallet.ScriptForOutput(output)
-}
-
-// deriveFromKeyLoc attempts to derive a private key using a fully specified
-// KeyLocator.
-func deriveFromKeyLoc(scopedMgr *waddrmgr.ScopedKeyManager,
-	addrmgrNs walletdb.ReadWriteBucket,
-	keyLoc keychain.KeyLocator) (*btcec.PrivateKey, error) {
-
-	path := waddrmgr.DerivationPath{
-		InternalAccount: uint32(keyLoc.Family),
-		Account:         uint32(keyLoc.Family),
-		Branch:          0,
-		Index:           keyLoc.Index,
-	}
-	addr, err := scopedMgr.DeriveFromKeyPath(addrmgrNs, path)
-	if err != nil {
-		return nil, err
-	}
-
-	return addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
 }
 
 // deriveKeyByBIP32Path derives a key described by a BIP32 path. We expect the
@@ -163,36 +148,14 @@ func (b *BtcWallet) deriveKeyByBIP32Path(path []uint32) (*btcec.PrivateKey,
 		Purpose: purpose,
 		Coin:    coinType,
 	}
-	scopedMgr, err := b.wallet.Manager.FetchScopedKeyManager(scope)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching manager for scope %v: "+
-			"%w", scope, err)
-	}
-
-	// Let's see if we can hit the private key cache.
 	keyPath := waddrmgr.DerivationPath{
 		InternalAccount: account,
 		Account:         account,
 		Branch:          change,
 		Index:           index,
 	}
-	privKey, err := scopedMgr.DeriveFromKeyPathCache(keyPath)
-	if err == nil {
-		return privKey, nil
-	}
 
-	// The key wasn't in the cache, let's fully derive it now.
-	err = walletdb.View(b.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		addr, err := scopedMgr.DeriveFromKeyPath(addrmgrNs, keyPath)
-		if err != nil {
-			return fmt.Errorf("error deriving private key: %w", err)
-		}
-
-		privKey, err = addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
-		return err
-	})
+	privKey, err := b.wallet.DeriveFromKeyPath(scope, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("error deriving key from path %#v: %w",
 			keyPath, err)
@@ -219,55 +182,15 @@ func (b *BtcWallet) deriveKeyByLocator(
 	keyLoc keychain.KeyLocator) (*btcec.PrivateKey, error) {
 
 	// We'll assume the special lightning key scope in this case.
-	scopedMgr, err := b.wallet.Manager.FetchScopedKeyManager(
-		b.chainKeyScope,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// First try to read the key from the cached store, if this fails, then
-	// we'll fall through to the method below that requires a database
-	// transaction.
+	scope := b.chainKeyScope
 	path := waddrmgr.DerivationPath{
 		InternalAccount: uint32(keyLoc.Family),
 		Account:         uint32(keyLoc.Family),
 		Branch:          0,
 		Index:           keyLoc.Index,
 	}
-	privKey, err := scopedMgr.DeriveFromKeyPathCache(path)
-	if err == nil {
-		return privKey, nil
-	}
 
-	var key *btcec.PrivateKey
-	err = walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		key, err = deriveFromKeyLoc(scopedMgr, addrmgrNs, keyLoc)
-		if waddrmgr.IsError(err, waddrmgr.ErrAccountNotFound) {
-			// If we've reached this point, then the account
-			// doesn't yet exist, so we'll create it now to ensure
-			// we can sign.
-			acctErr := scopedMgr.NewRawAccount(
-				addrmgrNs, uint32(keyLoc.Family),
-			)
-			if acctErr != nil {
-				return acctErr
-			}
-
-			// Now that we know the account exists, we'll attempt
-			// to re-derive the private key.
-			key, err = deriveFromKeyLoc(
-				scopedMgr, addrmgrNs, keyLoc,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		return err
-	})
+	key, err := b.wallet.DeriveFromKeyPathAddAccount(scope, path)
 	if err != nil {
 		return nil, err
 	}
@@ -315,20 +238,32 @@ func (b *BtcWallet) fetchPrivKey(
 
 // maybeTweakPrivKey examines the single and double tweak parameters on the
 // passed sign descriptor and may perform a mapping on the passed private key
-// in order to utilize the tweaks, if populated.
+// in order to utilize the tweaks, if populated. If both tweak parameters are
+// set, then both are applied in the following order:
+//
+//	a) double tweak
+//	b) single tweak
 func maybeTweakPrivKey(signDesc *input.SignDescriptor,
 	privKey *btcec.PrivateKey) (*btcec.PrivateKey, error) {
 
 	var retPriv *btcec.PrivateKey
+
 	switch {
+	// If both tweak parameters are set, apply the double tweak first
+	// (revocation), then the single tweak (HTLC index).
+	case signDesc.DoubleTweak != nil && signDesc.SingleTweak != nil:
+		retPriv = input.DeriveRevocationPrivKey(
+			privKey, signDesc.DoubleTweak,
+		)
+		retPriv = input.TweakPrivKey(retPriv, signDesc.SingleTweak)
 
 	case signDesc.SingleTweak != nil:
-		retPriv = input.TweakPrivKey(privKey,
-			signDesc.SingleTweak)
+		retPriv = input.TweakPrivKey(privKey, signDesc.SingleTweak)
 
 	case signDesc.DoubleTweak != nil:
-		retPriv = input.DeriveRevocationPrivKey(privKey,
-			signDesc.DoubleTweak)
+		retPriv = input.DeriveRevocationPrivKey(
+			privKey, signDesc.DoubleTweak,
+		)
 
 	default:
 		retPriv = privKey

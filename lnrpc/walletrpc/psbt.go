@@ -6,6 +6,7 @@ package walletrpc
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/btcsuite/btcd/wire"
 	base "github.com/btcsuite/btcwallet/wallet"
@@ -40,10 +41,12 @@ func verifyInputsUnspent(inputs []*wire.TxIn, utxos []*lnwallet.Utxo) error {
 	return nil
 }
 
-// lockInputs requests a lock lease for all inputs specified in a PSBT packet
-// by using the internal, static lock ID of lnd's wallet.
-func lockInputs(w lnwallet.WalletController,
-	outpoints []wire.OutPoint) ([]*base.ListLeasedOutputResult, error) {
+// lockInputs requests lock leases for all inputs specified in a PSBT packet
+// (the passed outpoints), using either the optional custom lock ID and duration
+// or the wallet's internal static lock ID with the default 10-minute duration.
+func lockInputs(w lnwallet.WalletController, outpoints []wire.OutPoint,
+	customLockID *wtxmgr.LockID, customLockDuration time.Duration) (
+	[]*base.ListLeasedOutputResult, error) {
 
 	locks := make(
 		[]*base.ListLeasedOutputResult, len(outpoints),
@@ -51,14 +54,28 @@ func lockInputs(w lnwallet.WalletController,
 	for idx := range outpoints {
 		lock := &base.ListLeasedOutputResult{
 			LockedOutput: &wtxmgr.LockedOutput{
-				LockID:   chanfunding.LndInternalLockID,
 				Outpoint: outpoints[idx],
 			},
 		}
 
-		expiration, pkScript, value, err := w.LeaseOutput(
-			lock.LockID, lock.Outpoint,
-			chanfunding.DefaultLockDuration,
+		lock.LockID = chanfunding.LndInternalLockID
+		if customLockID != nil {
+			lock.LockID = *customLockID
+		}
+
+		lockDuration := chanfunding.DefaultLockDuration
+		if customLockDuration != 0 {
+			lockDuration = customLockDuration
+		}
+
+		// Get the details about this outpoint.
+		utxo, err := w.FetchOutpointInfo(&lock.Outpoint)
+		if err != nil {
+			return nil, fmt.Errorf("fetch outpoint info: %w", err)
+		}
+
+		expiration, err := w.LeaseOutput(
+			lock.LockID, lock.Outpoint, lockDuration,
 		)
 		if err != nil {
 			// If we run into a problem with locking one output, we
@@ -80,8 +97,8 @@ func lockInputs(w lnwallet.WalletController,
 		}
 
 		lock.Expiration = expiration
-		lock.PkScript = pkScript
-		lock.Value = int64(value)
+		lock.PkScript = utxo.PkScript
+		lock.Value = int64(utxo.Value)
 		locks[idx] = lock
 	}
 

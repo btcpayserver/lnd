@@ -1,6 +1,7 @@
 package itest
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -42,25 +43,23 @@ import (
 // thus a following operation will fail if it relies on the channel being
 // enabled.
 func testUpdateChanStatus(ht *lntest.HarnessTest) {
-	// Create two fresh nodes and open a channel between them.
-	alice, bob := ht.Alice, ht.Bob
-	args := []string{
+	// Prepare params.
+	chanAmt := btcutil.Amount(100_000)
+	openChannelParams := lntest.OpenChannelParams{
+		Amt: chanAmt,
+	}
+	cfg := []string{
 		"--minbackoff=60s",
 		"--chan-enable-timeout=3s",
 		"--chan-disable-timeout=6s",
 		"--chan-status-sample-interval=0.5s",
 	}
-	ht.RestartNodeWithExtraArgs(alice, args)
-	ht.RestartNodeWithExtraArgs(bob, args)
-	ht.EnsureConnected(alice, bob)
+	cfgs := [][]string{cfg, cfg}
 
-	// Open a channel with 100k satoshis between Alice and Bob with Alice
-	// being the sole funder of the channel.
-	chanAmt := btcutil.Amount(100000)
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{Amt: chanAmt},
-	)
-	defer ht.CloseChannel(alice, chanPoint)
+	// Create two fresh nodes and open a channel between them.
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
+	chanPoint := chanPoints[0]
+	alice, bob := nodes[0], nodes[1]
 
 	// assertEdgeDisabled ensures that Alice has the correct Disabled state
 	// for given channel from her DescribeGraph.
@@ -220,7 +219,9 @@ func testUpdateChanStatus(ht *lntest.HarnessTest) {
 // describeGraph RPC request unless explicitly asked for.
 func testUnannouncedChannels(ht *lntest.HarnessTest) {
 	amount := funding.MaxBtcFundingAmount
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Open a channel between Alice and Bob, ensuring the
 	// channel has been opened properly.
@@ -234,7 +235,7 @@ func testUnannouncedChannels(ht *lntest.HarnessTest) {
 
 	// One block is enough to make the channel ready for use, since the
 	// nodes have defaultNumConfs=1 set.
-	fundingChanPoint := ht.WaitForChannelOpenEvent(chanOpenUpdate)
+	ht.WaitForChannelOpenEvent(chanOpenUpdate)
 
 	// Alice should have 1 edge in her graph.
 	ht.AssertNumEdges(alice, 1, true)
@@ -248,9 +249,6 @@ func testUnannouncedChannels(ht *lntest.HarnessTest) {
 
 	// Give the network a chance to learn that auth proof is confirmed.
 	ht.AssertNumEdges(alice, 1, false)
-
-	// Close the channel used during the test.
-	ht.CloseChannel(alice, fundingChanPoint)
 }
 
 func testGraphTopologyNotifications(ht *lntest.HarnessTest) {
@@ -269,13 +267,9 @@ func testGraphTopologyNtfns(ht *lntest.HarnessTest, pinned bool) {
 
 	// Spin up Bob first, since we will need to grab his pubkey when
 	// starting Alice to test pinned syncing.
-	bob := ht.Bob
+	bob := ht.NewNodeWithCoins("Bob", nil)
 	bobInfo := bob.RPC.GetInfo()
 	bobPubkey := bobInfo.IdentityPubkey
-
-	// Restart Bob as he may have leftover announcements from previous
-	// tests, causing the graph to be unsynced.
-	ht.RestartNodeWithExtraArgs(bob, nil)
 
 	// For unpinned syncing, start Alice as usual. Otherwise grab Bob's
 	// pubkey to include in his pinned syncer set.
@@ -287,8 +281,7 @@ func testGraphTopologyNtfns(ht *lntest.HarnessTest, pinned bool) {
 		}
 	}
 
-	alice := ht.Alice
-	ht.RestartNodeWithExtraArgs(alice, aliceArgs)
+	alice := ht.NewNodeWithCoins("Alice", aliceArgs)
 
 	// Connect Alice and Bob.
 	ht.EnsureConnected(alice, bob)
@@ -372,21 +365,19 @@ func testGraphTopologyNtfns(ht *lntest.HarnessTest, pinned bool) {
 	// Bob's new node announcement, and the channel between Bob and Carol.
 	ht.AssertNumChannelUpdates(alice, chanPoint, 2)
 	ht.AssertNumNodeAnns(alice, bob.PubKeyStr, 1)
-
-	// Close the channel between Bob and Carol.
-	ht.CloseChannel(bob, chanPoint)
 }
 
 // testNodeAnnouncement ensures that when a node is started with one or more
 // external IP addresses specified on the command line, that those addresses
 // announced to the network and reported in the network graph.
 func testNodeAnnouncement(ht *lntest.HarnessTest) {
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNode("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	advertisedAddrs := []string{
 		"192.168.1.1:8333",
 		"[2001:db8:85a3:8d3:1319:8a2e:370:7348]:8337",
-		"bkb6azqggsaiskzi.onion:9735",
 		"fomvuglh6h6vcag73xo5t5gv56ombih3zr2xvplkpbfd7wrog4swj" +
 			"wid.onion:1234",
 	}
@@ -405,7 +396,7 @@ func testNodeAnnouncement(ht *lntest.HarnessTest) {
 	// We'll then go ahead and open a channel between Bob and Dave. This
 	// ensures that Alice receives the node announcement from Bob as part of
 	// the announcement broadcast.
-	chanPoint := ht.OpenChannel(
+	ht.OpenChannel(
 		bob, dave, lntest.OpenChannelParams{Amt: 1000000},
 	)
 
@@ -427,16 +418,15 @@ func testNodeAnnouncement(ht *lntest.HarnessTest) {
 	allUpdates := ht.AssertNumNodeAnns(alice, dave.PubKeyStr, 1)
 	nodeUpdate := allUpdates[len(allUpdates)-1]
 	assertAddrs(nodeUpdate.Addresses, advertisedAddrs...)
-
-	// Close the channel between Bob and Dave.
-	ht.CloseChannel(bob, chanPoint)
 }
 
 // testUpdateNodeAnnouncement ensures that the RPC endpoint validates
-// the requests correctly and that the new node announcement is brodcasted
+// the requests correctly and that the new node announcement is broadcast
 // with the right information after updating our node.
 func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNode("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	var lndArgs []string
 
@@ -444,7 +434,6 @@ func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
 	extraAddrs := []string{
 		"192.168.1.1:8333",
 		"[2001:db8:85a3:8d3:1319:8a2e:370:7348]:8337",
-		"bkb6azqggsaiskzi.onion:9735",
 		"fomvuglh6h6vcag73xo5t5gv56ombih3zr2xvplkpbfd7wrog4swj" +
 			"wid.onion:1234",
 	}
@@ -479,7 +468,7 @@ func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
 	}
 
 	// Get dave default information so we can compare it lately with the
-	// brodcasted updates.
+	// broadcast updates.
 	resp := dave.RPC.GetInfo()
 	defaultAddrs := make([]*lnrpc.NodeAddress, 0, len(resp.Uris))
 	for _, uri := range resp.GetUris() {
@@ -532,7 +521,7 @@ func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
 	// Go ahead and open a channel between Bob and Dave. This
 	// ensures that Alice receives the node announcement from Bob as part of
 	// the announcement broadcast.
-	chanPoint := ht.OpenChannel(
+	ht.OpenChannel(
 		bob, dave, lntest.OpenChannelParams{
 			Amt: 1000000,
 		},
@@ -662,9 +651,126 @@ func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
 		FeatureUpdates: updateFeatureActions,
 	}
 	dave.RPC.UpdateNodeAnnouncementErr(nodeAnnReq)
+}
 
-	// Close the channel between Bob and Dave.
-	ht.CloseChannel(bob, chanPoint)
+// testSelfNodeAnnouncementPersistence tests that the node announcement configs
+// are persisted correctly and reused when the node is restarted using the
+// correct hierarchy (config > source node > defaults).
+func testSelfNodeAnnouncementPersistence(ht *lntest.HarnessTest) {
+	// Start Alice with default node announcement options.
+	alice := ht.NewNode("Alice", nil)
+
+	// assertAddrs is a helper function to assert that the node info
+	// contains the correct addresses.
+	assertAddrs := func(addrsFound []string, targetAddrs ...string) error {
+		addrs := make(map[string]struct{}, len(addrsFound))
+		for _, addr := range addrsFound {
+			addr = strings.Split(addr, "@")[1]
+			addrs[addr] = struct{}{}
+		}
+
+		for _, addr := range targetAddrs {
+			_, ok := addrs[addr]
+			if !ok {
+				return fmt.Errorf("address %v not found in "+
+					"node announcement", addr)
+			}
+		}
+
+		return nil
+	}
+
+	// assertNodeInfo is a helper function to assert that the node info
+	// contains the correct values.
+	assertNodeInfo := func(resp *lnrpc.GetInfoResponse, expectedAlias,
+		expectedColor string, expectedAddrs ...string) {
+
+		require.Equal(ht, expectedAlias, resp.Alias)
+		require.Equal(ht, expectedColor, resp.Color)
+		err := assertAddrs(resp.Uris, expectedAddrs...)
+		require.NoError(ht, err)
+	}
+
+	// Get the node info and verify that the default values are used for
+	// alias and color.
+	resp := alice.RPC.GetInfo()
+
+	// The alias should be the first 10 bytes of the serialized public key.
+	defaultAlias := hex.EncodeToString(alice.PubKey[:10])
+
+	// Assert that the default values are used for alias and color.
+	assertNodeInfo(resp, defaultAlias, "#3399ff")
+
+	// Update the node announcement and set an alias, color, and addresses.
+	nodeAnnReq := &peersrpc.NodeAnnouncementUpdateRequest{
+		Alias: "alice",
+		Color: "#eeeeee",
+		AddressUpdates: []*peersrpc.UpdateAddressAction{
+			{
+				Action:  peersrpc.UpdateAction_ADD,
+				Address: "192.168.1.10:8333",
+			},
+			{
+				Action:  peersrpc.UpdateAction_ADD,
+				Address: "192.168.1.11:8333",
+			},
+		},
+	}
+
+	response := alice.RPC.UpdateNodeAnnouncement(nodeAnnReq)
+
+	expectedOps := map[string]int{
+		"alias":     1,
+		"color":     1,
+		"addresses": 2,
+	}
+	assertUpdateNodeAnnouncementResponse(ht, response, expectedOps)
+
+	// Test that we can remove an address.
+	removeAddrReq := &peersrpc.NodeAnnouncementUpdateRequest{
+		AddressUpdates: []*peersrpc.UpdateAddressAction{
+			{
+				Action:  peersrpc.UpdateAction_REMOVE,
+				Address: "192.168.1.10:8333",
+			},
+		},
+	}
+	response = alice.RPC.UpdateNodeAnnouncement(removeAddrReq)
+	expectedOps = map[string]int{
+		"addresses": 1,
+	}
+	assertUpdateNodeAnnouncementResponse(ht, response, expectedOps)
+
+	resp = alice.RPC.GetInfo()
+	assertNodeInfo(
+		resp, "alice", "#eeeeee", "192.168.1.11:8333",
+	)
+
+	// Restart Alice.
+	ht.RestartNode(alice)
+
+	// After restarting, the node info should contain the values that were
+	// set in the update request since the updated values take precedence
+	// over the default values.
+	resp = alice.RPC.GetInfo()
+	assertNodeInfo(resp, "alice", "#eeeeee")
+
+	// Now we restart the node with custom values in the config.
+	lndArgs := []string{
+		"--externalip=192.168.1.12:8333",
+		"--externalip=192.168.1.13:8333",
+		"--alias=alice-updated",
+		"--color=#ffffff",
+	}
+	ht.RestartNodeWithExtraArgs(alice, lndArgs)
+
+	// Get the node info and verify that the values are the same as the
+	// ones we set in the config (and not the updated values).
+	resp = alice.RPC.GetInfo()
+	assertNodeInfo(
+		resp, "alice-updated", "#ffffff", "192.168.1.12:8333",
+		"192.168.1.13:8333",
+	)
 }
 
 // assertSyncType asserts that the peer has an expected syncType.
@@ -673,18 +779,27 @@ func testUpdateNodeAnnouncement(ht *lntest.HarnessTest) {
 func assertSyncType(ht *lntest.HarnessTest, hn *node.HarnessNode,
 	peer string, syncType lnrpc.Peer_SyncType) {
 
-	resp := hn.RPC.ListPeers()
-	for _, rpcPeer := range resp.Peers {
-		if rpcPeer.PubKey != peer {
-			continue
+	err := wait.NoError(func() error {
+		resp := hn.RPC.ListPeers()
+
+		for _, rpcPeer := range resp.Peers {
+			if rpcPeer.PubKey != peer {
+				continue
+			}
+
+			// Exit early if the sync type is matched.
+			if syncType == rpcPeer.SyncType {
+				return nil
+			}
+
+			return fmt.Errorf("sync type: want %v got %v", syncType,
+				rpcPeer.SyncType)
 		}
 
-		require.Equal(ht, syncType, rpcPeer.SyncType)
+		return fmt.Errorf("unable to find peer: %s", peer)
+	}, defaultTimeout)
 
-		return
-	}
-
-	ht.Fatalf("unable to find peer: %s", peer)
+	require.NoError(ht, err, "%s: timeout checking sync type", hn.Name())
 }
 
 // compareNodeAnns compares that two node announcements match or returns an

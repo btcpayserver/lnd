@@ -3,6 +3,7 @@ package routing
 import (
 	"bytes"
 	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -11,10 +12,10 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	sphinx "github.com/lightningnetwork/lightning-onion"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/feature"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -513,8 +514,19 @@ func getOutgoingBalance(node route.Vertex, outgoingChans map[uint64]struct{},
 	g Graph) (lnwire.MilliSatoshi, lnwire.MilliSatoshi, error) {
 
 	var max, total lnwire.MilliSatoshi
-	cb := func(channel *channeldb.DirectedChannel) error {
+	cb := func(channel *graphdb.DirectedChannel) error {
+		shortID := lnwire.NewShortChanIDFromInt(channel.ChannelID)
+
+		// This log line is needed to debug issues in case we do not
+		// have a channel in our graph for some reason when evaluating
+		// the local balance. Otherwise we could not tell whether all
+		// channels are being evaluated.
+		log.Tracef("Evaluating channel %v for local balance", shortID)
+
 		if !channel.OutPolicySet {
+			log.Debugf("ShortChannelID=%v: has no out policy set, "+
+				"skipping", shortID)
+
 			return nil
 		}
 
@@ -536,6 +548,11 @@ func getOutgoingBalance(node route.Vertex, outgoingChans map[uint64]struct{},
 		// we've already queried the bandwidth hints.
 		if !ok {
 			bandwidth = lnwire.NewMSatFromSatoshis(channel.Capacity)
+
+			log.Warnf("ShortChannelID=%v: not found in the local "+
+				"channels map of the bandwidth manager, "+
+				"using channel capacity=%v as bandwidth for "+
+				"this channel", shortID, bandwidth)
 		}
 
 		if bandwidth > max {
@@ -545,6 +562,9 @@ func getOutgoingBalance(node route.Vertex, outgoingChans map[uint64]struct{},
 		var overflow bool
 		total, overflow = overflowSafeAdd(total, bandwidth)
 		if overflow {
+			log.Warnf("ShortChannelID=%v: overflow detected, "+
+				"setting total to max value", shortID)
+
 			// If the current total and the bandwidth would
 			// overflow the maximum value, we set the total to the
 			// maximum value. Which is more milli-satoshis than are
@@ -557,7 +577,12 @@ func getOutgoingBalance(node route.Vertex, outgoingChans map[uint64]struct{},
 	}
 
 	// Iterate over all channels of the to node.
-	err := g.ForEachNodeChannel(node, cb)
+	err := g.ForEachNodeDirectedChannel(
+		context.TODO(), node, cb, func() {
+			max = 0
+			total = 0
+		},
+	)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -597,7 +622,9 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	features := r.DestFeatures
 	if features == nil {
 		var err error
-		features, err = g.graph.FetchNodeFeatures(target)
+		features, err = g.graph.FetchNodeFeatures(
+			context.TODO(), target,
+		)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -951,7 +978,7 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 
 		routingInfoSize := toNodeDist.routingInfoSize + payloadSize
 		// Skip paths that would exceed the maximum routing info size.
-		if routingInfoSize > sphinx.MaxPayloadSize {
+		if routingInfoSize > sphinx.MaxRoutingPayloadSize {
 			return
 		}
 
@@ -995,7 +1022,9 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 		}
 
 		// Fetch node features fresh from the graph.
-		fromFeatures, err := g.graph.FetchNodeFeatures(node)
+		fromFeatures, err := g.graph.FetchNodeFeatures(
+			context.TODO(), node,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1192,6 +1221,11 @@ type blindedPathRestrictions struct {
 	// nodeOmissionSet holds a set of node IDs of nodes that we should
 	// ignore during blinded path selection.
 	nodeOmissionSet fn.Set[route.Vertex]
+
+	// incomingChainedChannels holds the chained channels list specified
+	// via scid (short channel id) starting from a channel which points to
+	// the receiver node.
+	incomingChainedChannels []uint64
 }
 
 // blindedHop holds the information about a hop we have selected for a blinded
@@ -1221,15 +1255,106 @@ func findBlindedPaths(g Graph, target route.Vertex,
 			restrictions.minNumHops)
 	}
 
-	// If the node is not the destination node, then it is required that the
-	// node advertise the route blinding feature-bit in order for it to be
-	// chosen as a node on the blinded path.
-	supportsRouteBlinding := func(node route.Vertex) (bool, error) {
-		if node == target {
+	var (
+		// The target node is always the last hop in the path, and so
+		// we add it to the incoming path from the get-go. Any additions
+		// to the slice should be prepended.
+		incomingPath = []blindedHop{{
+			vertex: target,
+		}}
+
+		// supportsRouteBlinding is a list of nodes that we can assume
+		// support route blinding without needing to rely on the feature
+		// bits announced in their node announcement. Since we are
+		// finding a path to the target node, we can assume it supports
+		// route blinding.
+		supportsRouteBlinding = map[route.Vertex]bool{
+			target: true,
+		}
+
+		visited          = make(map[route.Vertex]bool)
+		nextTarget       = target
+		haveIncomingPath = len(restrictions.incomingChainedChannels) > 0
+
+		// errChanFound is an error variable we return from the DB
+		// iteration call below when we have found the channel we are
+		// looking for. This lets us exit the iteration early.
+		errChanFound = errors.New("found incoming channel")
+	)
+	for _, chanID := range restrictions.incomingChainedChannels {
+		// Mark that we have visited this node so that we don't revisit
+		// it later on when we call "processNodeForBlindedPath".
+		visited[nextTarget] = true
+
+		var (
+			incomingPathReset []blindedHop
+			nextTargetReset   = nextTarget
+		)
+		err := g.ForEachNodeDirectedChannel(
+			context.TODO(), nextTarget,
+			func(channel *graphdb.DirectedChannel) error {
+				// This is not the right channel, continue to
+				// the node's other channels.
+				if channel.ChannelID != chanID {
+					return nil
+				}
+
+				// We found the channel in question. Prepend it
+				// to the incoming path.
+				incomingPathReset = append([]blindedHop{
+					{
+						vertex:       channel.OtherNode,
+						channelID:    channel.ChannelID,
+						edgeCapacity: channel.Capacity,
+					},
+				}, incomingPathReset...)
+
+				// Update the target node.
+				nextTargetReset = channel.OtherNode
+
+				return errChanFound
+			}, func() {
+				incomingPathReset = nil
+				nextTargetReset = nextTarget
+			},
+		)
+		// We expect errChanFound to be returned if the channel in
+		// question was found.
+		if !errors.Is(err, errChanFound) && err != nil {
+			return nil, err
+		} else if err == nil {
+			return nil, fmt.Errorf("incoming channel %d is not "+
+				"seen as owned by node %v", chanID, nextTarget)
+		}
+		nextTarget = nextTargetReset
+		incomingPath = append(incomingPathReset, incomingPath...)
+
+		// Check that the user didn't accidentally add a channel that
+		// is owned by a node in the node omission set.
+		if restrictions.nodeOmissionSet.Contains(nextTarget) {
+			return nil, fmt.Errorf("node %v cannot simultaneously "+
+				"be included in the omission set and in the "+
+				"partially specified path", nextTarget)
+		}
+
+		// Check that we have not already visited the next target node
+		// since this would mean a circular incoming path.
+		if visited[nextTarget] {
+			return nil, fmt.Errorf("a circular route cannot be " +
+				"specified for the incoming blinded path")
+		}
+
+		supportsRouteBlinding[nextTarget] = true
+	}
+
+	// A helper closure which checks if the node in question has advertised
+	// that it supports route blinding.
+	nodeSupportsRouteBlinding := func(node route.Vertex) (bool, error) {
+		if supportsRouteBlinding[node] {
 			return true, nil
 		}
 
-		features, err := g.FetchNodeFeatures(node)
+		features, err := g.FetchNodeFeatures(context.TODO(), node)
 		if err != nil {
 			return false, err
 		}
@@ -1242,31 +1367,46 @@ func findBlindedPaths(g Graph, target route.Vertex,
 	// conditions such as: The maxHops number being reached or reaching
 	// a node that doesn't have any other edges - in that final case, the
 	// whole path should be ignored.
+	//
+	// NOTE: any paths returned will end at the "nextTarget" node meaning
+	// that if we have a fixed list of incoming chained channels, then this
+	// fixed list must be appended to any of the returned paths.
 	paths, _, err := processNodeForBlindedPath(
-		g, target, supportsRouteBlinding, nil, restrictions,
+		g, nextTarget, nodeSupportsRouteBlinding, visited, restrictions,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	// Reverse each path so that the order is correct (from introduction
-	// node to last hop node) and then append this node on as the
-	// destination of each path.
-	orderedPaths := make([][]blindedHop, len(paths))
-	for i, path := range paths {
+	// node to last hop node) and then append the incoming path (if any was
+	// specified) to the end of the path.
+	orderedPaths := make([][]blindedHop, 0, len(paths))
+	for _, path := range paths {
 		sort.Slice(path, func(i, j int) bool {
 			return j < i
 		})
 
-		orderedPaths[i] = append(path, blindedHop{vertex: target})
+		orderedPaths = append(
+			orderedPaths, append(path, incomingPath...),
+		)
+	}
+
+	// There is a chance we have an incoming path that by itself satisfies
+	// the minimum hop restriction. In that case, we add it as its own path.
+	if haveIncomingPath &&
+		len(incomingPath) > int(restrictions.minNumHops) {
+
+		orderedPaths = append(orderedPaths, incomingPath)
 	}
 
 	// Handle the special case that allows a blinded path with the
-	// introduction node as the destination node.
-	if restrictions.minNumHops == 0 {
+	// introduction node as the destination node. This only applies if no
+	// incoming path was specified since in that case, by definition, the
+	// caller wants a non-zero length blinded path.
+	if restrictions.minNumHops == 0 && !haveIncomingPath {
 		singleHopPath := [][]blindedHop{{{vertex: target}}}
 
-		//nolint:makezero
 		orderedPaths = append(
 			orderedPaths, singleHopPath...,
 		)
@@ -1325,8 +1465,9 @@ func processNodeForBlindedPath(g Graph, node route.Vertex,
 
 	// Now, iterate over the node's channels in search for paths to this
 	// node that can be used for blinded paths
-	err = g.ForEachNodeChannel(node,
-		func(channel *channeldb.DirectedChannel) error {
+	err = g.ForEachNodeDirectedChannel(
+		context.TODO(), node,
+		func(channel *graphdb.DirectedChannel) error {
 			// Keep track of how many incoming channels this node
 			// has. We only use a node as an introduction node if it
 			// has channels other than the one that lead us to it.
@@ -1334,7 +1475,7 @@ func processNodeForBlindedPath(g Graph, node route.Vertex,
 
 			// Process each channel peer to gather any paths that
 			// lead to the peer.
-			nextPaths, hasMoreChans, err := processNodeForBlindedPath( //nolint:lll
+			nextPaths, hasMoreChans, err := processNodeForBlindedPath( //nolint:ll
 				g, channel.OtherNode, supportsRouteBlinding,
 				visited, restrictions,
 			)
@@ -1368,6 +1509,9 @@ func processNodeForBlindedPath(g Graph, node route.Vertex,
 			}
 
 			return nil
+		}, func() {
+			hopSets = nil
+			chanCount = 0
 		},
 	)
 	if err != nil {

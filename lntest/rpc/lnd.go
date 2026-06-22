@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/devrpc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -292,6 +293,76 @@ func (h *HarnessRPC) AddInvoice(req *lnrpc.Invoice) *lnrpc.AddInvoiceResponse {
 	return invoice
 }
 
+// AddInvoiceAssertErr makes a RPC call to AddInvoice and asserts an error
+// has returned with a specific error message.
+func (h *HarnessRPC) AddInvoiceAssertErr(req *lnrpc.Invoice, errStr string) {
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.AddInvoice(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
+// GetChanInfoAssertErr makes an RPC call to GetChanInfo and asserts an error
+// has returned with a specific error message.
+func (h *HarnessRPC) GetChanInfoAssertErr(req *lnrpc.ChanInfoRequest,
+	errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.GetChanInfo(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
+// GetNodeInfoAssertErr makes an RPC call to GetNodeInfo and asserts an error
+// has returned with a specific error message.
+func (h *HarnessRPC) GetNodeInfoAssertErr(req *lnrpc.NodeInfoRequest,
+	errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.GetNodeInfo(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
+// SendCustomMessageAssertErr makes an RPC call to SendCustomMessage and asserts
+// an error has returned with a specific error message.
+func (h *HarnessRPC) SendCustomMessageAssertErr(
+	req *lnrpc.SendCustomMessageRequest, errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.SendCustomMessage(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
+// LookupInvoiceAssertErr makes an RPC call to LookupInvoice and asserts an
+// error has returned with a specific error message.
+func (h *HarnessRPC) LookupInvoiceAssertErr(req *lnrpc.PaymentHash,
+	errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.LookupInvoice(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
+// LookupHTLCResolutionAssertErr makes an RPC call to LookupHTLCResolution and
+// asserts an error has returned with a specific error message.
+func (h *HarnessRPC) LookupHTLCResolutionAssertErr(
+	req *lnrpc.LookupHtlcResolutionRequest, errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.LookupHtlcResolution(ctxt, req)
+	require.ErrorContains(h, err, errStr)
+}
+
 // AbandonChannel makes a RPC call to AbandonChannel and asserts.
 func (h *HarnessRPC) AbandonChannel(
 	req *lnrpc.AbandonChannelRequest) *lnrpc.AbandonChannelResponse {
@@ -489,32 +560,6 @@ func (h *HarnessRPC) QueryRoutes(
 	return routes
 }
 
-type SendToRouteClient lnrpc.Lightning_SendToRouteClient
-
-// SendToRoute makes a RPC call to SendToRoute and asserts.
-func (h *HarnessRPC) SendToRoute() SendToRouteClient {
-	// SendToRoute needs to have the context alive for the entire test case
-	// as the returned client will be used for send and receive payment
-	// stream. Thus we use runCtx here instead of a timeout context.
-	client, err := h.LN.SendToRoute(h.runCtx)
-	h.NoError(err, "SendToRoute")
-
-	return client
-}
-
-// SendToRouteSync makes a RPC call to SendToRouteSync and asserts.
-func (h *HarnessRPC) SendToRouteSync(
-	req *lnrpc.SendToRouteRequest) *lnrpc.SendResponse {
-
-	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
-	defer cancel()
-
-	resp, err := h.LN.SendToRouteSync(ctxt, req)
-	h.NoError(err, "SendToRouteSync")
-
-	return resp
-}
-
 // UpdateChannelPolicy makes a RPC call to UpdateChannelPolicy and asserts.
 func (h *HarnessRPC) UpdateChannelPolicy(
 	req *lnrpc.PolicyUpdateRequest) *lnrpc.PolicyUpdateResponse {
@@ -655,6 +700,8 @@ func (h *HarnessRPC) SubscribeChannelEvents() ChannelEventsClient {
 
 type CustomMessageClient lnrpc.Lightning_SubscribeCustomMessagesClient
 
+type OnionMessageClient lnrpc.Lightning_SubscribeOnionMessagesClient
+
 // SubscribeCustomMessages creates a subscription client for custom messages.
 func (h *HarnessRPC) SubscribeCustomMessages() (CustomMessageClient,
 	context.CancelFunc) {
@@ -687,6 +734,38 @@ func (h *HarnessRPC) SendCustomMessage(
 	return resp
 }
 
+// SendOnionMessage makes a RPC call to the node's SendOnionMessage and
+// returns the response.
+func (h *HarnessRPC) SendOnionMessage(
+	req *lnrpc.SendOnionMessageRequest) *lnrpc.SendOnionMessageResponse {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.LN.SendOnionMessage(ctxt, req)
+	h.NoError(err, "SendOnionMessage")
+
+	return resp
+}
+
+// SubscribeOnionMessages creates a subscription client for onion messages.
+func (h *HarnessRPC) SubscribeOnionMessages() (OnionMessageClient,
+	context.CancelFunc) {
+
+	ctxt, cancel := context.WithCancel(h.runCtx)
+
+	req := &lnrpc.SubscribeOnionMessagesRequest{}
+
+	// SubscribeCustomMessages needs to have the context alive for the
+	// entire test case as the returned client will be used for send and
+	// receive events stream. Thus we use runCtx here instead of a timeout
+	// context.
+	stream, err := h.LN.SubscribeOnionMessages(ctxt, req)
+	h.NoError(err, "SubscribeOnionMessages")
+
+	return stream, cancel
+}
+
 // GetChanInfo makes a RPC call to the node's GetChanInfo and returns the
 // response.
 func (h *HarnessRPC) GetChanInfo(
@@ -704,7 +783,7 @@ func (h *HarnessRPC) GetChanInfo(
 // LookupHtlcResolution makes a RPC call to the node's LookupHtlcResolution and
 // returns the response.
 //
-//nolint:lll
+//nolint:ll
 func (h *HarnessRPC) LookupHtlcResolution(
 	req *lnrpc.LookupHtlcResolutionRequest) *lnrpc.LookupHtlcResolutionResponse {
 
@@ -729,4 +808,60 @@ func (h *HarnessRPC) LookupHtlcResolutionAssertErr(
 	require.Error(h, err, "expected an error")
 
 	return err
+}
+
+// Quiesce makes an RPC call to the node's Quiesce method and returns the
+// response.
+func (h *HarnessRPC) Quiesce(
+	req *devrpc.QuiescenceRequest) *devrpc.QuiescenceResponse {
+
+	ctx, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	res, err := h.Dev.Quiesce(ctx, req)
+	h.NoError(err, "Quiesce returned an error")
+
+	return res
+}
+
+type PeerEventsClient lnrpc.Lightning_SubscribePeerEventsClient
+
+// SubscribePeerEvents makes a RPC call to the node's SubscribePeerEvents and
+// returns the stream client.
+func (h *HarnessRPC) SubscribePeerEvents(
+	req *lnrpc.PeerEventSubscription) PeerEventsClient {
+
+	// SubscribePeerEvents needs to have the context alive for the entire
+	// test case as the returned client will be used for send and receive
+	// events stream. Thus we use runCtx here instead of a timeout context.
+	resp, err := h.LN.SubscribePeerEvents(h.runCtx, req)
+	h.NoError(err, "SubscribePeerEvents")
+
+	return resp
+}
+
+// DeleteCanceledInvoice makes a RPC call to the node's DeleteCanceledInvoice
+// and asserts.
+func (h *HarnessRPC) DeleteCanceledInvoice(
+	req *lnrpc.DelCanceledInvoiceReq) *lnrpc.DelCanceledInvoiceResp {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	resp, err := h.LN.DeleteCanceledInvoice(ctxt, req)
+	h.NoError(err, "DeleteCanceledInvoice")
+
+	return resp
+}
+
+// DeleteCanceledInvoiceAssertErr makes a RPC call to the node's
+// DeleteCanceledInvoice and asserts if an RPC error is returned.
+func (h *HarnessRPC) DeleteCanceledInvoiceAssertErr(
+	req *lnrpc.DelCanceledInvoiceReq, errStr string) {
+
+	ctxt, cancel := context.WithTimeout(h.runCtx, DefaultTimeout)
+	defer cancel()
+
+	_, err := h.LN.DeleteCanceledInvoice(ctxt, req)
+	require.ErrorContains(h, err, errStr)
 }

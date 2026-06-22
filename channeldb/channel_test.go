@@ -2,6 +2,7 @@ package channeldb
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math/rand"
 	"net"
 	"reflect"
@@ -10,20 +11,22 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/channels"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
@@ -43,7 +46,19 @@ var (
 	}
 	privKey, pubKey = btcec.PrivKeyFromBytes(key[:])
 
+	testRBytes, _ = hex.DecodeString("8ce2bc69281ce27da07e6683571319d18e" +
+		"949ddfa2965fb6caa1bf0314f882d7")
+	testSBytes, _ = hex.DecodeString("299105481d63e0f4bc2a88121167221b67" +
+		"00d72a0ead154c03be696a292d24ae")
+	testRScalar = new(btcec.ModNScalar)
+	testSScalar = new(btcec.ModNScalar)
+	_           = testRScalar.SetByteSlice(testRBytes)
+	_           = testSScalar.SetByteSlice(testSBytes)
+	testSig     = ecdsa.NewSignature(testRScalar, testSScalar)
+
 	wireSig, _ = lnwire.NewSigFromSignature(testSig)
+
+	testPub = route.Vertex{2, 202, 4}
 
 	testClock = clock.NewTestClock(testNow)
 
@@ -92,6 +107,10 @@ type testChannelParams struct {
 	// openChannel is set to true if the channel should be fully marked as
 	// open if this is false, the channel will be left in pending state.
 	openChannel bool
+
+	// closedChannel is set to true if the channel should be marked as
+	// closed after opening it.
+	closedChannel bool
 }
 
 // testChannelOption is a functional option which can be used to alter the
@@ -111,6 +130,21 @@ func pendingHeightOption(height uint32) testChannelOption {
 func openChannelOption() testChannelOption {
 	return func(params *testChannelParams) {
 		params.openChannel = true
+	}
+}
+
+// closedChannelOption is an option which can be used to create a test channel
+// that is closed.
+func closedChannelOption() testChannelOption {
+	return func(params *testChannelParams) {
+		params.closedChannel = true
+	}
+}
+
+// pubKeyOption is an option which can be used to set the remote's pubkey.
+func pubKeyOption(pubKey *btcec.PublicKey) testChannelOption {
+	return func(params *testChannelParams) {
+		params.channel.IdentityPub = pubKey
 	}
 }
 
@@ -215,6 +249,17 @@ func createTestChannel(t *testing.T, cdb *ChannelStateDB,
 	// Mark the channel as open with the short channel id provided.
 	err = params.channel.MarkAsOpen(params.channel.ShortChannelID)
 	require.NoError(t, err, "unable to mark channel open")
+
+	if params.closedChannel {
+		// Set the other public keys so that serialization doesn't
+		// panic.
+		err = params.channel.CloseChannel(&ChannelCloseSummary{
+			RemotePub:               params.channel.IdentityPub,
+			RemoteCurrentRevocation: params.channel.IdentityPub,
+			RemoteNextRevocation:    params.channel.IdentityPub,
+		})
+		require.NoError(t, err, "unable to close channel")
+	}
 
 	return params.channel
 }
@@ -933,6 +978,73 @@ func TestChannelStateTransition(t *testing.T) {
 	require.Empty(t, fwdPkgs, "no forwarding packages should exist")
 }
 
+// TestOpeningChannelTxConfirmation verifies that calling MarkConfirmationHeight
+// correctly updates the confirmed state. It also ensures that calling Refresh
+// on a different OpenChannel updates its in-memory state to reflect the prior
+// MarkConfirmationHeight call.
+func TestOpeningChannelTxConfirmation(t *testing.T) {
+	t.Parallel()
+
+	fullDB, err := MakeTestDB(t)
+	require.NoError(t, err)
+
+	cdb := fullDB.ChannelStateDB()
+
+	// Create a pending channel that was broadcast at height 99.
+	const broadcastHeight = uint32(99)
+	channelState := createTestChannel(
+		t, cdb, pendingHeightOption(broadcastHeight),
+	)
+
+	// Fetch pending channels from the database.
+	pendingChannels, err := cdb.FetchPendingChannels()
+	require.NoError(t, err)
+	require.Len(t, pendingChannels, 1)
+
+	// Verify the broadcast height of the pending channel.
+	require.Equal(
+		t, broadcastHeight, pendingChannels[0].FundingBroadcastHeight,
+	)
+
+	confirmationHeight := broadcastHeight + 1
+
+	// Mark the channel's confirmation height.
+	err = pendingChannels[0].MarkConfirmationHeight(confirmationHeight)
+	require.NoError(t, err)
+
+	// Verify the ConfirmationHeight is updated correctly.
+	require.Equal(
+		t, confirmationHeight, pendingChannels[0].ConfirmationHeight,
+	)
+
+	// Re-fetch the pending channels to confirm persistence.
+	pendingChannels, err = cdb.FetchPendingChannels()
+	require.NoError(t, err)
+	require.Len(t, pendingChannels, 1)
+
+	// Validate the confirmation and broadcast height.
+	require.Equal(
+		t, confirmationHeight, pendingChannels[0].ConfirmationHeight,
+	)
+	require.Equal(
+		t, broadcastHeight, pendingChannels[0].FundingBroadcastHeight,
+	)
+
+	// Ensure the original channel state's confirmation height is not
+	// updated before refresh.
+	require.EqualValues(t, channelState.ConfirmationHeight, 0)
+
+	// Refresh the original channel state.
+	err = channelState.Refresh()
+	require.NoError(t, err)
+
+	// Verify that both channel states now have the same ConfirmationHeight.
+	require.Equal(
+		t, channelState.ConfirmationHeight,
+		pendingChannels[0].ConfirmationHeight,
+	)
+}
+
 func TestFetchPendingChannels(t *testing.T) {
 	t.Parallel()
 
@@ -962,7 +1074,7 @@ func TestFetchPendingChannels(t *testing.T) {
 	}
 
 	chanOpenLoc := lnwire.ShortChannelID{
-		BlockHeight: 5,
+		BlockHeight: broadcastHeight + 1,
 		TxIndex:     10,
 		TxPosition:  15,
 	}

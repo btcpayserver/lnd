@@ -1,6 +1,7 @@
 package bitcoindnotify
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -15,7 +16,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/queue"
 )
 
@@ -139,6 +140,7 @@ func (b *BitcoindNotifier) Stop() error {
 	// Shutdown the rpc client, this gracefully disconnects from bitcoind,
 	// and cleans up all related resources.
 	b.chainConn.Stop()
+	b.chainConn.WaitForShutdown()
 
 	close(b.quit)
 	b.wg.Wait()
@@ -170,9 +172,11 @@ func (b *BitcoindNotifier) Started() bool {
 }
 
 func (b *BitcoindNotifier) startNotifier() error {
+	chainntnfs.Log.Infof("bitcoind notifier starting...")
+
 	// Connect to bitcoind, and register for notifications on connected,
 	// and disconnected blocks.
-	if err := b.chainConn.Start(); err != nil {
+	if err := b.chainConn.Start(context.Background()); err != nil {
 		return err
 	}
 	if err := b.chainConn.NotifyBlocks(); err != nil {
@@ -205,6 +209,8 @@ func (b *BitcoindNotifier) startNotifier() error {
 	// Set the active flag now that we've completed the full
 	// startup.
 	atomic.StoreInt32(&b.active, 1)
+
+	chainntnfs.Log.Debugf("bitcoind notifier started")
 
 	return nil
 }
@@ -255,7 +261,7 @@ out:
 				// TODO(wilmer): add retry logic if rescan fails?
 				b.wg.Add(1)
 
-				//nolint:lll
+				//nolint:ll
 				go func(msg *chainntnfs.HistoricalConfDispatch) {
 					defer b.wg.Done()
 
@@ -300,7 +306,7 @@ out:
 				// TODO(wilmer): add retry logic if rescan fails?
 				b.wg.Add(1)
 
-				//nolint:lll
+				//nolint:ll
 				go func(msg *chainntnfs.HistoricalSpendDispatch) {
 					defer b.wg.Done()
 
@@ -490,7 +496,7 @@ out:
 func (b *BitcoindNotifier) handleRelevantTx(tx *btcutil.Tx,
 	mempool bool, height uint32) {
 
-	// If this is a mempool spend, we'll ask the mempool notifier to hanlde
+	// If this is a mempool spend, we'll ask the mempool notifier to handle
 	// it.
 	if mempool {
 		err := b.memNotifier.ProcessRelevantSpendTx(tx)
@@ -664,8 +670,14 @@ func (b *BitcoindNotifier) handleBlockConnected(block chainntnfs.BlockEpoch) err
 	// satisfy any client requests based upon the new block.
 	b.bestBlock = block
 
+	err = b.txNotifier.NotifyHeight(uint32(block.Height))
+	if err != nil {
+		return fmt.Errorf("unable to notify height: %w", err)
+	}
+
 	b.notifyBlockEpochs(block.Height, block.Hash, block.BlockHeader)
-	return b.txNotifier.NotifyHeight(uint32(block.Height))
+
+	return nil
 }
 
 // notifyBlockEpochs notifies all registered block epoch clients of the newly
@@ -822,8 +834,16 @@ func (b *BitcoindNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 			return nil, err
 		}
 
-		if uint32(blockHeight) > ntfn.HistoricalDispatch.StartHeight {
-			ntfn.HistoricalDispatch.StartHeight = uint32(blockHeight)
+		spentHeight := uint32(blockHeight)
+		chainntnfs.Log.Debugf("Outpoint(%v) has spent at height %v",
+			outpoint, spentHeight)
+
+		// Since the tx has already been spent at spentHeight, the
+		// heightHint specified by the caller is no longer relevant. We
+		// now update the starting height to be the spent height to make
+		// sure we won't miss it in the rescan.
+		if spentHeight != ntfn.HistoricalDispatch.StartHeight {
+			ntfn.HistoricalDispatch.StartHeight = spentHeight
 		}
 	}
 

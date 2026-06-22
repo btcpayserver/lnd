@@ -1,23 +1,17 @@
 package itest
 
 import (
-	"context"
 	"fmt"
 	"testing"
-	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainreg"
-	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/funding"
-	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lnrpc"
-	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -25,166 +19,290 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testBasicChannelFunding performs a test exercising expected behavior from a
-// basic funding workflow. The test creates a new channel between Alice and
-// Bob, then immediately closes the channel after asserting some expected post
-// conditions. Finally, the chain itself is checked to ensure the closing
-// transaction was mined.
-func testBasicChannelFunding(ht *lntest.HarnessTest) {
-	// Run through the test with combinations of all the different
-	// commitment types.
-	allTypes := []lnrpc.CommitmentType{
-		lnrpc.CommitmentType_STATIC_REMOTE_KEY,
-		lnrpc.CommitmentType_ANCHORS,
-		lnrpc.CommitmentType_SIMPLE_TAPROOT,
-	}
+// basicFundingTestCases defines the test cases for the basic funding test.
+var basicFundingTestCases = []*lntest.TestCase{
+	{
+		Name:     "basic flow static key remote",
+		TestFunc: testBasicChannelFundingStaticRemote,
+	},
+	{
+		Name:     "basic flow anchor",
+		TestFunc: testBasicChannelFundingAnchor,
+	},
+	{
+		Name:     "basic flow simple taproot",
+		TestFunc: testBasicChannelFundingSimpleTaproot,
+	},
+	{
+		Name:     "basic flow simple taproot final",
+		TestFunc: testBasicChannelFundingSimpleTaprootFinal,
+	},
+}
 
-	// testFunding is a function closure that takes Carol and Dave's
-	// commitment types and test the funding flow.
-	testFunding := func(ht *lntest.HarnessTest, carolCommitType,
-		daveCommitType lnrpc.CommitmentType) {
+// allFundingTypes defines the channel types to test for the basic funding
+// test.
+var allFundingTypes = []lnrpc.CommitmentType{
+	lnrpc.CommitmentType_STATIC_REMOTE_KEY,
+	lnrpc.CommitmentType_ANCHORS,
+	lnrpc.CommitmentType_SIMPLE_TAPROOT,
+	lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL,
+}
 
-		// Based on the current tweak variable for Carol, we'll
-		// preferentially signal the legacy commitment format.  We do
-		// the same for Dave shortly below.
-		carolArgs := lntest.NodeArgsForCommitType(carolCommitType)
-		carol := ht.NewNode("Carol", carolArgs)
+// testBasicChannelFundingStaticRemote performs a test exercising expected
+// behavior from a basic funding workflow. The test creates a new channel
+// between Carol and Dave, with Carol using the static remote key commitment
+// type, and Dave using allFundingTypes.
+func testBasicChannelFundingStaticRemote(ht *lntest.HarnessTest) {
+	carolCommitType := lnrpc.CommitmentType_STATIC_REMOTE_KEY
 
-		// Each time, we'll send Carol a new set of coins in order to
-		// fund the channel.
-		ht.FundCoins(btcutil.SatoshiPerBitcoin, carol)
-
-		daveArgs := lntest.NodeArgsForCommitType(daveCommitType)
-		dave := ht.NewNode("Dave", daveArgs)
-
-		// Before we start the test, we'll ensure both sides are
-		// connected to the funding flow can properly be executed.
-		ht.EnsureConnected(carol, dave)
-
-		var privateChan bool
-
-		// If this is to be a taproot channel type, then it needs to be
-		// private, otherwise it'll be rejected by Dave.
-		//
-		// TODO(roasbeef): lift after gossip 1.75
-		if carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
-			privateChan = true
-		}
-
-		// If carol wants taproot, but dave wants something
-		// else, then we'll assert that the channel negotiation
-		// attempt fails.
-		if carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT &&
-			daveCommitType != lnrpc.CommitmentType_SIMPLE_TAPROOT {
-
-			expectedErr := fmt.Errorf("requested channel type " +
-				"not supported")
-			amt := funding.MaxBtcFundingAmount
-			ht.OpenChannelAssertErr(
-				carol, dave, lntest.OpenChannelParams{
-					Private:        privateChan,
-					Amt:            amt,
-					CommitmentType: carolCommitType,
-				}, expectedErr,
-			)
-
-			return
-		}
-
-		carolChan, daveChan, closeChan := basicChannelFundingTest(
-			ht, carol, dave, nil, privateChan, &carolCommitType,
-		)
-
-		// Both nodes should report the same commitment
-		// type.
-		chansCommitType := carolChan.CommitmentType
-		require.Equal(ht, chansCommitType, daveChan.CommitmentType,
-			"commit types don't match")
-
-		// Now check that the commitment type reported by both nodes is
-		// what we expect. It will be the minimum of the two nodes'
-		// preference, in the order Legacy, Tweakless, Anchors.
-		expType := carolCommitType
-
-		switch daveCommitType {
-		// Dave supports taproot, type will be what Carol supports.
-		case lnrpc.CommitmentType_SIMPLE_TAPROOT:
-
-		// Dave supports anchors, type will be what Carol supports.
-		case lnrpc.CommitmentType_ANCHORS:
-			// However if Alice wants taproot chans, then we
-			// downgrade to anchors as this is still using implicit
-			// negotiation.
-			if expType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
-				expType = lnrpc.CommitmentType_ANCHORS
-			}
-
-		// Dave only supports tweakless, channel will be downgraded to
-		// this type if Carol supports anchors.
-		case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
-			switch expType {
-			case lnrpc.CommitmentType_ANCHORS:
-				expType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
-			case lnrpc.CommitmentType_SIMPLE_TAPROOT:
-				expType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
-			}
-
-		// Dave only supports legacy type, channel will be downgraded
-		// to this type.
-		case lnrpc.CommitmentType_LEGACY:
-			expType = lnrpc.CommitmentType_LEGACY
-
-		default:
-			ht.Fatalf("invalid commit type %v", daveCommitType)
-		}
-
-		// Check that the signalled type matches what we expect.
-		switch {
-		case expType == lnrpc.CommitmentType_ANCHORS &&
-			chansCommitType == lnrpc.CommitmentType_ANCHORS:
-
-		case expType == lnrpc.CommitmentType_STATIC_REMOTE_KEY &&
-			chansCommitType == lnrpc.CommitmentType_STATIC_REMOTE_KEY: //nolint:lll
-
-		case expType == lnrpc.CommitmentType_LEGACY &&
-			chansCommitType == lnrpc.CommitmentType_LEGACY:
-
-		case expType == lnrpc.CommitmentType_SIMPLE_TAPROOT &&
-			chansCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT:
-
-		default:
-			ht.Fatalf("expected nodes to signal "+
-				"commit type %v, instead got "+
-				"%v", expType, chansCommitType)
-		}
-
-		// As we've concluded this sub-test case we'll now close out
-		// the channel for both sides.
-		closeChan()
-	}
-
-test:
 	// We'll test all possible combinations of the feature bit presence
 	// that both nodes can signal for this new channel type. We'll make a
 	// new Carol+Dave for each test instance as well.
-	for _, carolCommitType := range allTypes {
-		for _, daveCommitType := range allTypes {
-			cc := carolCommitType
-			dc := daveCommitType
+	for _, daveCommitType := range allFundingTypes {
+		cc := carolCommitType
+		dc := daveCommitType
 
-			testName := fmt.Sprintf(
-				"carol_commit=%v,dave_commit=%v", cc, dc,
-			)
+		testName := fmt.Sprintf(
+			"carol_commit=%v,dave_commit=%v", cc, dc,
+		)
 
-			success := ht.Run(testName, func(t *testing.T) {
-				st := ht.Subtest(t)
-				testFunding(st, cc, dc)
-			})
+		success := ht.Run(testName, func(t *testing.T) {
+			st := ht.Subtest(t)
+			runBasicFundingTest(st, cc, dc)
+		})
 
-			if !success {
-				break test
-			}
+		if !success {
+			break
 		}
+	}
+}
+
+// testBasicChannelFundingAnchor performs a test exercising expected behavior
+// from a basic funding workflow. The test creates a new channel between Carol
+// and Dave, with Carol using the anchor commitment type, and Dave using
+// allFundingTypes.
+func testBasicChannelFundingAnchor(ht *lntest.HarnessTest) {
+	carolCommitType := lnrpc.CommitmentType_ANCHORS
+
+	// We'll test all possible combinations of the feature bit presence
+	// that both nodes can signal for this new channel type. We'll make a
+	// new Carol+Dave for each test instance as well.
+	for _, daveCommitType := range allFundingTypes {
+		cc := carolCommitType
+		dc := daveCommitType
+
+		testName := fmt.Sprintf(
+			"carol_commit=%v,dave_commit=%v", cc, dc,
+		)
+
+		success := ht.Run(testName, func(t *testing.T) {
+			st := ht.Subtest(t)
+			runBasicFundingTest(st, cc, dc)
+		})
+
+		if !success {
+			break
+		}
+	}
+}
+
+// testBasicChannelFundingSimpleTaproot performs a test exercising expected
+// behavior from a basic funding workflow. The test creates a new channel
+// between Carol and Dave, with Carol using the simple taproot commitment type,
+// and Dave using allFundingTypes.
+func testBasicChannelFundingSimpleTaproot(ht *lntest.HarnessTest) {
+	carolCommitType := lnrpc.CommitmentType_SIMPLE_TAPROOT
+
+	// We'll test all possible combinations of the feature bit presence
+	// that both nodes can signal for this new channel type. We'll make a
+	// new Carol+Dave for each test instance as well.
+	for _, daveCommitType := range allFundingTypes {
+		cc := carolCommitType
+		dc := daveCommitType
+
+		testName := fmt.Sprintf(
+			"carol_commit=%v,dave_commit=%v", cc, dc,
+		)
+
+		success := ht.Run(testName, func(t *testing.T) {
+			st := ht.Subtest(t)
+			runBasicFundingTest(st, cc, dc)
+		})
+
+		if !success {
+			break
+		}
+	}
+}
+
+// testBasicChannelFundingSimpleTaprootFinal performs a test exercising expected
+// behavior from a basic funding workflow. The test creates a new channel
+// between Carol and Dave, with Carol using the production simple taproot
+// commitment type, and Dave using allFundingTypes.
+func testBasicChannelFundingSimpleTaprootFinal(ht *lntest.HarnessTest) {
+	carolCommitType := lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+
+	// We'll test all possible combinations of the feature bit presence
+	// that both nodes can signal for this new channel type. We'll make a
+	// new Carol+Dave for each test instance as well.
+	for _, daveCommitType := range allFundingTypes {
+		cc := carolCommitType
+		dc := daveCommitType
+
+		testName := fmt.Sprintf(
+			"carol_commit=%v,dave_commit=%v", cc, dc,
+		)
+
+		success := ht.Run(testName, func(t *testing.T) {
+			st := ht.Subtest(t)
+			runBasicFundingTest(st, cc, dc)
+		})
+
+		if !success {
+			break
+		}
+	}
+}
+
+// runBasicFundingTest is a helper function that takes Carol and Dave's
+// commitment types and test the funding flow.
+func runBasicFundingTest(ht *lntest.HarnessTest, carolCommitType,
+	daveCommitType lnrpc.CommitmentType) {
+
+	// Based on the current tweak variable for Carol, we'll preferentially
+	// signal the legacy commitment format.  We do the same for Dave
+	// shortly below.
+	carolArgs := lntest.NodeArgsForCommitType(carolCommitType)
+	carol := ht.NewNode("Carol", carolArgs)
+
+	// Each time, we'll send Carol a new set of coins in order to fund the
+	// channel.
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, carol)
+
+	daveArgs := lntest.NodeArgsForCommitType(daveCommitType)
+	dave := ht.NewNode("Dave", daveArgs)
+
+	// Before we start the test, we'll ensure both sides are connected to
+	// the funding flow can properly be executed.
+	ht.EnsureConnected(carol, dave)
+
+	var privateChan bool
+
+	// If this is to be a taproot channel type, then it needs to be
+	// private, otherwise it'll be rejected by Dave.
+	//
+	// TODO(roasbeef): lift after gossip 1.75
+	if carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT ||
+		carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL {
+
+		privateChan = true
+	}
+
+	// If carol wants taproot (staging or final), but dave wants something
+	// that doesn't enable taproot support, then we'll assert that the
+	// channel negotiation attempt fails. Cross-type negotiation between
+	// SIMPLE_TAPROOT and SIMPLE_TAPROOT_FINAL succeeds because both
+	// staging and final feature bits are advertised when taproot is
+	// enabled.
+	carolWantsTaproot := carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT || //nolint:ll
+		carolCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+	daveHasTaproot := daveCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT || //nolint:ll
+		daveCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL
+
+	if carolWantsTaproot && !daveHasTaproot {
+		expectedErr := fmt.Errorf("requested channel type " +
+			"not supported")
+		amt := funding.MaxBtcFundingAmount
+		ht.OpenChannelAssertErr(
+			carol, dave, lntest.OpenChannelParams{
+				Private:        privateChan,
+				Amt:            amt,
+				CommitmentType: carolCommitType,
+			}, expectedErr,
+		)
+
+		return
+	}
+
+	// NOTE: With both staging and final feature bits advertised by default,
+	// cross-type negotiation (e.g., Carol wants FINAL, Dave prefers
+	// STAGING) will succeed because explicit channel_type takes precedence.
+	// The channel will be created with Carol's requested type (FINAL) since
+	// Dave advertises support for it.
+
+	carolChan, daveChan := basicChannelFundingTest(
+		ht, carol, dave, nil, privateChan, &carolCommitType,
+	)
+
+	// Both nodes should report the same commitment type.
+	chansCommitType := carolChan.CommitmentType
+	require.Equal(ht, chansCommitType, daveChan.CommitmentType,
+		"commit types don't match")
+
+	// Now check that the commitment type reported by both nodes is what we
+	// expect. It will be the minimum of the two nodes' preference, in the
+	// order Legacy, Tweakless, Anchors.
+	expType := carolCommitType
+
+	switch daveCommitType {
+	// Dave supports production taproot, type will be what Carol supports.
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
+
+	// Dave supports taproot, type will be what Carol supports.
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+
+	// Dave supports anchors, type will be what Carol supports.
+	case lnrpc.CommitmentType_ANCHORS:
+		// However if Alice wants taproot chans, then we downgrade to
+		// anchors as this is still using implicit negotiation.
+		if expType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
+			expType = lnrpc.CommitmentType_ANCHORS
+		}
+		if expType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL {
+			expType = lnrpc.CommitmentType_ANCHORS
+		}
+
+	// Dave only supports tweakless, channel will be downgraded to this
+	// type if Carol supports anchors.
+	case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
+		switch expType {
+		case lnrpc.CommitmentType_ANCHORS:
+			expType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
+		case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+			expType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
+		case lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
+			expType = lnrpc.CommitmentType_STATIC_REMOTE_KEY
+		}
+
+	// Dave only supports legacy type, channel will be downgraded to this
+	// type.
+	case lnrpc.CommitmentType_LEGACY:
+		expType = lnrpc.CommitmentType_LEGACY
+
+	default:
+		ht.Fatalf("invalid commit type %v", daveCommitType)
+	}
+
+	// Check that the signalled type matches what we expect.
+	switch {
+	case expType == lnrpc.CommitmentType_ANCHORS &&
+		chansCommitType == lnrpc.CommitmentType_ANCHORS:
+
+	case expType == lnrpc.CommitmentType_STATIC_REMOTE_KEY &&
+		chansCommitType == lnrpc.CommitmentType_STATIC_REMOTE_KEY:
+
+	case expType == lnrpc.CommitmentType_LEGACY &&
+		chansCommitType == lnrpc.CommitmentType_LEGACY:
+
+	case expType == lnrpc.CommitmentType_SIMPLE_TAPROOT &&
+		chansCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT:
+
+	case expType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL &&
+		chansCommitType == lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
+
+	default:
+		ht.Fatalf("expected nodes to signal commit type %v, instead "+
+			"got %v", expType, chansCommitType)
 	}
 }
 
@@ -195,7 +313,7 @@ test:
 func basicChannelFundingTest(ht *lntest.HarnessTest,
 	alice, bob *node.HarnessNode, fundingShim *lnrpc.FundingShim,
 	privateChan bool, commitType *lnrpc.CommitmentType) (*lnrpc.Channel,
-	*lnrpc.Channel, func()) {
+	*lnrpc.Channel) {
 
 	chanAmt := funding.MaxBtcFundingAmount
 	pushAmt := btcutil.Amount(100000)
@@ -231,10 +349,13 @@ func basicChannelFundingTest(ht *lntest.HarnessTest,
 	// explicit commitment type. This allows us to continue supporting the
 	// existing min version comparison for implicit negotiation.
 	var commitTypeParam lnrpc.CommitmentType
-	if commitType != nil &&
-		*commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
+	if commitType != nil {
+		switch *commitType {
+		case lnrpc.CommitmentType_SIMPLE_TAPROOT,
+			lnrpc.CommitmentType_SIMPLE_TAPROOT_FINAL:
 
-		commitTypeParam = *commitType
+			commitTypeParam = *commitType
+		}
 	}
 
 	// First establish a channel with a capacity of 0.5 BTC between Alice
@@ -267,14 +388,7 @@ func basicChannelFundingTest(ht *lntest.HarnessTest,
 	aliceChannel := ht.GetChannelByChanPoint(alice, chanPoint)
 	bobChannel := ht.GetChannelByChanPoint(bob, chanPoint)
 
-	closeChan := func() {
-		// Finally, immediately close the channel. This function will
-		// also block until the channel is closed and will additionally
-		// assert the relevant channel closing post conditions.
-		ht.CloseChannel(alice, chanPoint)
-	}
-
-	return aliceChannel, bobChannel, closeChan
+	return aliceChannel, bobChannel
 }
 
 // testUnconfirmedChannelFunding tests that our unconfirmed change outputs can
@@ -287,8 +401,7 @@ func testUnconfirmedChannelFunding(ht *lntest.HarnessTest) {
 
 	// We'll start off by creating a node for Carol.
 	carol := ht.NewNode("Carol", nil)
-
-	alice := ht.Alice
+	alice := ht.NewNode("Alice", nil)
 
 	// We'll send her some unconfirmed funds.
 	ht.FundCoinsUnconfirmed(2*chanAmt, carol)
@@ -383,38 +496,27 @@ func testUnconfirmedChannelFunding(ht *lntest.HarnessTest) {
 	// spend and the funding tx.
 	ht.MineBlocksAndAssertNumTxes(6, 2)
 
-	chanPoint := ht.WaitForChannelOpenEvent(chanOpenUpdate)
+	ht.WaitForChannelOpenEvent(chanOpenUpdate)
 
 	// With the channel open, we'll check the balances on each side of the
 	// channel as a sanity check to ensure things worked out as intended.
 	checkChannelBalance(carol, carolLocalBalance, pushAmt, 0, 0)
 	checkChannelBalance(alice, pushAmt, carolLocalBalance, 0, 0)
-
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	//
-	// We may get the error `unable to gracefully close channel while peer
-	// is offline (try force closing it instead): channel link not found`.
-	// This happens because the channel link hasn't been added yet but we
-	// now proceed to closing the channel. We may need to revisit how the
-	// channel open event is created and make sure the event is only sent
-	// after all relevant states have been updated.
-	time.Sleep(2 * time.Second)
-
-	// Now that we're done with the test, the channel can be closed.
-	ht.CloseChannel(carol, chanPoint)
 }
 
 // testChannelFundingInputTypes tests that any type of supported input type can
 // be used to fund channels.
 func testChannelFundingInputTypes(ht *lntest.HarnessTest) {
+	alice := ht.NewNode("Alice", nil)
+
 	// We'll start off by creating a node for Carol.
 	carol := ht.NewNode("Carol", nil)
 
 	// Now, we'll connect her to Alice so that they can open a
 	// channel together.
-	ht.ConnectNodes(carol, ht.Alice)
+	ht.ConnectNodes(carol, alice)
 
-	runChannelFundingInputTypes(ht, ht.Alice, carol)
+	runChannelFundingInputTypes(ht, alice, carol)
 }
 
 // runChannelFundingInputTypes tests that any type of supported input type can
@@ -427,20 +529,29 @@ func runChannelFundingInputTypes(ht *lntest.HarnessTest, alice,
 		burnAddr = "bcrt1qxsnqpdc842lu8c0xlllgvejt6rhy49u6fmpgyz"
 	)
 
-	fundMixed := func(amt btcutil.Amount, target *node.HarnessNode) {
+	fundMixed := func(amt btcutil.Amount,
+		target *node.HarnessNode) *wire.MsgTx {
+
 		ht.FundCoins(amt/5, target)
 		ht.FundCoins(amt/5, target)
 		ht.FundCoinsP2TR(amt/5, target)
 		ht.FundCoinsP2TR(amt/5, target)
 		ht.FundCoinsP2TR(amt/5, target)
+
+		return nil
 	}
-	fundMultipleP2TR := func(amt btcutil.Amount, target *node.HarnessNode) {
+	fundMultipleP2TR := func(amt btcutil.Amount,
+		target *node.HarnessNode) *wire.MsgTx {
+
 		ht.FundCoinsP2TR(amt/4, target)
 		ht.FundCoinsP2TR(amt/4, target)
 		ht.FundCoinsP2TR(amt/4, target)
 		ht.FundCoinsP2TR(amt/4, target)
+
+		return nil
 	}
-	fundWithTypes := []func(amt btcutil.Amount, target *node.HarnessNode){
+	fundWithTypes := []func(amt btcutil.Amount,
+		target *node.HarnessNode) *wire.MsgTx{
 		ht.FundCoins, ht.FundCoinsNP2WKH, ht.FundCoinsP2TR, fundMixed,
 		fundMultipleP2TR,
 	}
@@ -519,17 +630,6 @@ func runChannelFundingInputTypes(ht *lntest.HarnessTest, alice,
 		checkChannelBalance(carol, carolLocalBalance, 0, 0, 0)
 		checkChannelBalance(alice, 0, carolLocalBalance, 0, 0)
 
-		// TODO(yy): remove the sleep once the following bug is fixed.
-		//
-		// We may get the error `unable to gracefully close channel
-		// while peer is offline (try force closing it instead):
-		// channel link not found`. This happens because the channel
-		// link hasn't been added yet but we now proceed to closing the
-		// channel. We may need to revisit how the channel open event
-		// is created and make sure the event is only sent after all
-		// relevant states have been updated.
-		time.Sleep(2 * time.Second)
-
 		// Now that we're done with the test, the channel can be closed.
 		ht.CloseChannel(carol, chanPoint)
 
@@ -583,8 +683,8 @@ func runExternalFundingScriptEnforced(ht *lntest.HarnessTest) {
 	// a transaction that will never be published.
 	const thawHeight uint32 = 10
 	const chanSize = funding.MaxBtcFundingAmount
-	fundingShim1, chanPoint1 := deriveFundingShim(
-		ht, carol, dave, chanSize, thawHeight, false, commitmentType,
+	fundingShim1, chanPoint1 := ht.DeriveFundingShim(
+		carol, dave, chanSize, thawHeight, false, commitmentType,
 	)
 	ht.OpenChannelAssertPending(
 		carol, dave, lntest.OpenChannelParams{
@@ -599,14 +699,14 @@ func runExternalFundingScriptEnforced(ht *lntest.HarnessTest) {
 	// externally funded, we should still be able to open another one. Let's
 	// do exactly that now. For this one we publish the transaction so we
 	// can mine it later.
-	fundingShim2, chanPoint2 := deriveFundingShim(
-		ht, carol, dave, chanSize, thawHeight, true, commitmentType,
+	fundingShim2, chanPoint2 := ht.DeriveFundingShim(
+		carol, dave, chanSize, thawHeight, true, commitmentType,
 	)
 
 	// At this point, we'll now carry out the normal basic channel funding
 	// test as everything should now proceed as normal (a regular channel
 	// funding flow).
-	carolChan, daveChan, _ := basicChannelFundingTest(
+	carolChan, daveChan := basicChannelFundingTest(
 		ht, carol, dave, fundingShim2, false, nil,
 	)
 
@@ -634,21 +734,16 @@ func runExternalFundingScriptEnforced(ht *lntest.HarnessTest) {
 	// First, we'll try to close the channel as Carol, the initiator. This
 	// should fail as a frozen channel only allows the responder to
 	// initiate a channel close.
-	err := ht.CloseChannelAssertErr(carol, chanPoint2, false)
+	req := &lnrpc.CloseChannelRequest{
+		ChannelPoint: chanPoint2,
+	}
+	err := ht.CloseChannelAssertErr(carol, req)
 	require.Contains(ht, err.Error(), "cannot co-op close frozen channel")
 
 	// Before Dave closes the channel, he needs to check the invoice is
 	// settled to avoid an error saying cannot close channel due to active
 	// HTLCs.
 	ht.AssertInvoiceSettled(dave, resp.PaymentAddr)
-
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	// When the invoice is reported settled, the commitment dance is not
-	// yet finished, which can cause an error when closing the channel,
-	// saying there's active HTLCs. We need to investigate this issue and
-	// reverse the order to, first finish the commitment dance, then report
-	// the invoice as settled.
-	time.Sleep(2 * time.Second)
 
 	// Next we'll try but this time with Dave (the responder) as the
 	// initiator. This time the channel should be closed as normal.
@@ -699,8 +794,8 @@ func runExternalFundingTaproot(ht *lntest.HarnessTest) {
 	// a transaction that will never be published.
 	const thawHeight uint32 = 10
 	const chanSize = funding.MaxBtcFundingAmount
-	fundingShim1, chanPoint1 := deriveFundingShim(
-		ht, carol, dave, chanSize, thawHeight, false, commitmentType,
+	fundingShim1, chanPoint1 := ht.DeriveFundingShim(
+		carol, dave, chanSize, thawHeight, false, commitmentType,
 	)
 	ht.OpenChannelAssertPending(carol, dave, lntest.OpenChannelParams{
 		Amt:            chanSize,
@@ -715,14 +810,14 @@ func runExternalFundingTaproot(ht *lntest.HarnessTest) {
 	// externally funded, we should still be able to open another one. Let's
 	// do exactly that now. For this one we publish the transaction so we
 	// can mine it later.
-	fundingShim2, chanPoint2 := deriveFundingShim(
-		ht, carol, dave, chanSize, thawHeight, true, commitmentType,
+	fundingShim2, chanPoint2 := ht.DeriveFundingShim(
+		carol, dave, chanSize, thawHeight, true, commitmentType,
 	)
 
 	// At this point, we'll now carry out the normal basic channel funding
 	// test as everything should now proceed as normal (a regular channel
 	// funding flow).
-	carolChan, daveChan, _ := basicChannelFundingTest(
+	carolChan, daveChan := basicChannelFundingTest(
 		ht, carol, dave, fundingShim2, true, &commitmentType,
 	)
 
@@ -791,7 +886,10 @@ func runExternalFundingTaproot(ht *lntest.HarnessTest) {
 	// First, we'll try to close the channel as Carol, the initiator. This
 	// should fail as a frozen channel only allows the responder to
 	// initiate a channel close.
-	err := ht.CloseChannelAssertErr(carol, chanPoint2, false)
+	req := &lnrpc.CloseChannelRequest{
+		ChannelPoint: chanPoint2,
+	}
+	err := ht.CloseChannelAssertErr(carol, req)
 	require.Contains(ht, err.Error(), "cannot co-op close frozen channel")
 
 	// Before Dave closes the channel, he needs to check the invoice is
@@ -799,17 +897,38 @@ func runExternalFundingTaproot(ht *lntest.HarnessTest) {
 	// HTLCs.
 	ht.AssertInvoiceSettled(dave, resp.PaymentAddr)
 
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	// When the invoice is reported settled, the commitment dance is not
-	// yet finished, which can cause an error when closing the channel,
-	// saying there's active HTLCs. We need to investigate this issue and
-	// reverse the order to, first finish the commitment dance, then report
-	// the invoice as settled.
-	time.Sleep(2 * time.Second)
+	// Mine past the thaw height so the channel can be cooperatively
+	// closed. With RBF cooperative close (auto-enabled for taproot
+	// channels), both sides enforce the thaw height check during
+	// shutdown negotiation.
+	ht.MineBlocks(int(thawHeight))
 
 	// Next we'll try but this time with Dave (the responder) as the
-	// initiator. This time the channel should be closed as normal.
-	ht.CloseChannel(dave, chanPoint2)
+	// initiator. With RBF close auto-enabled for taproot channels,
+	// both sides create competing closing txs. Only one makes it
+	// to the mempool (the other is rejected as a same-fee RBF).
+	// We skip the mempool check since the local tx may not be the
+	// one that made it in.
+	closeStream, _ := ht.CloseChannelAssertPending(
+		dave, chanPoint2, false,
+		lntest.WithSkipMempoolCheck(),
+	)
+
+	// Mine a block to confirm whichever closing tx is in the mempool.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Consume updates until we get the final ChanClose event. The
+	// RBF close protocol may send multiple ClosePending updates
+	// (one per side's closing tx proposal) before the final close.
+	for {
+		event, err := ht.ReceiveCloseChannelUpdate(closeStream)
+		require.NoError(ht, err)
+
+		//nolint:ll
+		if _, ok := event.Update.(*lnrpc.CloseStatusUpdate_ChanClose); ok {
+			break
+		}
+	}
 
 	// Let's make sure we can abandon it.
 	carol.RPC.AbandonChannel(&lnrpc.AbandonChannelRequest{
@@ -844,7 +963,7 @@ func testChannelFundingPersistence(ht *lntest.HarnessTest) {
 	}
 	carol := ht.NewNode("Carol", carolArgs)
 
-	alice := ht.Alice
+	alice := ht.NewNodeWithCoins("Alice", nil)
 	ht.ConnectNodes(alice, carol)
 
 	// Create a new channel that requires 5 confs before it's considered
@@ -927,19 +1046,14 @@ func testChannelFundingPersistence(ht *lntest.HarnessTest) {
 
 	// Make sure Alice and Carol have seen the channel in their network
 	// topology.
-	ht.AssertTopologyChannelOpen(alice, chanPoint)
-	ht.AssertTopologyChannelOpen(carol, chanPoint)
+	ht.AssertChannelInGraph(alice, chanPoint)
+	ht.AssertChannelInGraph(carol, chanPoint)
 
 	// Create an additional check for our channel assertion that will
 	// check that our label is as expected.
 	shortChanID := lnwire.NewShortChanIDFromInt(chanAlice.ChanId)
 	label = labels.MakeLabel(labels.LabelTypeChannelOpen, &shortChanID)
 	require.Equal(ht, label, tx.Label, "open channel label not updated")
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // testBatchChanFunding makes sure multiple channels can be opened in one batch
@@ -960,8 +1074,8 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 	}
 	eve := ht.NewNode("eve", scidAliasArgs)
 
-	alice, bob := ht.Alice, ht.Bob
-	ht.RestartNodeWithExtraArgs(alice, scidAliasArgs)
+	alice := ht.NewNodeWithCoins("Alice", scidAliasArgs)
+	bob := ht.NewNodeWithCoins("Bob", nil)
 
 	// Before we start the test, we'll ensure Alice is connected to Carol
 	// and Dave, so she can open channels to both of them (and Bob).
@@ -1055,7 +1169,7 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 
 	// Ensure that Alice can send funds to Eve via the zero-conf channel
 	// before the batch transaction was mined.
-	ht.AssertTopologyChannelOpen(alice, chanPoint4)
+	ht.AssertChannelInGraph(alice, chanPoint4)
 	eveInvoiceParams := &lnrpc.Invoice{
 		Value:   int64(10_000),
 		Private: true,
@@ -1068,9 +1182,9 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 	// Mine the batch transaction and check the network topology.
 	block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
 	ht.AssertTxInBlock(block, *txHash)
-	ht.AssertTopologyChannelOpen(alice, chanPoint1)
-	ht.AssertTopologyChannelOpen(alice, chanPoint2)
-	ht.AssertTopologyChannelOpen(alice, chanPoint3)
+	ht.AssertChannelInGraph(alice, chanPoint1)
+	ht.AssertChannelInGraph(alice, chanPoint2)
+	ht.AssertChannelInGraph(alice, chanPoint3)
 
 	// Check if the change type from the batch_open_channel funding is P2TR.
 	rawTx := ht.GetRawTransaction(*txHash)
@@ -1132,15 +1246,6 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 		chainreg.DefaultBitcoinBaseFeeMSat,
 		chainreg.DefaultBitcoinFeeRate,
 	)
-
-	// To conclude, we'll close the newly created channel between Carol and
-	// Dave. This function will also block until the channel is closed and
-	// will additionally assert the relevant channel closing post
-	// conditions.
-	ht.CloseChannel(alice, chanPoint1)
-	ht.CloseChannel(alice, chanPoint2)
-	ht.CloseChannel(alice, chanPoint3)
-	ht.CloseChannel(alice, chanPoint4)
 }
 
 // ensurePolicy ensures that the peer sees alice's channel fee settings.
@@ -1150,7 +1255,7 @@ func ensurePolicy(ht *lntest.HarnessTest, alice, peer *node.HarnessNode,
 
 	channel := ht.AssertChannelExists(peer, chanPoint)
 	policy, err := peer.RPC.LN.GetChanInfo(
-		context.Background(), &lnrpc.ChanInfoRequest{
+		ht.Context(), &lnrpc.ChanInfoRequest{
 			ChanId: channel.ChanId,
 		},
 	)
@@ -1161,122 +1266,6 @@ func ensurePolicy(ht *lntest.HarnessTest, alice, peer *node.HarnessNode,
 	}
 	require.EqualValues(ht, expectedBaseFee, alicePolicy.FeeBaseMsat)
 	require.EqualValues(ht, expectedFeeRate, alicePolicy.FeeRateMilliMsat)
-}
-
-// deriveFundingShim creates a channel funding shim by deriving the necessary
-// keys on both sides.
-func deriveFundingShim(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
-	chanSize btcutil.Amount, thawHeight uint32, publish bool,
-	commitType lnrpc.CommitmentType) (*lnrpc.FundingShim,
-	*lnrpc.ChannelPoint) {
-
-	keyLoc := &signrpc.KeyLocator{KeyFamily: 9999}
-	carolFundingKey := carol.RPC.DeriveKey(keyLoc)
-	daveFundingKey := dave.RPC.DeriveKey(keyLoc)
-
-	// Now that we have the multi-sig keys for each party, we can manually
-	// construct the funding transaction. We'll instruct the backend to
-	// immediately create and broadcast a transaction paying out an exact
-	// amount. Normally this would reside in the mempool, but we just
-	// confirm it now for simplicity.
-	var (
-		fundingOutput *wire.TxOut
-		musig2        bool
-		err           error
-	)
-	if commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
-		var carolKey, daveKey *btcec.PublicKey
-		carolKey, err = btcec.ParsePubKey(carolFundingKey.RawKeyBytes)
-		require.NoError(ht, err)
-		daveKey, err = btcec.ParsePubKey(daveFundingKey.RawKeyBytes)
-		require.NoError(ht, err)
-
-		_, fundingOutput, err = input.GenTaprootFundingScript(
-			carolKey, daveKey, int64(chanSize),
-			fn.None[chainhash.Hash](),
-		)
-		require.NoError(ht, err)
-
-		musig2 = true
-	} else {
-		_, fundingOutput, err = input.GenFundingPkScript(
-			carolFundingKey.RawKeyBytes, daveFundingKey.RawKeyBytes,
-			int64(chanSize),
-		)
-		require.NoError(ht, err)
-	}
-
-	var txid *chainhash.Hash
-	targetOutputs := []*wire.TxOut{fundingOutput}
-	if publish {
-		txid = ht.SendOutputsWithoutChange(targetOutputs, 5)
-	} else {
-		tx := ht.CreateTransaction(targetOutputs, 5)
-
-		txHash := tx.TxHash()
-		txid = &txHash
-	}
-
-	// At this point, we can being our external channel funding workflow.
-	// We'll start by generating a pending channel ID externally that will
-	// be used to track this new funding type.
-	pendingChanID := ht.Random32Bytes()
-
-	// Now that we have the pending channel ID, Dave (our responder) will
-	// register the intent to receive a new channel funding workflow using
-	// the pending channel ID.
-	chanPoint := &lnrpc.ChannelPoint{
-		FundingTxid: &lnrpc.ChannelPoint_FundingTxidBytes{
-			FundingTxidBytes: txid[:],
-		},
-	}
-	chanPointShim := &lnrpc.ChanPointShim{
-		Amt:       int64(chanSize),
-		ChanPoint: chanPoint,
-		LocalKey: &lnrpc.KeyDescriptor{
-			RawKeyBytes: daveFundingKey.RawKeyBytes,
-			KeyLoc: &lnrpc.KeyLocator{
-				KeyFamily: daveFundingKey.KeyLoc.KeyFamily,
-				KeyIndex:  daveFundingKey.KeyLoc.KeyIndex,
-			},
-		},
-		RemoteKey:     carolFundingKey.RawKeyBytes,
-		PendingChanId: pendingChanID,
-		ThawHeight:    thawHeight,
-		Musig2:        musig2,
-	}
-	fundingShim := &lnrpc.FundingShim{
-		Shim: &lnrpc.FundingShim_ChanPointShim{
-			ChanPointShim: chanPointShim,
-		},
-	}
-	dave.RPC.FundingStateStep(&lnrpc.FundingTransitionMsg{
-		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
-			ShimRegister: fundingShim,
-		},
-	})
-
-	// If we attempt to register the same shim (has the same pending chan
-	// ID), then we should get an error.
-	dave.RPC.FundingStateStepAssertErr(&lnrpc.FundingTransitionMsg{
-		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
-			ShimRegister: fundingShim,
-		},
-	})
-
-	// We'll take the chan point shim we just registered for Dave (the
-	// responder), and swap the local/remote keys before we feed it in as
-	// Carol's funding shim as the initiator.
-	fundingShim.GetChanPointShim().LocalKey = &lnrpc.KeyDescriptor{
-		RawKeyBytes: carolFundingKey.RawKeyBytes,
-		KeyLoc: &lnrpc.KeyLocator{
-			KeyFamily: carolFundingKey.KeyLoc.KeyFamily,
-			KeyIndex:  carolFundingKey.KeyLoc.KeyIndex,
-		},
-	}
-	fundingShim.GetChanPointShim().RemoteKey = daveFundingKey.RawKeyBytes
-
-	return fundingShim, chanPoint
 }
 
 // testChannelFundingWithUnstableUtxos tests channel openings with restricted
@@ -1297,6 +1286,7 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 	// First, we'll create two new nodes that we'll use to open channel
 	// between for this test.
 	carol := ht.NewNode("carol", nil)
+
 	// We'll attempt at max 2 pending channels, so Dave will need to accept
 	// two pending ones.
 	dave := ht.NewNode("dave", []string{
@@ -1329,13 +1319,12 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 	// Open a channel to dave with an unconfirmed utxo. Although this utxo
 	// is unconfirmed it can be used to open a channel because it did not
 	// originated from the sweeper subsystem.
-	update := ht.OpenChannelAssertPending(carol, dave,
+	ht.OpenChannelAssertPending(carol, dave,
 		lntest.OpenChannelParams{
 			Amt:              chanSize,
 			SpendUnconfirmed: true,
 			CommitmentType:   cType,
 		})
-	chanPoint1 := lntest.ChanPointFromPendingUpdate(update)
 
 	// Verify that both nodes know about the channel.
 	ht.AssertNumPendingOpenChannels(carol, 1)
@@ -1347,7 +1336,7 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 	// so unconfirmed utxos originated from prior channel opening are safe
 	// to use because channel opening should not be RBFed, at least not for
 	// now.
-	update = ht.OpenChannelAssertPending(carol, dave,
+	update := ht.OpenChannelAssertPending(carol, dave,
 		lntest.OpenChannelParams{
 			Amt:              chanSize,
 			SpendUnconfirmed: true,
@@ -1375,11 +1364,17 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 	// Make sure Carol sees her to_remote output from the force close tx.
 	ht.AssertNumPendingSweeps(carol, 1)
 
-	// Mine one block to trigger the sweep transaction.
+	// Wait for Carol's sweep transaction to appear in the mempool. Due to
+	// async confirmation notifications, there's a race between when the
+	// sweep is registered and when the sweeper processes the next block.
+	// The sweeper uses immediate=false, so it broadcasts on the next block
+	// after registration. Mine an empty block to trigger the broadcast.
 	ht.MineEmptyBlocks(1)
 
-	// We need to wait for carol initiating the sweep of the to_remote
-	// output of chanPoint2.
+	// Now the sweep should be in the mempool.
+	ht.AssertNumTxsInMempool(1)
+
+	// Now we should see the unconfirmed UTXO from the sweep.
 	utxo := ht.AssertNumUTXOsUnconfirmed(carol, 1)[0]
 
 	// We now try to open channel using the unconfirmed utxo.
@@ -1435,8 +1430,10 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 	// Make sure Carol sees her to_remote output from the force close tx.
 	ht.AssertNumPendingSweeps(carol, 1)
 
-	// Mine one block to trigger the sweep transaction.
+	// Mine an empty block to trigger the sweep broadcast (same fix as
+	// above).
 	ht.MineEmptyBlocks(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Wait for the to_remote sweep tx to show up in carol's wallet.
 	ht.AssertNumUTXOsUnconfirmed(carol, 1)
@@ -1472,20 +1469,16 @@ func testChannelFundingWithUnstableUtxos(ht *lntest.HarnessTest) {
 
 	// Now after the sweep utxo is confirmed it is stable and can be used
 	// for channel openings again.
-	update = ht.OpenChannelAssertPending(carol, dave,
+	ht.OpenChannelAssertPending(carol, dave,
 		lntest.OpenChannelParams{
 			Amt:              chanSize,
 			SpendUnconfirmed: true,
 			CommitmentType:   cType,
 		})
-	chanPoint4 := lntest.ChanPointFromPendingUpdate(update)
 
 	// Verify that both nodes know about the channel.
 	ht.AssertNumPendingOpenChannels(carol, 1)
 	ht.AssertNumPendingOpenChannels(dave, 1)
 
 	ht.MineBlocksAndAssertNumTxes(1, 1)
-
-	ht.CloseChannel(carol, chanPoint1)
-	ht.CloseChannel(carol, chanPoint4)
 }

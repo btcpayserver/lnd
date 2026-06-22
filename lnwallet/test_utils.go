@@ -16,7 +16,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -243,21 +243,8 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 		return nil, nil, err
 	}
 
-	dbAlice, err := channeldb.Open(t.TempDir(), dbModifiers...)
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbAlice.Close())
-	})
-
-	dbBob, err := channeldb.Open(t.TempDir(), dbModifiers...)
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbBob.Close())
-	})
+	dbAlice := channeldb.OpenForTesting(t, t.TempDir(), dbModifiers...)
+	dbBob := channeldb.OpenForTesting(t, t.TempDir(), dbModifiers...)
 
 	estimator := chainfee.NewStaticEstimator(6000, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)

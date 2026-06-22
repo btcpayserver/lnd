@@ -1,16 +1,12 @@
-# If you change this value, please change it in the following files as well:
-# /Dockerfile
-# /dev.Dockerfile
-# /.github/workflows/main.yml
-# /.github/workflows/release.yml
-FROM golang:1.22.6-bookworm
+# If you change this please also update GO_VERSION in Makefile (then run
+# `make lint` to see where else it needs to be updated as well).
+FROM golang:1.26.3-bookworm
 
 MAINTAINER Olaoluwa Osuntokun <laolu@lightning.engineering>
 
 # Golang build related environment variables that are static and used for all
 # architectures/OSes.
 ENV GODEBUG netdns=cgo
-ENV GO111MODULE=auto
 ENV CGO_ENABLED=0
 
 # Set up cache directories. Those will be mounted from the host system to speed

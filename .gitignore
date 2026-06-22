@@ -40,9 +40,15 @@ itest/btcd-itest
 itest/.logs-*
 itest/cover
 
+# Local lntest miner logs (dev artifacts)
+lntest/miner/*.log
+
 cmd/cmd
 *.key
 *.hex
+
+# Ignore the custom linter binary if it is built.
+custom-gcl
 
 cmd/lncli/lncli
 
@@ -77,3 +83,9 @@ coverage.txt
 # Release build directory (to avoid build.vcs.modified Golang build tag to be
 # set to true by having untracked files in the working directory).
 /lnd-*/
+/.worktrees/
+
+.aider*
+
+# All test data generated from rapid.
+*/testdata

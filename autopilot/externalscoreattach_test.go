@@ -22,6 +22,7 @@ func randKey() (*btcec.PublicKey, error) {
 // ExternalScoreAttachment correctly reflects the scores we set last.
 func TestSetNodeScores(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
 	const name = "externalscore"
 
@@ -62,7 +63,7 @@ func TestSetNodeScores(t *testing.T) {
 		q[nID] = struct{}{}
 	}
 	resp, err := h.NodeScores(
-		nil, nil, btcutil.Amount(btcutil.SatoshiPerBitcoin), q,
+		ctx, nil, nil, btcutil.Amount(btcutil.SatoshiPerBitcoin), q,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -30,19 +30,16 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	chanAmt := funding.MaxBtcFundingAmount
 	pushAmt := chanAmt / 2
 
-	alice, bob := ht.Alice, ht.Bob
-
 	// Create a channel Alice->Bob.
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{
+	chanPoints, nodes := ht.CreateSimpleNetwork(
+		[][]string{nil, nil}, lntest.OpenChannelParams{
 			Amt:     chanAmt,
 			PushAmt: pushAmt,
 		},
 	)
 
-	// We add all the nodes' update channels to a slice, such that we can
-	// make sure they all receive the expected updates.
-	nodes := []*node.HarnessNode{alice, bob}
+	alice, bob := nodes[0], nodes[1]
+	chanPoint := chanPoints[0]
 
 	// Alice and Bob should see each other's ChannelUpdates, advertising the
 	// default routing policies. We do not currently set any inbound fees.
@@ -127,8 +124,8 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	}
 
 	// Make sure Alice and Carol have seen each other's channels.
-	ht.AssertTopologyChannelOpen(alice, chanPoint2)
-	ht.AssertTopologyChannelOpen(carol, chanPoint)
+	ht.AssertChannelInGraph(alice, chanPoint2)
+	ht.AssertChannelInGraph(carol, chanPoint)
 
 	// First we'll try to send a payment from Alice to Carol with an amount
 	// less than the min_htlc value required by Carol. This payment should
@@ -144,7 +141,6 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	// not be able to find a path during routing.
 	payReq := &routerrpc.SendPaymentRequest{
 		PaymentRequest: resp.PaymentRequest,
-		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 	}
 	ht.SendPaymentAssertFail(
@@ -174,29 +170,28 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	routes.Routes[0].Hops[1].AmtToForward = amtSat
 	routes.Routes[0].Hops[1].AmtToForwardMsat = amtMSat
 
-	// Send the payment with the modified value.
-	alicePayStream := alice.RPC.SendToRoute()
-
-	sendReq := &lnrpc.SendToRouteRequest{
+	// Send the payment with the modified value and expect a failure because
+	// the amount is below the minimum HTLC size.
+	sendReq := &routerrpc.SendToRouteRequest{
 		PaymentHash: resp.RHash,
 		Route:       routes.Routes[0],
 	}
-	err := alicePayStream.Send(sendReq)
-	require.NoError(ht, err, "unable to send payment")
+	sendResp := alice.RPC.SendToRouteV2(sendReq)
+	require.NotNil(ht, sendResp.Failure, "expected payment failure")
+	require.Equal(
+		ht, lnrpc.Failure_AMOUNT_BELOW_MINIMUM, sendResp.Failure.Code,
+	)
 
-	// We expect this payment to fail, and that the min_htlc value is
-	// communicated back to us, since the attempted HTLC value was too low.
-	sendResp, err := ht.ReceiveSendToRouteUpdate(alicePayStream)
-	require.NoError(ht, err, "unable to receive payment stream")
-
-	// Expected as part of the error message.
-	substrs := []string{
-		"AmountBelowMinimum",
-		"HtlcMinimumMsat: (lnwire.MilliSatoshi) 5000 mSAT",
-	}
-	for _, s := range substrs {
-		require.Contains(ht, sendResp.PaymentError, s)
-	}
+	// The failure should carry the advertised min HTLC value so that
+	// callers can react to the channel policy.
+	require.NotNil(
+		ht, sendResp.Failure.ChannelUpdate,
+		"expected channel update in failure",
+	)
+	require.Equal(
+		ht, uint64(customMinHtlc),
+		sendResp.Failure.ChannelUpdate.HtlcMinimumMsat,
+	)
 
 	// Make sure sending using the original value succeeds.
 	payAmt = btcutil.Amount(5)
@@ -217,17 +212,12 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 		TotalAmtMsat: amtMSat,
 	}
 
-	sendReq = &lnrpc.SendToRouteRequest{
+	sendReq = &routerrpc.SendToRouteRequest{
 		PaymentHash: resp.RHash,
 		Route:       route,
 	}
-
-	err = alicePayStream.Send(sendReq)
-	require.NoError(ht, err, "unable to send payment")
-
-	sendResp, err = ht.ReceiveSendToRouteUpdate(alicePayStream)
-	require.NoError(ht, err, "unable to receive payment stream")
-	require.Empty(ht, sendResp.PaymentError, "expected payment to succeed")
+	sendResp = alice.RPC.SendToRouteV2(sendReq)
+	require.Nil(ht, sendResp.Failure, "expected payment to succeed")
 
 	// With our little cluster set up, we'll update the outbound fees and
 	// the max htlc size for the Bob side of the Alice->Bob channel, and
@@ -254,7 +244,8 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 			ChanPoint: chanPoint,
 		},
 	}
-	bob.RPC.UpdateChannelPolicy(req)
+	updateResp := bob.RPC.UpdateChannelPolicy(req)
+	require.Empty(ht, updateResp.FailedUpdates, 0)
 
 	// Wait for all nodes to have seen the policy update done by Bob.
 	assertNodesPolicyUpdate(ht, nodes, bob, expectedPolicy, chanPoint)
@@ -292,13 +283,13 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	)
 
 	// Make sure Bob knows this channel.
-	ht.AssertTopologyChannelOpen(bob, chanPoint3)
+	ht.AssertChannelInGraph(bob, chanPoint3)
 
 	// Make a global update, and check that both channels' new policies get
 	// propagated.
 	baseFee = int64(800)
 	feeRate = int64(123)
-	timeLockDelta = uint32(22)
+	timeLockDelta = uint32(24)
 	maxHtlc *= 2
 	inboundBaseFee := int32(-400)
 	inboundFeeRatePpm := int32(-60)
@@ -344,10 +335,10 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	// but not the second, as she only allows two updates per day and a day
 	// has yet to elapse from the previous update.
 
-	// assertAliceAndBob is a helper closure which updates Alice's policy
-	// and asserts that both Alice and Bob have heard and updated the
+	// updateAndAssertAliceAndBob is a helper closure which updates Alice's
+	// policy and asserts that both Alice and Bob have heard and updated the
 	// policy in their graph.
-	assertAliceAndBob := func(req *lnrpc.PolicyUpdateRequest,
+	updateAndAssertAliceAndBob := func(req *lnrpc.PolicyUpdateRequest,
 		expectedPolicy *lnrpc.RoutingPolicy) {
 
 		alice.RPC.UpdateChannelPolicy(req)
@@ -387,7 +378,7 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	expectedPolicy.FeeBaseMsat = baseFee1
 	req.BaseFeeMsat = baseFee1
 	req.InboundFee = nil
-	assertAliceAndBob(req, expectedPolicy)
+	updateAndAssertAliceAndBob(req, expectedPolicy)
 
 	// Check that Carol has both heard the policy and updated it in her
 	// graph.
@@ -410,7 +401,7 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	baseFee2 := baseFee1 * 2
 	expectedPolicy.FeeBaseMsat = baseFee2
 	req.BaseFeeMsat = baseFee2
-	assertAliceAndBob(req, expectedPolicy)
+	updateAndAssertAliceAndBob(req, expectedPolicy)
 
 	// Since Carol didn't receive the last update, she still has Alice's
 	// old policy. We validate this by checking the base fee is the older
@@ -422,11 +413,6 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 	ht.AssertChannelPolicy(
 		carol, alice.PubKeyStr, expectedPolicy, chanPoint3,
 	)
-
-	// Close all channels.
-	ht.CloseChannel(alice, chanPoint)
-	ht.CloseChannel(bob, chanPoint2)
-	ht.CloseChannel(alice, chanPoint3)
 }
 
 // testSendUpdateDisableChannel ensures that a channel update with the disable
@@ -440,7 +426,8 @@ func testUpdateChannelPolicy(ht *lntest.HarnessTest) {
 func testSendUpdateDisableChannel(ht *lntest.HarnessTest) {
 	const chanAmt = 100000
 
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
 
 	// Create a new node Eve, which will be restarted later with a config
 	// that has an inactive channel timeout of just 6 seconds (down from
@@ -515,9 +502,9 @@ func testSendUpdateDisableChannel(ht *lntest.HarnessTest) {
 	ht.RestartNodeWithExtraArgs(eve, nodeCfg)
 
 	// Dave should know all the channels.
-	ht.AssertTopologyChannelOpen(dave, chanPointAliceBob)
-	ht.AssertTopologyChannelOpen(dave, chanPointAliceCarol)
-	ht.AssertTopologyChannelOpen(dave, chanPointEveCarol)
+	ht.AssertChannelInGraph(dave, chanPointAliceBob)
+	ht.AssertChannelInGraph(dave, chanPointAliceCarol)
+	ht.AssertChannelInGraph(dave, chanPointEveCarol)
 
 	// We should expect to see a channel update with the default routing
 	// policy, except that it should indicate the channel is disabled.
@@ -677,7 +664,9 @@ func testUpdateChannelPolicyForPrivateChannel(ht *lntest.HarnessTest) {
 
 	// We'll create the following topology first,
 	// Alice <--public:100k--> Bob <--private:100k--> Carol
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Open a channel with 100k satoshis between Alice and Bob.
 	chanPointAliceBob := ht.OpenChannel(
@@ -701,7 +690,7 @@ func testUpdateChannelPolicyForPrivateChannel(ht *lntest.HarnessTest) {
 	)
 
 	// Carol should be aware of the channel between Alice and Bob.
-	ht.AssertTopologyChannelOpen(carol, chanPointAliceBob)
+	ht.AssertChannelInGraph(carol, chanPointAliceBob)
 
 	// We should have the following topology now,
 	// Alice <--public:100k--> Bob <--private:100k--> Carol
@@ -772,10 +761,6 @@ func testUpdateChannelPolicyForPrivateChannel(ht *lntest.HarnessTest) {
 	// Alice should have sent 20k satoshis + fee to Bob.
 	ht.AssertAmountPaid("Alice(local) => Bob(remote)",
 		alice, chanPointAliceBob, amtExpected, 0)
-
-	// Finally, close the channels.
-	ht.CloseChannel(alice, chanPointAliceBob)
-	ht.CloseChannel(bob, chanPointBobCarol)
 }
 
 // testUpdateChannelPolicyFeeRateAccuracy tests that updating the channel policy
@@ -786,16 +771,14 @@ func testUpdateChannelPolicyFeeRateAccuracy(ht *lntest.HarnessTest) {
 	pushAmt := chanAmt / 2
 
 	// Create a channel Alice -> Bob.
-	alice, bob := ht.Alice, ht.Bob
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{
+	chanPoints, nodes := ht.CreateSimpleNetwork(
+		[][]string{nil, nil}, lntest.OpenChannelParams{
 			Amt:     chanAmt,
 			PushAmt: pushAmt,
 		},
 	)
-
-	// Nodes that we need to make sure receive the channel updates.
-	nodes := []*node.HarnessNode{alice, bob}
+	alice := nodes[0]
+	chanPoint := chanPoints[0]
 
 	baseFee := int64(1500)
 	timeLockDelta := uint32(66)
@@ -846,8 +829,6 @@ func testUpdateChannelPolicyFeeRateAccuracy(ht *lntest.HarnessTest) {
 
 	// Make sure that both Alice and Bob sees the same policy after update.
 	assertNodesPolicyUpdate(ht, nodes, alice, expectedPolicy, chanPoint)
-
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // assertNodesPolicyUpdate checks that a given policy update has been received

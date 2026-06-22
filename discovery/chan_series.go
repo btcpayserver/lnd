@@ -1,11 +1,13 @@
 package discovery
 
 import (
+	"context"
+	"iter"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/graph"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -23,22 +25,23 @@ type ChannelGraphTimeSeries interface {
 	// height that's close to the current tip of the main chain as we
 	// know it.  We'll use this to start our QueryChannelRange dance with
 	// the remote node.
-	HighestChanID(chain chainhash.Hash) (*lnwire.ShortChannelID, error)
+	HighestChanID(ctx context.Context,
+		chain chainhash.Hash) (*lnwire.ShortChannelID, error)
 
 	// UpdatesInHorizon returns all known channel and node updates with an
 	// update timestamp between the start time and end time. We'll use this
 	// to catch up a remote node to the set of channel updates that they
-	// may have missed out on within the target chain.
-	UpdatesInHorizon(chain chainhash.Hash,
-		startTime time.Time, endTime time.Time) ([]lnwire.Message, error)
+	// may have missed out on.
+	UpdatesInHorizon(ctx context.Context, startTime time.Time,
+		endTime time.Time) iter.Seq2[lnwire.Message, error]
 
 	// FilterKnownChanIDs takes a target chain, and a set of channel ID's,
 	// and returns a filtered set of chan ID's. This filtered set of chan
 	// ID's represents the ID's that we don't know of which were in the
 	// passed superSet.
 	FilterKnownChanIDs(chain chainhash.Hash,
-		superSet []channeldb.ChannelUpdateInfo,
-		isZombieChan func(time.Time, time.Time) bool) (
+		superSet []graphdb.ChannelUpdateInfo,
+		isZombieChan func(graphdb.ChannelUpdateInfo) bool) (
 		[]lnwire.ShortChannelID, error)
 
 	// FilterChannelRange returns the set of channels that we created
@@ -46,7 +49,7 @@ type ChannelGraphTimeSeries interface {
 	// grouped by their common block height. We'll use this to to a remote
 	// peer's QueryChannelRange message.
 	FilterChannelRange(chain chainhash.Hash, startHeight, endHeight uint32,
-		withTimestamps bool) ([]channeldb.BlockChannelRange, error)
+		withTimestamps bool) ([]graphdb.BlockChannelRange, error)
 
 	// FetchChanAnns returns a full set of channel announcements as well as
 	// their updates that match the set of specified short channel ID's.
@@ -61,7 +64,8 @@ type ChannelGraphTimeSeries interface {
 	// specified short channel ID. If no channel updates are known for the
 	// channel, then an empty slice will be returned.
 	FetchChanUpdates(chain chainhash.Hash,
-		shortChanID lnwire.ShortChannelID) ([]*lnwire.ChannelUpdate, error)
+		shortChanID lnwire.ShortChannelID) ([]*lnwire.ChannelUpdate1,
+		error)
 }
 
 // ChanSeries is an implementation of the ChannelGraphTimeSeries
@@ -70,12 +74,12 @@ type ChannelGraphTimeSeries interface {
 // in-protocol channel range queries to quickly and efficiently synchronize our
 // channel state with all peers.
 type ChanSeries struct {
-	graph *channeldb.ChannelGraph
+	graph *graphdb.VersionedGraph
 }
 
 // NewChanSeries constructs a new ChanSeries backed by a channeldb.ChannelGraph.
 // The returned ChanSeries implements the ChannelGraphTimeSeries interface.
-func NewChanSeries(graph *channeldb.ChannelGraph) *ChanSeries {
+func NewChanSeries(graph *graphdb.VersionedGraph) *ChanSeries {
 	return &ChanSeries{
 		graph: graph,
 	}
@@ -87,8 +91,10 @@ func NewChanSeries(graph *channeldb.ChannelGraph) *ChanSeries {
 // this to start our QueryChannelRange dance with the remote node.
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
-func (c *ChanSeries) HighestChanID(chain chainhash.Hash) (*lnwire.ShortChannelID, error) {
-	chanID, err := c.graph.HighestChanID()
+func (c *ChanSeries) HighestChanID(ctx context.Context,
+	_ chainhash.Hash) (*lnwire.ShortChannelID, error) {
+
+	chanID, err := c.graph.HighestChanID(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -99,99 +105,110 @@ func (c *ChanSeries) HighestChanID(chain chainhash.Hash) (*lnwire.ShortChannelID
 
 // UpdatesInHorizon returns all known channel and node updates with an update
 // timestamp between the start time and end time. We'll use this to catch up a
-// remote node to the set of channel updates that they may have missed out on
-// within the target chain.
+// remote node to the set of channel updates that they may have missed out on.
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
-func (c *ChanSeries) UpdatesInHorizon(chain chainhash.Hash,
-	startTime time.Time, endTime time.Time) ([]lnwire.Message, error) {
+func (c *ChanSeries) UpdatesInHorizon(ctx context.Context,
+	startTime, endTime time.Time) iter.Seq2[lnwire.Message, error] {
 
-	var updates []lnwire.Message
-
-	// First, we'll query for all the set of channels that have an update
-	// that falls within the specified horizon.
-	chansInHorizon, err := c.graph.ChanUpdatesInHorizon(
-		startTime, endTime,
-	)
-	if err != nil {
-		return nil, err
-	}
-	for _, channel := range chansInHorizon {
-		// If the channel hasn't been fully advertised yet, or is a
-		// private channel, then we'll skip it as we can't construct a
-		// full authentication proof if one is requested.
-		if channel.Info.AuthProof == nil {
-			continue
-		}
-
-		chanAnn, edge1, edge2, err := netann.CreateChanAnnouncement(
-			channel.Info.AuthProof, channel.Info, channel.Policy1,
-			channel.Policy2,
+	return func(yield func(lnwire.Message, error) bool) {
+		// First, we'll query for all the set of channels that have an
+		// update that falls within the specified horizon.
+		chansInHorizon := c.graph.ChanUpdatesInHorizon(
+			ctx, graphdb.ChanUpdateRange{
+				StartTime: fn.Some(startTime),
+				EndTime:   fn.Some(endTime),
+			},
 		)
-		if err != nil {
-			return nil, err
-		}
 
-		updates = append(updates, chanAnn)
-		if edge1 != nil {
+		for channel, err := range chansInHorizon {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			// If the channel hasn't been fully advertised yet, or
+			// is a private channel, then we'll skip it as we can't
+			// construct a full authentication proof if one is
+			// requested.
+			if channel.Info.AuthProof == nil {
+				continue
+			}
+
+			//nolint:ll
+			chanAnn, edge1, edge2, err := netann.CreateChanAnnouncement(
+				channel.Info, channel.Policy1, channel.Policy2,
+			)
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+
+				continue
+			}
+
+			if !yield(chanAnn, nil) {
+				return
+			}
+
 			// We don't want to send channel updates that don't
-			// conform to the spec (anymore).
-			err := graph.ValidateChannelUpdateFields(0, edge1)
-			if err != nil {
-				log.Errorf("not sending invalid channel "+
-					"update %v: %v", edge1, err)
-			} else {
-				updates = append(updates, edge1)
+			// conform to the spec (anymore), so check to make sure
+			// that these channel updates are valid before yielding
+			// them.
+			if edge1 != nil {
+				err := netann.ValidateChannelUpdateFields(
+					0, edge1,
+				)
+				if err != nil {
+					log.Errorf("not sending invalid "+
+						"channel update %v: %v",
+						edge1, err)
+				} else if !yield(edge1, nil) {
+					return
+				}
+			}
+			if edge2 != nil {
+				err := netann.ValidateChannelUpdateFields(
+					0, edge2,
+				)
+				if err != nil {
+					log.Errorf("not sending invalid "+
+						"channel update %v: %v", edge2,
+						err)
+				} else if !yield(edge2, nil) {
+					return
+				}
 			}
 		}
-		if edge2 != nil {
-			err := graph.ValidateChannelUpdateFields(0, edge2)
+
+		// Next, we'll send out all the node announcements that have an
+		// update within the horizon as well. We send these second to
+		// ensure that they follow any active channels they have.
+		nodeAnnsInHorizon := c.graph.NodeUpdatesInHorizon(
+			ctx, graphdb.NodeUpdateRange{
+				StartTime: fn.Some(startTime),
+				EndTime:   fn.Some(endTime),
+			},
+			graphdb.WithIterPublicNodesOnly(),
+		)
+		for nodeAnn, err := range nodeAnnsInHorizon {
 			if err != nil {
-				log.Errorf("not sending invalid channel "+
-					"update %v: %v", edge2, err)
-			} else {
-				updates = append(updates, edge2)
+				yield(nil, err)
+				return
+			}
+			nodeUpdate, err := nodeAnn.NodeAnnouncement(true)
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+
+				continue
+			}
+
+			if !yield(nodeUpdate, nil) {
+				return
 			}
 		}
 	}
-
-	// Next, we'll send out all the node announcements that have an update
-	// within the horizon as well. We send these second to ensure that they
-	// follow any active channels they have.
-	nodeAnnsInHorizon, err := c.graph.NodeUpdatesInHorizon(
-		startTime, endTime,
-	)
-	if err != nil {
-		return nil, err
-	}
-	for _, nodeAnn := range nodeAnnsInHorizon {
-		nodeAnn := nodeAnn
-
-		// Ensure we only forward nodes that are publicly advertised to
-		// prevent leaking information about nodes.
-		isNodePublic, err := c.graph.IsPublicNode(nodeAnn.PubKeyBytes)
-		if err != nil {
-			log.Errorf("Unable to determine if node %x is "+
-				"advertised: %v", nodeAnn.PubKeyBytes, err)
-			continue
-		}
-
-		if !isNodePublic {
-			log.Tracef("Skipping forwarding announcement for "+
-				"node %x due to being unadvertised",
-				nodeAnn.PubKeyBytes)
-			continue
-		}
-
-		nodeUpdate, err := nodeAnn.NodeAnnouncement(true)
-		if err != nil {
-			return nil, err
-		}
-
-		updates = append(updates, nodeUpdate)
-	}
-
-	return updates, nil
 }
 
 // FilterKnownChanIDs takes a target chain, and a set of channel ID's, and
@@ -200,11 +217,13 @@ func (c *ChanSeries) UpdatesInHorizon(chain chainhash.Hash,
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
 func (c *ChanSeries) FilterKnownChanIDs(_ chainhash.Hash,
-	superSet []channeldb.ChannelUpdateInfo,
-	isZombieChan func(time.Time, time.Time) bool) (
+	superSet []graphdb.ChannelUpdateInfo,
+	isZombieChan func(graphdb.ChannelUpdateInfo) bool) (
 	[]lnwire.ShortChannelID, error) {
 
-	newChanIDs, err := c.graph.FilterKnownChanIDs(superSet, isZombieChan)
+	newChanIDs, err := c.graph.FilterKnownChanIDs(
+		context.TODO(), superSet, isZombieChan,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -226,11 +245,11 @@ func (c *ChanSeries) FilterKnownChanIDs(_ chainhash.Hash,
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
 func (c *ChanSeries) FilterChannelRange(_ chainhash.Hash, startHeight,
-	endHeight uint32, withTimestamps bool) ([]channeldb.BlockChannelRange,
+	endHeight uint32, withTimestamps bool) ([]graphdb.BlockChannelRange,
 	error) {
 
 	return c.graph.FilterChannelRange(
-		startHeight, endHeight, withTimestamps,
+		context.TODO(), startHeight, endHeight, withTimestamps,
 	)
 }
 
@@ -239,6 +258,7 @@ func (c *ChanSeries) FilterChannelRange(_ chainhash.Hash, startHeight,
 // to reply to a QueryShortChanIDs message sent by a remote peer. The response
 // will contain a unique set of ChannelAnnouncements, the latest ChannelUpdate
 // for each of the announcements, and a unique set of NodeAnnouncements.
+// Invalid node announcements are skipped and logged for debugging purposes.
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
 func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
@@ -249,7 +269,7 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 		chanIDs = append(chanIDs, chanID.ToUint64())
 	}
 
-	channels, err := c.graph.FetchChanInfos(chanIDs)
+	channels, err := c.graph.FetchChanInfos(context.TODO(), chanIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -269,8 +289,7 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 		}
 
 		chanAnn, edge1, edge2, err := netann.CreateChanAnnouncement(
-			channel.Info.AuthProof, channel.Info, channel.Policy1,
-			channel.Policy2,
+			channel.Info, channel.Policy1, channel.Policy2,
 		)
 		if err != nil {
 			return nil, err
@@ -283,7 +302,7 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 			// If this edge has a validated node announcement, that
 			// we haven't yet sent, then we'll send that as well.
 			nodePub := channel.Node2.PubKeyBytes
-			hasNodeAnn := channel.Node2.HaveNodeAnnouncement
+			hasNodeAnn := channel.Node2.HaveAnnouncement()
 			if _, ok := nodePubsSent[nodePub]; !ok && hasNodeAnn {
 				nodeAnn, err := channel.Node2.NodeAnnouncement(
 					true,
@@ -292,8 +311,15 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 					return nil, err
 				}
 
-				chanAnns = append(chanAnns, nodeAnn)
-				nodePubsSent[nodePub] = struct{}{}
+				err = netann.ValidateNodeAnnFields(nodeAnn)
+				if err != nil {
+					log.Debugf("Skipping forwarding "+
+						"invalid node announcement "+
+						"%x: %v", nodeAnn.NodeID, err)
+				} else {
+					chanAnns = append(chanAnns, nodeAnn)
+					nodePubsSent[nodePub] = struct{}{}
+				}
 			}
 		}
 		if edge2 != nil {
@@ -302,7 +328,7 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 			// If this edge has a validated node announcement, that
 			// we haven't yet sent, then we'll send that as well.
 			nodePub := channel.Node1.PubKeyBytes
-			hasNodeAnn := channel.Node1.HaveNodeAnnouncement
+			hasNodeAnn := channel.Node1.HaveAnnouncement()
 			if _, ok := nodePubsSent[nodePub]; !ok && hasNodeAnn {
 				nodeAnn, err := channel.Node1.NodeAnnouncement(
 					true,
@@ -311,8 +337,15 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 					return nil, err
 				}
 
-				chanAnns = append(chanAnns, nodeAnn)
-				nodePubsSent[nodePub] = struct{}{}
+				err = netann.ValidateNodeAnnFields(nodeAnn)
+				if err != nil {
+					log.Debugf("Skipping forwarding "+
+						"invalid node announcement "+
+						"%x: %v", nodeAnn.NodeID, err)
+				} else {
+					chanAnns = append(chanAnns, nodeAnn)
+					nodePubsSent[nodePub] = struct{}{}
+				}
 			}
 		}
 	}
@@ -326,16 +359,16 @@ func (c *ChanSeries) FetchChanAnns(chain chainhash.Hash,
 //
 // NOTE: This is part of the ChannelGraphTimeSeries interface.
 func (c *ChanSeries) FetchChanUpdates(chain chainhash.Hash,
-	shortChanID lnwire.ShortChannelID) ([]*lnwire.ChannelUpdate, error) {
+	shortChanID lnwire.ShortChannelID) ([]*lnwire.ChannelUpdate1, error) {
 
 	chanInfo, e1, e2, err := c.graph.FetchChannelEdgesByID(
-		shortChanID.ToUint64(),
+		context.TODO(), shortChanID.ToUint64(),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	chanUpdates := make([]*lnwire.ChannelUpdate, 0, 2)
+	chanUpdates := make([]*lnwire.ChannelUpdate1, 0, 2)
 	if e1 != nil {
 		chanUpdate, err := netann.ChannelUpdateFromEdge(chanInfo, e1)
 		if err != nil {

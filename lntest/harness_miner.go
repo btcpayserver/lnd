@@ -41,7 +41,7 @@ func (h *HarnessTest) MineBlocks(num int) {
 		// Check the block doesn't have any txns except the coinbase.
 		if len(block.Transactions) <= 1 {
 			// Make sure all the active nodes are synced.
-			h.AssertActiveNodesSyncedTo(block)
+			h.AssertActiveNodesSyncedTo(block.BlockHash())
 
 			// Mine the next block.
 			continue
@@ -116,7 +116,7 @@ func (h *HarnessTest) MineBlocksAndAssertNumTxes(num uint32,
 
 	// Finally, make sure all the active nodes are synced.
 	bestBlock := blocks[len(blocks)-1]
-	h.AssertActiveNodesSyncedTo(bestBlock)
+	h.AssertActiveNodesSyncedTo(bestBlock.BlockHash())
 
 	return blocks
 }
@@ -157,7 +157,7 @@ func (h *HarnessTest) cleanMempool() {
 		bestBlock = blocks[len(blocks)-1]
 
 		// Make sure all the active nodes are synced.
-		h.AssertActiveNodesSyncedTo(bestBlock)
+		h.AssertActiveNodesSyncedTo(bestBlock.BlockHash())
 
 		return fmt.Errorf("still have %d txes in mempool", len(mem))
 	}, wait.MinerMempoolTimeout)
@@ -196,7 +196,8 @@ func (h *HarnessTest) mineTillForceCloseResolved(hn *node.HarnessNode) {
 		return nil
 	}, DefaultTimeout)
 
-	require.NoErrorf(h, err, "assert force close resolved timeout")
+	require.NoErrorf(h, err, "%s: assert force close resolved timeout",
+		hn.Name())
 }
 
 // AssertTxInMempool asserts a given transaction can be found in the mempool.
@@ -215,7 +216,7 @@ func (h *HarnessTest) AssertTxNotInMempool(txid chainhash.Hash) {
 }
 
 // AssertNumTxsInMempool polls until finding the desired number of transactions
-// in the provided miner's mempool. It will asserrt if this number is not met
+// in the provided miner's mempool. It will assert if this number is not met
 // after the given timeout.
 func (h *HarnessTest) AssertNumTxsInMempool(n int) []chainhash.Hash {
 	return h.miner.AssertNumTxsInMempool(n)
@@ -246,7 +247,15 @@ func (h *HarnessTest) GetBestBlock() (*chainhash.Hash, int32) {
 
 // MineBlockWithTx mines a single block to include the specifies tx only.
 func (h *HarnessTest) MineBlockWithTx(tx *wire.MsgTx) *wire.MsgBlock {
-	return h.miner.MineBlockWithTx(tx)
+	// Update the harness's current height.
+	defer h.updateCurrentHeight()
+
+	block := h.miner.MineBlockWithTx(tx)
+
+	// Finally, make sure all the active nodes are synced.
+	h.AssertActiveNodesSyncedTo(block.BlockHash())
+
+	return block
 }
 
 // ConnectToMiner connects the miner to a temp miner.
@@ -312,7 +321,9 @@ func (h *HarnessTest) AssertMinerBlockHeightDelta(
 func (h *HarnessTest) SendRawTransaction(tx *wire.MsgTx,
 	allowHighFees bool) (chainhash.Hash, error) {
 
-	txid, err := h.miner.Client.SendRawTransaction(tx, allowHighFees)
+	// Use the miner's SendRawTransaction method which handles both
+	// btcd and bitcoind backends.
+	txid, err := h.miner.SendRawTransaction(tx, allowHighFees)
 	require.NoError(h, err)
 
 	return *txid, nil

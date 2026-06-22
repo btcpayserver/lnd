@@ -20,11 +20,16 @@ const (
 	// DefaultIncomingBroadcastDelta defines the number of blocks before the
 	// expiry of an incoming htlc at which we force close the channel. We
 	// only go to chain if we also have the preimage to actually pull in the
-	// htlc. BOLT #2 suggests 7 blocks. We use a few more for extra safety.
-	// Within this window we need to get our sweep or 2nd level success tx
-	// confirmed, because after that the remote party is also able to claim
-	// the htlc using the timeout path.
-	DefaultIncomingBroadcastDelta = 10
+	// htlc. BOLT #2 suggests 7 blocks. We use more for extra safety.
+	//
+	// The value accounts for:
+	//   - Up to 6 blocks waiting for close tx confirmation (reorg safety)
+	//   - Time to broadcast and confirm our sweep/2nd level success tx
+	//
+	// Within this window we need to get our sweep confirmed, because after
+	// that the remote party is also able to claim the htlc using the
+	// timeout path.
+	DefaultIncomingBroadcastDelta = 16
 
 	// DefaultFinalCltvRejectDelta defines the number of blocks before the
 	// expiry of an incoming exit hop htlc at which we cancel it back
@@ -72,6 +77,11 @@ const (
 	// DefaultZombieSweeperInterval is the default time interval at which
 	// unfinished (zombiestate) open channel flows are purged from memory.
 	DefaultZombieSweeperInterval = 1 * time.Minute
+
+	// DefaultMaxWaitNumBlocksFundingConf is the maximum number of blocks to
+	// wait for the funding transaction to confirm before forgetting
+	// channels that aren't initiated by us. 2016 blocks is ~2 weeks.
+	DefaultMaxWaitNumBlocksFundingConf = 2016
 )
 
 // CleanAndExpandPath expands environment variables and leading ~ in the
@@ -103,6 +113,14 @@ func CleanAndExpandPath(path string) string {
 // NormalizeNetwork returns the common name of a network type used to create
 // file paths. This allows differently versioned networks to use the same path.
 func NormalizeNetwork(network string) string {
+	// The 4th testnet isn't the "default" yet, so we'll want to explicitly
+	// point that to a "testnet4" directory.
+	if network == "testnet4" {
+		return network
+	}
+
+	// We want to collapse "testnet3" and "testnet" to the same "testnet"
+	// directory.
 	if strings.HasPrefix(network, "testnet") {
 		return "testnet"
 	}

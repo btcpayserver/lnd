@@ -11,7 +11,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	sphinx "github.com/lightningnetwork/lightning-onion"
-	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -375,7 +375,7 @@ func TestPadBlindedHopInfo(t *testing.T) {
 				}
 
 				if test.existingPadding != nil {
-					//nolint:lll
+					//nolint:ll
 					padding := tlv.SomeRecordT(
 						tlv.NewPrimitiveRecord[tlv.TlvType1](
 							make([]byte, test.existingPadding[i]),

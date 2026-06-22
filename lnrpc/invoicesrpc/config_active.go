@@ -51,9 +51,9 @@ type Config struct {
 	// specified.
 	DefaultCLTVExpiry uint32
 
-	// GraphDB is a global database instance which is needed to access the
-	// channel graph.
-	GraphDB *channeldb.ChannelGraph
+	// Graph provides the invoices with information about the current LN
+	// graph.
+	Graph GraphSource
 
 	// ChanStateDB is a possibly replicated db instance which contains the
 	// channel state

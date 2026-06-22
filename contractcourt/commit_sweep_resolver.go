@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -13,16 +12,22 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
 )
 
 // commitSweepResolver is a resolver that will attempt to sweep the commitment
-// output paying to us, in the case that the remote party broadcasts their
-// version of the commitment transaction. We can sweep this output immediately,
-// as it doesn't have a time-lock delay.
+// output paying to us (local channel balance). In the case that the local
+// party (we) broadcasts their version of the commitment transaction, we have
+// to wait before sweeping it, as it has a CSV delay. For anchor channel
+// type, even if the remote party broadcasts the commitment transaction,
+// we have to wait one block after commitment transaction is confirmed,
+// because CSV 1 is put into the script of UTXO representing local balance.
+// Additionally, if the channel is a channel lease, we have to wait for
+// CLTV to expire.
+// https://docs.lightning.engineering/lightning-network-tools/pool/overview
 type commitSweepResolver struct {
 	// localChanCfg is used to provide the resolver with the keys required
 	// to identify whether the commitment transaction was broadcast by the
@@ -33,13 +38,10 @@ type commitSweepResolver struct {
 	// this HTLC on-chain.
 	commitResolution lnwallet.CommitOutputResolution
 
-	// resolved reflects if the contract has been fully resolved or not.
-	resolved bool
-
-	// broadcastHeight is the height that the original contract was
-	// broadcast to the main-chain at. We'll use this value to bound any
-	// historical queries to the chain for spends/confirmations.
-	broadcastHeight uint32
+	// confirmHeight is the block height that the commitment transaction was
+	// confirmed at. We'll use this value to bound any historical queries to
+	// the chain for spends/confirmations.
+	confirmHeight uint32
 
 	// chanPoint is the channel point of the original contract.
 	chanPoint wire.OutPoint
@@ -72,17 +74,17 @@ type commitSweepResolver struct {
 
 // newCommitSweepResolver instantiates a new direct commit output resolver.
 func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
-	broadcastHeight uint32, chanPoint wire.OutPoint,
+	confirmHeight uint32, chanPoint wire.OutPoint,
 	resCfg ResolverConfig) *commitSweepResolver {
 
 	r := &commitSweepResolver{
 		contractResolverKit: *newContractResolverKit(resCfg),
 		commitResolution:    res,
-		broadcastHeight:     broadcastHeight,
+		confirmHeight:       confirmHeight,
 		chanPoint:           chanPoint,
 	}
 
-	r.initLogger(r)
+	r.initLogger(fmt.Sprintf("%T(%v)", r, r.commitResolution.SelfOutPoint))
 	r.initReport()
 
 	return r
@@ -93,36 +95,6 @@ func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
 func (c *commitSweepResolver) ResolverKey() []byte {
 	key := newResolverID(c.commitResolution.SelfOutPoint)
 	return key[:]
-}
-
-// waitForHeight registers for block notifications and waits for the provided
-// block height to be reached.
-func waitForHeight(waitHeight uint32, notifier chainntnfs.ChainNotifier,
-	quit <-chan struct{}) error {
-
-	// Register for block epochs. After registration, the current height
-	// will be sent on the channel immediately.
-	blockEpochs, err := notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return err
-	}
-	defer blockEpochs.Cancel()
-
-	for {
-		select {
-		case newBlock, ok := <-blockEpochs.Epochs:
-			if !ok {
-				return errResolverShuttingDown
-			}
-			height := newBlock.Height
-			if height >= int32(waitHeight) {
-				return nil
-			}
-
-		case <-quit:
-			return errResolverShuttingDown
-		}
-	}
 }
 
 // waitForSpend waits for the given outpoint to be spent, and returns the
@@ -151,37 +123,6 @@ func waitForSpend(op *wire.OutPoint, pkScript []byte, heightHint uint32,
 	}
 }
 
-// getCommitTxConfHeight waits for confirmation of the commitment tx and
-// returns the confirmation height.
-func (c *commitSweepResolver) getCommitTxConfHeight() (uint32, error) {
-	txID := c.commitResolution.SelfOutPoint.Hash
-	signDesc := c.commitResolution.SelfOutputSignDesc
-	pkScript := signDesc.Output.PkScript
-
-	const confDepth = 1
-
-	confChan, err := c.Notifier.RegisterConfirmationsNtfn(
-		&txID, pkScript, confDepth, c.broadcastHeight,
-	)
-	if err != nil {
-		return 0, err
-	}
-	defer confChan.Cancel()
-
-	select {
-	case txConfirmation, ok := <-confChan.Confirmed:
-		if !ok {
-			return 0, fmt.Errorf("cannot get confirmation "+
-				"for commit tx %v", txID)
-		}
-
-		return txConfirmation.BlockHeight, nil
-
-	case <-c.quit:
-		return 0, errResolverShuttingDown
-	}
-}
-
 // Resolve instructs the contract resolver to resolve the output on-chain. Once
 // the output has been *fully* resolved, the function should return immediately
 // with a nil ContractResolver value for the first return value.  In the case
@@ -189,201 +130,15 @@ func (c *commitSweepResolver) getCommitTxConfHeight() (uint32, error) {
 // returned.
 //
 // NOTE: This function MUST be run as a goroutine.
+
+// TODO(yy): fix the funlen in the next PR.
 //
 //nolint:funlen
-func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
+func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	// If we're already resolved, then we can exit early.
-	if c.resolved {
+	if c.IsResolved() {
+		c.log.Errorf("already resolved")
 		return nil, nil
-	}
-
-	confHeight, err := c.getCommitTxConfHeight()
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait up until the CSV expires, unless we also have a CLTV that
-	// expires after.
-	unlockHeight := confHeight + c.commitResolution.MaturityDelay
-	if c.hasCLTV() {
-		unlockHeight = uint32(math.Max(
-			float64(unlockHeight), float64(c.leaseExpiry),
-		))
-	}
-
-	c.log.Debugf("commit conf_height=%v, unlock_height=%v",
-		confHeight, unlockHeight)
-
-	// Update report now that we learned the confirmation height.
-	c.reportLock.Lock()
-	c.currentReport.MaturityHeight = unlockHeight
-	c.reportLock.Unlock()
-
-	// If there is a csv/cltv lock, we'll wait for that.
-	if c.commitResolution.MaturityDelay > 0 || c.hasCLTV() {
-		// Determine what height we should wait until for the locks to
-		// expire.
-		var waitHeight uint32
-		switch {
-		// If we have both a csv and cltv lock, we'll need to look at
-		// both and see which expires later.
-		case c.commitResolution.MaturityDelay > 0 && c.hasCLTV():
-			c.log.Debugf("waiting for CSV and CLTV lock to expire "+
-				"at height %v", unlockHeight)
-			// If the CSV expires after the CLTV, or there is no
-			// CLTV, then we can broadcast a sweep a block before.
-			// Otherwise, we need to broadcast at our expected
-			// unlock height.
-			waitHeight = uint32(math.Max(
-				float64(unlockHeight-1), float64(c.leaseExpiry),
-			))
-
-		// If we only have a csv lock, wait for the height before the
-		// lock expires as the spend path should be unlocked by then.
-		case c.commitResolution.MaturityDelay > 0:
-			c.log.Debugf("waiting for CSV lock to expire at "+
-				"height %v", unlockHeight)
-			waitHeight = unlockHeight - 1
-		}
-
-		err := waitForHeight(waitHeight, c.Notifier, c.quit)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var (
-		isLocalCommitTx bool
-
-		signDesc = c.commitResolution.SelfOutputSignDesc
-	)
-
-	switch {
-	// For taproot channels, we'll know if this is the local commit based
-	// on the timelock value. For remote commitment transactions, the
-	// witness script has a timelock of 1.
-	case c.chanType.IsTaproot():
-		delayKey := c.localChanCfg.DelayBasePoint.PubKey
-		nonDelayKey := c.localChanCfg.PaymentBasePoint.PubKey
-
-		signKey := c.commitResolution.SelfOutputSignDesc.KeyDesc.PubKey
-
-		// If the key in the script is neither of these, we shouldn't
-		// proceed. This should be impossible.
-		if !signKey.IsEqual(delayKey) && !signKey.IsEqual(nonDelayKey) {
-			return nil, fmt.Errorf("unknown sign key %v", signKey)
-		}
-
-		// The commitment transaction is ours iff the signing key is
-		// the delay key.
-		isLocalCommitTx = signKey.IsEqual(delayKey)
-
-	// The output is on our local commitment if the script starts with
-	// OP_IF for the revocation clause. On the remote commitment it will
-	// either be a regular P2WKH or a simple sig spend with a CSV delay.
-	default:
-		isLocalCommitTx = signDesc.WitnessScript[0] == txscript.OP_IF
-	}
-	isDelayedOutput := c.commitResolution.MaturityDelay != 0
-
-	c.log.Debugf("isDelayedOutput=%v, isLocalCommitTx=%v", isDelayedOutput,
-		isLocalCommitTx)
-
-	// There're three types of commitments, those that have tweaks for the
-	// remote key (us in this case), those that don't, and a third where
-	// there is no tweak and the output is delayed. On the local commitment
-	// our output will always be delayed. We'll rely on the presence of the
-	// commitment tweak to discern which type of commitment this is.
-	var witnessType input.WitnessType
-	switch {
-	// The local delayed output for a taproot channel.
-	case isLocalCommitTx && c.chanType.IsTaproot():
-		witnessType = input.TaprootLocalCommitSpend
-
-	// The CSV 1 delayed output for a taproot channel.
-	case !isLocalCommitTx && c.chanType.IsTaproot():
-		witnessType = input.TaprootRemoteCommitSpend
-
-	// Delayed output to us on our local commitment for a channel lease in
-	// which we are the initiator.
-	case isLocalCommitTx && c.hasCLTV():
-		witnessType = input.LeaseCommitmentTimeLock
-
-	// Delayed output to us on our local commitment.
-	case isLocalCommitTx:
-		witnessType = input.CommitmentTimeLock
-
-	// A confirmed output to us on the remote commitment for a channel lease
-	// in which we are the initiator.
-	case isDelayedOutput && c.hasCLTV():
-		witnessType = input.LeaseCommitmentToRemoteConfirmed
-
-	// A confirmed output to us on the remote commitment.
-	case isDelayedOutput:
-		witnessType = input.CommitmentToRemoteConfirmed
-
-	// A non-delayed output on the remote commitment where the key is
-	// tweakless.
-	case c.commitResolution.SelfOutputSignDesc.SingleTweak == nil:
-		witnessType = input.CommitSpendNoDelayTweakless
-
-	// A non-delayed output on the remote commitment where the key is
-	// tweaked.
-	default:
-		witnessType = input.CommitmentNoDelay
-	}
-
-	c.log.Infof("Sweeping with witness type: %v", witnessType)
-
-	// We'll craft an input with all the information required for the
-	// sweeper to create a fully valid sweeping transaction to recover
-	// these coins.
-	var inp *input.BaseInput
-	if c.hasCLTV() {
-		inp = input.NewCsvInputWithCltv(
-			&c.commitResolution.SelfOutPoint, witnessType,
-			&c.commitResolution.SelfOutputSignDesc,
-			c.broadcastHeight, c.commitResolution.MaturityDelay,
-			c.leaseExpiry,
-			input.WithResolutionBlob(
-				c.commitResolution.ResolutionBlob,
-			),
-		)
-	} else {
-		inp = input.NewCsvInput(
-			&c.commitResolution.SelfOutPoint, witnessType,
-			&c.commitResolution.SelfOutputSignDesc,
-			c.broadcastHeight, c.commitResolution.MaturityDelay,
-			input.WithResolutionBlob(
-				c.commitResolution.ResolutionBlob,
-			),
-		)
-	}
-
-	// TODO(roasbeef): instead of ading ctrl block to the sign desc, make
-	// new input type, have sweeper set it?
-
-	// Calculate the budget for the sweeping this input.
-	budget := calculateBudget(
-		btcutil.Amount(inp.SignDesc().Output.Value),
-		c.Budget.ToLocalRatio, c.Budget.ToLocal,
-	)
-	c.log.Infof("Sweeping commit output using budget=%v", budget)
-
-	// With our input constructed, we'll now offer it to the sweeper.
-	resultChan, err := c.Sweeper.SweepInput(
-		inp, sweep.Params{
-			Budget: budget,
-
-			// Specify a nil deadline here as there's no time
-			// pressure.
-			DeadlineHeight: fn.None[int32](),
-		},
-	)
-	if err != nil {
-		c.log.Errorf("unable to sweep input: %v", err)
-
-		return nil, err
 	}
 
 	var sweepTxID chainhash.Hash
@@ -394,7 +149,7 @@ func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 	// happen.
 	outcome := channeldb.ResolverOutcomeClaimed
 	select {
-	case sweepResult := <-resultChan:
+	case sweepResult := <-c.sweepResultChan:
 		switch sweepResult.Err {
 		// If the remote party was able to sweep this output it's
 		// likely what we sent was actually a revoked commitment.
@@ -434,7 +189,7 @@ func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 	report := c.currentReport.resolverReport(
 		&sweepTxID, channeldb.ResolverTypeCommit, outcome,
 	)
-	c.resolved = true
+	c.markResolved()
 
 	// Checkpoint the resolver with a closure that will write the outcome
 	// of the resolver and its sweep transaction to disk.
@@ -446,15 +201,9 @@ func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 //
 // NOTE: Part of the ContractResolver interface.
 func (c *commitSweepResolver) Stop() {
+	c.log.Debugf("stopping...")
+	defer c.log.Debugf("stopped")
 	close(c.quit)
-}
-
-// IsResolved returns true if the stored state in the resolve is fully
-// resolved. In this case the target output can be forgotten.
-//
-// NOTE: Part of the ContractResolver interface.
-func (c *commitSweepResolver) IsResolved() bool {
-	return c.resolved
 }
 
 // SupplementState allows the user of a ContractResolver to supplement it with
@@ -485,10 +234,10 @@ func (c *commitSweepResolver) Encode(w io.Writer) error {
 		return err
 	}
 
-	if err := binary.Write(w, endian, c.resolved); err != nil {
+	if err := binary.Write(w, endian, c.IsResolved()); err != nil {
 		return err
 	}
-	if err := binary.Write(w, endian, c.broadcastHeight); err != nil {
+	if err := binary.Write(w, endian, c.confirmHeight); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.chanPoint.Hash[:]); err != nil {
@@ -520,10 +269,15 @@ func newCommitSweepResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 		return nil, err
 	}
 
-	if err := binary.Read(r, endian, &c.resolved); err != nil {
+	var resolved bool
+	if err := binary.Read(r, endian, &resolved); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(r, endian, &c.broadcastHeight); err != nil {
+	if resolved {
+		c.markResolved()
+	}
+
+	if err := binary.Read(r, endian, &c.confirmHeight); err != nil {
 		return nil, err
 	}
 	_, err := io.ReadFull(r, c.chanPoint.Hash[:])
@@ -539,7 +293,7 @@ func newCommitSweepResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 	// removed this, but keep in mind that this data may still be present in
 	// the database.
 
-	c.initLogger(c)
+	c.initLogger(fmt.Sprintf("%T(%v)", c, c.commitResolution.SelfOutPoint))
 	c.initReport()
 
 	return c, nil
@@ -579,3 +333,187 @@ func (c *commitSweepResolver) initReport() {
 // A compile time assertion to ensure commitSweepResolver meets the
 // ContractResolver interface.
 var _ reportingContractResolver = (*commitSweepResolver)(nil)
+
+// Launch constructs a commit input and offers it to the sweeper.
+func (c *commitSweepResolver) Launch() error {
+	if c.isLaunched() {
+		c.log.Tracef("already launched")
+		return nil
+	}
+
+	c.log.Debugf("launching resolver...")
+	c.markLaunched()
+
+	// If we're already resolved, then we can exit early.
+	if c.IsResolved() {
+		c.log.Errorf("already resolved")
+		return nil
+	}
+
+	// Wait up until the CSV expires, unless we also have a CLTV that
+	// expires after.
+	unlockHeight := c.confirmHeight + c.commitResolution.MaturityDelay
+	if c.hasCLTV() {
+		unlockHeight = max(unlockHeight, c.leaseExpiry)
+	}
+
+	// Update report with the calculated maturity height.
+	c.reportLock.Lock()
+	c.currentReport.MaturityHeight = unlockHeight
+	c.reportLock.Unlock()
+
+	// Derive the witness type for this input.
+	witnessType, err := c.decideWitnessType()
+	if err != nil {
+		return err
+	}
+
+	// We'll craft an input with all the information required for the
+	// sweeper to create a fully valid sweeping transaction to recover
+	// these coins.
+	var inp *input.BaseInput
+	if c.hasCLTV() {
+		inp = input.NewCsvInputWithCltv(
+			&c.commitResolution.SelfOutPoint, witnessType,
+			&c.commitResolution.SelfOutputSignDesc,
+			c.confirmHeight, c.commitResolution.MaturityDelay,
+			c.leaseExpiry, input.WithResolutionBlob(
+				c.commitResolution.ResolutionBlob,
+			),
+		)
+	} else {
+		inp = input.NewCsvInput(
+			&c.commitResolution.SelfOutPoint, witnessType,
+			&c.commitResolution.SelfOutputSignDesc,
+			c.confirmHeight, c.commitResolution.MaturityDelay,
+			input.WithResolutionBlob(
+				c.commitResolution.ResolutionBlob,
+			),
+		)
+	}
+
+	// TODO(roasbeef): instead of adding ctrl block to the sign desc, make
+	// new input type, have sweeper set it?
+
+	// Calculate the budget for the sweeping this input.
+	budget := calculateBudget(
+		btcutil.Amount(inp.SignDesc().Output.Value),
+		c.Budget.ToLocalRatio, c.Budget.ToLocal,
+	)
+	c.log.Infof("sweeping commit output %v using budget=%v", witnessType,
+		budget)
+
+	// With our input constructed, we'll now offer it to the sweeper.
+	resultChan, err := c.Sweeper.SweepInput(
+		inp, sweep.Params{
+			Budget: budget,
+
+			// Specify a nil deadline here as there's no time
+			// pressure.
+			DeadlineHeight: fn.None[int32](),
+		},
+	)
+	if err != nil {
+		c.log.Errorf("unable to sweep input: %v", err)
+
+		return err
+	}
+
+	c.sweepResultChan = resultChan
+
+	return nil
+}
+
+// decideWitnessType returns the witness type for the input.
+func (c *commitSweepResolver) decideWitnessType() (input.WitnessType, error) {
+	var (
+		isLocalCommitTx bool
+		signDesc        = c.commitResolution.SelfOutputSignDesc
+	)
+
+	switch {
+	// For taproot channels, we'll know if this is the local commit based
+	// on the timelock value. For remote commitment transactions, the
+	// witness script has a timelock of 1.
+	case c.chanType.IsTaproot():
+		delayKey := c.localChanCfg.DelayBasePoint.PubKey
+		nonDelayKey := c.localChanCfg.PaymentBasePoint.PubKey
+
+		signKey := c.commitResolution.SelfOutputSignDesc.KeyDesc.PubKey
+
+		// If the key in the script is neither of these, we shouldn't
+		// proceed. This should be impossible.
+		if !signKey.IsEqual(delayKey) && !signKey.IsEqual(nonDelayKey) {
+			return nil, fmt.Errorf("unknown sign key %v", signKey)
+		}
+
+		// The commitment transaction is ours iff the signing key is
+		// the delay key.
+		isLocalCommitTx = signKey.IsEqual(delayKey)
+
+	// The output is on our local commitment if the script starts with
+	// OP_IF for the revocation clause. On the remote commitment it will
+	// either be a regular P2WKH or a simple sig spend with a CSV delay.
+	default:
+		isLocalCommitTx = signDesc.WitnessScript[0] == txscript.OP_IF
+	}
+
+	isDelayedOutput := c.commitResolution.MaturityDelay != 0
+
+	c.log.Debugf("isDelayedOutput=%v, isLocalCommitTx=%v", isDelayedOutput,
+		isLocalCommitTx)
+
+	// There're three types of commitments, those that have tweaks for the
+	// remote key (us in this case), those that don't, and a third where
+	// there is no tweak and the output is delayed. On the local commitment
+	// our output will always be delayed. We'll rely on the presence of the
+	// commitment tweak to discern which type of commitment this is.
+	var witnessType input.WitnessType
+	switch {
+	// The local delayed output for a final taproot channel.
+	case isLocalCommitTx && c.chanType.IsTaprootFinal():
+		witnessType = input.TaprootLocalCommitSpendFinal
+
+	// The local delayed output for a staging taproot channel.
+	case isLocalCommitTx && c.chanType.IsTaproot():
+		witnessType = input.TaprootLocalCommitSpend
+
+	// The CSV 1 delayed output for a final taproot channel.
+	case !isLocalCommitTx && c.chanType.IsTaprootFinal():
+		witnessType = input.TaprootRemoteCommitSpendFinal
+
+	// The CSV 1 delayed output for a staging taproot channel.
+	case !isLocalCommitTx && c.chanType.IsTaproot():
+		witnessType = input.TaprootRemoteCommitSpend
+
+	// Delayed output to us on our local commitment for a channel lease in
+	// which we are the initiator.
+	case isLocalCommitTx && c.hasCLTV():
+		witnessType = input.LeaseCommitmentTimeLock
+
+	// Delayed output to us on our local commitment.
+	case isLocalCommitTx:
+		witnessType = input.CommitmentTimeLock
+
+	// A confirmed output to us on the remote commitment for a channel lease
+	// in which we are the initiator.
+	case isDelayedOutput && c.hasCLTV():
+		witnessType = input.LeaseCommitmentToRemoteConfirmed
+
+	// A confirmed output to us on the remote commitment.
+	case isDelayedOutput:
+		witnessType = input.CommitmentToRemoteConfirmed
+
+	// A non-delayed output on the remote commitment where the key is
+	// tweakless.
+	case c.commitResolution.SelfOutputSignDesc.SingleTweak == nil:
+		witnessType = input.CommitSpendNoDelayTweakless
+
+	// A non-delayed output on the remote commitment where the key is
+	// tweaked.
+	default:
+		witnessType = input.CommitmentNoDelay
+	}
+
+	return witnessType, nil
+}

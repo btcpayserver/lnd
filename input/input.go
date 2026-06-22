@@ -6,7 +6,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -19,7 +19,7 @@ var EmptyOutPoint wire.OutPoint
 // construct a valid input within a sweeping transaction to sweep this
 // lingering UTXO.
 type Input interface {
-	// Outpoint returns the reference to the output being spent, used to
+	// OutPoint returns the reference to the output being spent, used to
 	// construct the corresponding transaction input.
 	OutPoint() wire.OutPoint
 
@@ -329,6 +329,25 @@ func MakeTaprootHtlcSucceedInput(op *wire.OutPoint, signDesc *SignDescriptor,
 
 	input := MakeBaseInput(
 		op, TaprootHtlcAcceptedRemoteSuccess, signDesc,
+		heightHint, nil, opts...,
+	)
+	input.blockToMaturity = blocksToMaturity
+
+	return HtlcSucceedInput{
+		inputKit: input.inputKit,
+		preimage: preimage,
+	}
+}
+
+// MakeTaprootHtlcSucceedInputFinal creates a new HtlcSucceedInput that can be
+// used to spend an HTLC output for a production taproot channel on the remote
+// party's commitment transaction.
+func MakeTaprootHtlcSucceedInputFinal(op *wire.OutPoint,
+	signDesc *SignDescriptor, preimage []byte, heightHint,
+	blocksToMaturity uint32, opts ...InputOpt) HtlcSucceedInput {
+
+	input := MakeBaseInput(
+		op, TaprootHtlcAcceptedRemoteSuccessFinal, signDesc,
 		heightHint, nil, opts...,
 	)
 	input.blockToMaturity = blocksToMaturity

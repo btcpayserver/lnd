@@ -7,6 +7,16 @@ INSERT INTO invoices (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
 ) RETURNING id;
 
+-- name: InsertMigratedInvoice :one
+INSERT INTO invoices (
+    hash, preimage, settle_index, settled_at, memo, amount_msat, cltv_delta, 
+    expiry, payment_addr, payment_request, payment_request_hash, state, 
+    amount_paid_msat, is_amp, is_hodl, is_keysend, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+) RETURNING id;
+
+
 -- name: InsertInvoiceFeature :exec
 INSERT INTO invoice_features (
     invoice_id, feature
@@ -19,81 +29,101 @@ SELECT *
 FROM invoice_features
 WHERE invoice_id = $1;
 
--- This method may return more than one invoice if filter using multiple fields
--- from different invoices. It is the caller's responsibility to ensure that 
--- we bubble up an error in those cases.
-
--- name: GetInvoice :many
+-- name: GetInvoiceByHash :one
 SELECT i.*
 FROM invoices i
-LEFT JOIN amp_sub_invoices a 
-ON i.id = a.invoice_id
-AND (
-    a.set_id = sqlc.narg('set_id') OR sqlc.narg('set_id') IS NULL
-)
-WHERE (
-    i.id = sqlc.narg('add_index') OR 
-    sqlc.narg('add_index') IS NULL
-) AND (
-    i.hash = sqlc.narg('hash') OR 
-    sqlc.narg('hash') IS NULL
-) AND (
-    i.preimage = sqlc.narg('preimage') OR 
-    sqlc.narg('preimage') IS NULL
-) AND (
-    i.payment_addr = sqlc.narg('payment_addr') OR 
-    sqlc.narg('payment_addr') IS NULL
-)
-GROUP BY i.id
-LIMIT 2;
+WHERE i.hash = $1;
+
+-- name: GetInvoiceByAddr :one
+SELECT i.*
+FROM invoices i
+WHERE i.payment_addr = $1;
 
 -- name: GetInvoiceBySetID :many
+-- TODO(ziggie): This query can only return one invoice if the set_id is 
+-- the primary key of amp_sub_invoices table.
 SELECT i.*
 FROM invoices i
 INNER JOIN amp_sub_invoices a 
 ON i.id = a.invoice_id AND a.set_id = $1;
 
--- name: FilterInvoices :many
+-- name: FetchPendingInvoices :many
+-- FetchPendingInvoices returns all invoices in a pending state (open or
+-- accepted). The invoices_state_idx index on the state column makes this a
+-- fast index scan rather than a full table scan. id_cursor is an exclusive
+-- lower bound on the primary key used for cursor-based pagination; the caller
+-- must supply 0 when starting from the beginning.
 SELECT
     invoices.*
 FROM invoices
-WHERE (
-    id >= sqlc.narg('add_index_get') OR 
-    sqlc.narg('add_index_get') IS NULL
-) AND (
-    id <= sqlc.narg('add_index_let') OR 
-    sqlc.narg('add_index_let') IS NULL
-) AND (
-    settle_index >= sqlc.narg('settle_index_get') OR
-    sqlc.narg('settle_index_get') IS NULL
-) AND (
-    settle_index <= sqlc.narg('settle_index_let') OR
-    sqlc.narg('settle_index_let') IS NULL
-) AND (
-    state = sqlc.narg('state') OR 
-    sqlc.narg('state') IS NULL
-) AND (
-    created_at >= sqlc.narg('created_after') OR
-    sqlc.narg('created_after') IS NULL
-) AND (
-    created_at < sqlc.narg('created_before') OR 
-    sqlc.narg('created_before') IS NULL
-) AND (
-    CASE
-        WHEN sqlc.narg('pending_only') = TRUE THEN (state = 0 OR state = 3)
-        ELSE TRUE 
-    END
-)
-ORDER BY
-CASE
-    WHEN sqlc.narg('reverse') = FALSE OR sqlc.narg('reverse') IS NULL THEN id
-    ELSE NULL
-    END ASC,
-CASE
-    WHEN sqlc.narg('reverse') = TRUE THEN id
-    ELSE NULL
-END DESC
-LIMIT @num_limit OFFSET @num_offset;
+WHERE state IN (0, 3) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND id > @id_cursor
+ORDER BY id ASC
+LIMIT @num_limit;
+
+-- name: FilterInvoicesBySettleIndex :many
+-- FilterInvoicesBySettleIndex returns settled invoices whose settle_index is
+-- greater than or equal to the given value, ordered by id. The caller must
+-- always supply a concrete lower bound so the invoices_settle_index_idx index
+-- can be used. id_cursor is an exclusive lower bound on the primary key used
+-- for cursor-based pagination; the caller must supply 0 when starting from
+-- the beginning.
+SELECT
+    invoices.*
+FROM invoices
+WHERE settle_index >= @settle_index_get
+  AND id > @id_cursor
+ORDER BY id ASC
+LIMIT @num_limit;
+
+-- name: FilterInvoicesByAddIndex :many
+-- FilterInvoicesByAddIndex returns invoices whose add_index (primary key id)
+-- is greater than or equal to the given value, ordered by id. Because id is
+-- the primary key, this is always an efficient range scan on the clustered
+-- index. For cursor-based pagination the caller advances add_index_get to
+-- last_returned_id + 1 on each subsequent page.
+SELECT
+    invoices.*
+FROM invoices
+WHERE id >= @add_index_get
+ORDER BY id ASC
+LIMIT @num_limit;
+
+-- name: FilterInvoicesForward :many
+-- FilterInvoicesForward returns invoices in ascending id order. All parameters
+-- are non-nullable so the planner always sees plain range predicates and can
+-- use the primary-key index. For cursor-based pagination the caller advances
+-- add_index_get to last_returned_id + 1 on each subsequent page. The caller
+-- is responsible for supplying Go-side defaults when a filter is not needed:
+--   add_index_get  → 1                             (first valid invoice id)
+--   created_after  → time.Unix(0, 0).UTC()         (epoch – before any invoice)
+--   created_before → time.Date(9999, …)             (far future – no upper cap)
+--   pending_only   → false                          (include all states)
+SELECT
+    invoices.*
+FROM invoices
+WHERE id >= @add_index_get
+  AND (NOT @pending_only OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND created_at >= @created_after
+  AND created_at < @created_before
+ORDER BY id ASC
+LIMIT @num_limit;
+
+-- name: FilterInvoicesReverse :many
+-- FilterInvoicesReverse is the descending counterpart of FilterInvoicesForward.
+-- It returns invoices in descending id order. For cursor-based pagination the
+-- caller advances add_index_let to last_returned_id - 1 on each subsequent
+-- page; pass math.MaxInt64 to start from the most recent invoice. See
+-- FilterInvoicesForward for the expected Go-side defaults.
+SELECT
+    invoices.*
+FROM invoices
+WHERE id <= @add_index_let
+  AND (NOT @pending_only OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND created_at >= @created_after
+  AND created_at < @created_before
+ORDER BY id DESC
+LIMIT @num_limit;
 
 -- name: UpdateInvoiceState :execresult
 UPDATE invoices
@@ -169,3 +199,23 @@ INSERT INTO invoice_htlc_custom_records (
 SELECT ihcr.htlc_id, key, value
 FROM invoice_htlcs ih JOIN invoice_htlc_custom_records ihcr ON ih.id=ihcr.htlc_id 
 WHERE ih.invoice_id = $1;
+
+-- name: InsertKVInvoiceKeyAndAddIndex :exec
+INSERT INTO invoice_payment_hashes (
+    id, add_index
+) VALUES (
+    $1, $2
+);
+
+-- name: SetKVInvoicePaymentHash :exec
+UPDATE invoice_payment_hashes
+SET hash = $2
+WHERE id = $1;
+
+-- name: GetKVInvoicePaymentHashByAddIndex :one
+SELECT hash
+FROM invoice_payment_hashes
+WHERE add_index = $1;
+
+-- name: ClearKVInvoiceHashIndex :exec
+DELETE FROM invoice_payment_hashes;

@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine as builder
+FROM golang:1.26.3-alpine as builder
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
@@ -14,11 +14,11 @@ WORKDIR /go/src/github.com/lightningnetwork/lnd
 COPY . .
 
 RUN make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc"
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc watchtowerrpc kvdb_sqlite"
 
 
 # Build loop binary
-RUN git clone --depth 1 --branch v0.29.0-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
+RUN git clone --depth 1 --branch v0.33.3-beta https://github.com/lightninglabs/loop.git /go/src/github.com/lightninglabs/loop
 WORKDIR /go/src/github.com/lightninglabs/loop/cmd
 
 
@@ -27,7 +27,7 @@ RUN go install ./...
 
 
 # Start a new, final image.
-FROM alpine:3.17.3 as final
+FROM alpine as final
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.

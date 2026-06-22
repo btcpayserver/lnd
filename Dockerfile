@@ -1,9 +1,6 @@
-# If you change this value, please change it in the following files as well:
-# /dev.Dockerfile
-# /make/builder.Dockerfile
-# /.github/workflows/main.yml
-# /.github/workflows/release.yml
-FROM golang:1.22.6-alpine as builder
+# If you change this please also update GO_VERSION in Makefile (then run
+# `make lint` to see where else it needs to be updated as well).
+FROM golang:1.26.3-alpine as builder
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
@@ -24,7 +21,7 @@ RUN apk add --no-cache --update alpine-sdk \
 &&  cd /go/src/github.com/lightningnetwork/lnd \
 &&  git checkout $checkout \
 &&  make release-install
-
+ 
 # Start a new, final image.
 FROM alpine as final
 
@@ -32,13 +29,13 @@ FROM alpine as final
 VOLUME /root/.lnd
 
 # Add utilities for quality of life and SSL-related reasons. We also require
-# curl and gpg for the signature verification script.
+# wget and gpg for the signature verification script.
 RUN apk --no-cache add \
     bash \
     jq \
     ca-certificates \
     gnupg \
-    curl
+    wget
 
 # Copy the binaries from the builder image.
 COPY --from=builder /go/bin/lncli /bin/

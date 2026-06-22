@@ -22,6 +22,7 @@ BUILD_DATE_STAMP="202001010000.00"
 function reproducible_tar_gzip() {
   local dir=$1
   local tar_cmd=tar
+  local gzip_cmd=gzip
 
   # MacOS has a version of BSD tar which doesn't support setting the --mtime
   # flag. We need gnu-tar, or gtar for short to be installed for this script to
@@ -38,12 +39,27 @@ function reproducible_tar_gzip() {
     tar_cmd=gtar
   fi
 
+  # On MacOS, the default BSD gzip produces a different output than the GNU
+  # gzip on Linux. To ensure reproducible builds, we need to use GNU gzip.
+  gzip_version=$(gzip --version 2>&1 || true)
+  if [[ ! "$gzip_version" =~ "GNU" ]]; then
+    if ! command -v "ggzip" >/dev/null 2>&1; then
+      echo "GNU gzip is required but cannot be found!"
+      echo "On MacOS please run 'brew install gzip' to install ggzip."
+      exit 1
+    fi
+
+    # We have ggzip installed, use that instead.
+    gzip_cmd=ggzip
+  fi
+
   # Pin down the timestamp time zone.
   export TZ=UTC
 
   find "${dir}" -print0 | LC_ALL=C sort -r -z | $tar_cmd \
     "--mtime=${BUILD_DATE}" --no-recursion --null --mode=u+rw,go+r-w,a+X \
-    --owner=0 --group=0 --numeric-owner -c -T - | gzip -9n > "${dir}.tar.gz"
+    --owner=0 --group=0 --numeric-owner -c -T - | $gzip_cmd \
+    -9n > "${dir}.tar.gz"
 
   rm -r "${dir}"
 }
@@ -98,7 +114,7 @@ function check_tag_correct() {
   fi
 
   # Build lnd to extract version.
-  env GOEXPERIMENT=loopvar go build ${PKG}/cmd/lnd
+  go build ${PKG}/cmd/lnd
 
   # Extract version command output.
   lnd_version_output=$(./lnd --version)
@@ -129,11 +145,23 @@ function check_tag_correct() {
 
 # build_release builds the actual release binaries.
 #   arguments: <version-tag> <build-system(s)> <build-tags> <ldflags>
+#              <go-version>
 function build_release() {
   local tag=$1
   local sys=$2
   local buildtags=$3
   local ldflags=$4
+  local goversion=$5
+
+  # Check if the active Go version matches the specified Go version.
+  active_go_version=$(go version | awk '{print $3}' | sed 's/go//')
+  if [ "$active_go_version" != "$goversion" ]; then
+    echo "Error: active Go version ($active_go_version) does not match \
+required Go version ($goversion)."
+    exit 1
+  fi
+
+  echo "Building release for tag $tag with Go version $goversion"
 
   green " - Packaging vendor"
   go mod vendor
@@ -177,9 +205,12 @@ function build_release() {
     pushd "${dir}"
 
     green " - Building: ${os} ${arch} ${arm} with build tags '${buildtags}'"
-    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lnd
-    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lncli
+    env CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lnd
+    env CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lncli
     popd
+
+    # Clear Go build cache to prevent disk space issues during multi-platform builds.
+    go clean -cache
 
     # Add the hashes for the individual binaries as well for easy verification
     # of a single installed binary.
@@ -202,7 +233,7 @@ function build_release() {
 function usage() {
   red "Usage: "
   red "release.sh check-tag <version-tag>"
-  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags>"
+  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags> <go-version>"
 }
 
 # Whatever sub command is passed in, we need at least 2 arguments.

@@ -10,7 +10,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -166,7 +166,7 @@ func genTaskTest(
 					PkScript: pkScript,
 				},
 				WitnessScript: scriptTree.RevocationLeaf.Script,
-				SignMethod:    input.TaprootScriptSpendSignMethod, //nolint:lll
+				SignMethod:    input.TaprootScriptSpendSignMethod, //nolint:ll
 				HashType:      txscript.SigHashDefault,
 				ControlBlock:  ctrlBytes,
 			}
@@ -217,7 +217,7 @@ func genTaskTest(
 					PubKey:     toRemotePK,
 				},
 				WitnessScript: scriptTree.SettleLeaf.Script,
-				SignMethod:    input.TaprootScriptSpendSignMethod, //nolint:lll
+				SignMethod:    input.TaprootScriptSpendSignMethod, //nolint:ll
 				Output: &wire.TxOut{
 					Value:    toRemoteAmt,
 					PkScript: pkScript,
@@ -652,7 +652,7 @@ func testBackupTask(t *testing.T, test backupTaskTest) {
 	hint, encBlob, err := task.craftSessionPayload(test.signer)
 	require.NoError(t, err, "unable to craft session payload")
 
-	// Verify that the breach hint matches the breach txid's prefix.
+	// Verify that the breach hint matches the prefix of SHA256(txid).
 	breachTxID := test.breachInfo.BreachTxHash
 	expHint := blob.NewBreachHintFromHash(&breachTxID)
 	require.Equal(t, expHint, hint)

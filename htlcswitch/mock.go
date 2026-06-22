@@ -5,10 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -19,14 +19,13 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/go-errors/errors"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -153,8 +152,10 @@ type mockServer struct {
 
 	t testing.TB
 
-	name     string
-	messages chan lnwire.Message
+	name             string
+	messages         chan lnwire.Message
+	protocolTraceMtx sync.Mutex
+	protocolTrace    []lnwire.Message
 
 	id         [33]byte
 	htlcSwitch *Switch
@@ -167,7 +168,7 @@ type mockServer struct {
 var _ lnpeer.Peer = (*mockServer)(nil)
 
 func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) {
-	signAliasUpdate := func(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+	signAliasUpdate := func(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 		error) {
 
 		return testSig, nil
@@ -183,9 +184,9 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 			events: make(map[time.Time]channeldb.ForwardingEvent),
 		},
 		FetchLastChannelUpdate: func(scid lnwire.ShortChannelID) (
-			*lnwire.ChannelUpdate, error) {
+			*lnwire.ChannelUpdate1, error) {
 
-			return &lnwire.ChannelUpdate{
+			return &lnwire.ChannelUpdate1{
 				ShortChannelID: scid,
 			}, nil
 		},
@@ -214,11 +215,7 @@ func initSwitchWithTempDB(t testing.TB, startingHeight uint32) (*Switch,
 	error) {
 
 	tempPath := filepath.Join(t.TempDir(), "switchdb")
-	db, err := channeldb.Open(tempPath)
-	if err != nil {
-		return nil, err
-	}
-	t.Cleanup(func() { db.Close() })
+	db := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(startingHeight, db)
 	if err != nil {
@@ -252,9 +249,7 @@ func newMockServer(t testing.TB, name string, startingHeight uint32,
 
 	t.Cleanup(func() { _ = htlcSwitch.Stop() })
 
-	registry := newMockRegistry(defaultDelta)
-
-	t.Cleanup(func() { registry.cleanup() })
+	registry := newMockRegistry(t)
 
 	return &mockServer{
 		t:                t,
@@ -289,6 +284,10 @@ func (s *mockServer) Start() error {
 		for {
 			select {
 			case msg := <-s.messages:
+				s.protocolTraceMtx.Lock()
+				s.protocolTrace = append(s.protocolTrace, msg)
+				s.protocolTraceMtx.Unlock()
+
 				var shouldSkip bool
 
 				for _, interceptor := range s.interceptorFuncs {
@@ -523,7 +522,7 @@ func (p *mockIteratorDecoder) DecodeHopIterator(r io.Reader, rHash []byte,
 }
 
 func (p *mockIteratorDecoder) DecodeHopIterators(id []byte,
-	reqs []hop.DecodeHopIteratorRequest) (
+	reqs []hop.DecodeHopIteratorRequest, _ bool) (
 	[]hop.DecodeHopIteratorResponse, error) {
 
 	idHash := sha256.Sum256(id)
@@ -626,6 +625,8 @@ func (s *mockServer) readHandler(message lnwire.Message) error {
 	case *lnwire.ChannelReestablish:
 		targetChan = msg.ChanID
 	case *lnwire.UpdateFee:
+		targetChan = msg.ChanID
+	case *lnwire.Stfu:
 		targetChan = msg.ChanID
 	default:
 		return fmt.Errorf("unknown message type: %T", msg)
@@ -735,7 +736,7 @@ type mockChannelLink struct {
 	checkHtlcForwardResult *LinkError
 
 	failAliasUpdate func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate
+		incoming bool) *lnwire.ChannelUpdate1
 
 	confirmedZC bool
 }
@@ -870,7 +871,7 @@ func (f *mockChannelLink) AttachMailBox(mailBox MailBox) {
 }
 
 func (f *mockChannelLink) attachFailAliasUpdate(closure func(
-	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate) {
+	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate1) {
 
 	f.failAliasUpdate = closure
 }
@@ -950,6 +951,14 @@ func (f *mockChannelLink) OnFlushedOnce(func()) {
 func (f *mockChannelLink) OnCommitOnce(LinkDirection, func()) {
 	// TODO(proofofkeags): Implement
 }
+func (f *mockChannelLink) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
+	// TODO(proofofkeags): Implement
+	c := make(chan fn.Result[lntypes.ChannelParty], 1)
+
+	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not implemented")
+
+	return c
+}
 
 func (f *mockChannelLink) FundingCustomBlob() fn.Option[tlv.Blob] {
 	return fn.None[tlv.Blob]()
@@ -967,33 +976,10 @@ func (f *mockChannelLink) AuxBandwidth(lnwire.MilliSatoshi,
 	lnwire.ShortChannelID,
 	fn.Option[tlv.Blob], AuxTrafficShaper) fn.Result[OptionalBandwidth] {
 
-	return fn.Ok(fn.None[lnwire.MilliSatoshi]())
+	return fn.Ok(OptionalBandwidth{})
 }
 
 var _ ChannelLink = (*mockChannelLink)(nil)
-
-func newDB() (*channeldb.DB, func(), error) {
-	// First, create a temporary directory to be used for the duration of
-	// this test.
-	tempDirName, err := os.MkdirTemp("", "channeldb")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Next, create channeldb for the first time.
-	cdb, err := channeldb.Open(tempDirName)
-	if err != nil {
-		os.RemoveAll(tempDirName)
-		return nil, nil, err
-	}
-
-	cleanUp := func() {
-		cdb.Close()
-		os.RemoveAll(tempDirName)
-	}
-
-	return cdb, cleanUp, nil
-}
 
 const testInvoiceCltvExpiry = 6
 
@@ -1001,8 +987,6 @@ type mockInvoiceRegistry struct {
 	settleChan chan lntypes.Hash
 
 	registry *invoices.InvoiceRegistry
-
-	cleanup func()
 }
 
 type mockChainNotifier struct {
@@ -1019,11 +1003,8 @@ func (m *mockChainNotifier) RegisterBlockEpochNtfn(*chainntnfs.BlockEpoch) (
 	}, nil
 }
 
-func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
-	cdb, cleanup, err := newDB()
-	if err != nil {
-		panic(err)
-	}
+func newMockRegistry(t testing.TB) *mockInvoiceRegistry {
+	cdb := channeldb.OpenForTesting(t, t.TempDir())
 
 	modifierMock := &invoices.MockHtlcModifier{}
 	registry := invoices.NewRegistry(
@@ -1041,7 +1022,6 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 
 	return &mockInvoiceRegistry{
 		registry: registry,
-		cleanup:  cleanup,
 	}
 }
 

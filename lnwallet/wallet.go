@@ -21,12 +21,12 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
@@ -733,7 +733,7 @@ func (l *LightningWallet) RegisterFundingIntent(expectedID [32]byte,
 	}
 
 	if _, ok := l.fundingIntents[expectedID]; ok {
-		return fmt.Errorf("%w: already has intent registered: %v",
+		return fmt.Errorf("%w: already has intent registered: %x",
 			ErrDuplicatePendingChanID, expectedID[:])
 	}
 
@@ -1718,7 +1718,7 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 			[]*input.Script, 0, len(ourContribution.Inputs),
 		)
 		for _, txIn := range fundingTx.TxIn {
-			_, err := l.FetchInputInfo(&txIn.PreviousOutPoint)
+			_, err := l.FetchOutpointInfo(&txIn.PreviousOutPoint)
 			if err != nil {
 				continue
 			}
@@ -1733,7 +1733,8 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 		}
 
 		walletLog.Tracef("Funding tx for ChannelPoint(%v) "+
-			"generated: %v", chanPoint, spew.Sdump(fundingTx))
+			"generated: %v", chanPoint,
+			lnutils.SpewLogClosure(fundingTx))
 	}
 
 	// If we landed here and didn't exit early, it means we already have
@@ -2001,9 +2002,9 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 	txsort.InPlaceSort(theirCommitTx)
 
 	walletLog.Tracef("Local commit tx for ChannelPoint(%v): %v",
-		chanPoint, spew.Sdump(ourCommitTx))
+		chanPoint, lnutils.SpewLogClosure(ourCommitTx))
 	walletLog.Tracef("Remote commit tx for ChannelPoint(%v): %v",
-		chanPoint, spew.Sdump(theirCommitTx))
+		chanPoint, lnutils.SpewLogClosure(theirCommitTx))
 
 	// Record newly available information within the open channel state.
 	chanState.FundingOutpoint = chanPoint
@@ -2449,9 +2450,9 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 	chanState.RemoteCommitment.CommitTx = theirCommitTx
 
 	walletLog.Debugf("Local commit tx for ChannelPoint(%v): %v",
-		req.fundingOutpoint, spew.Sdump(ourCommitTx))
+		req.fundingOutpoint, lnutils.SpewLogClosure(ourCommitTx))
 	walletLog.Debugf("Remote commit tx for ChannelPoint(%v): %v",
-		req.fundingOutpoint, spew.Sdump(theirCommitTx))
+		req.fundingOutpoint, lnutils.SpewLogClosure(theirCommitTx))
 
 	// With both commitment transactions created, we'll now verify their
 	// signature on our commitment.
@@ -2476,13 +2477,13 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 		fundingTxOut         *wire.TxOut
 	)
 	if chanType.IsTaproot() {
-		//nolint:lll
+		//nolint:ll
 		fundingWitnessScript, fundingTxOut, err = input.GenTaprootFundingScript(
 			ourKey.PubKey, theirKey.PubKey, channelValue,
 			pendingReservation.partialState.TapscriptRoot,
 		)
 	} else {
-		//nolint:lll
+		//nolint:ll
 		fundingWitnessScript, fundingTxOut, err = input.GenFundingPkScript(
 			ourKey.PubKey.SerializeCompressed(),
 			theirKey.PubKey.SerializeCompressed(), channelValue,
@@ -2741,7 +2742,7 @@ func (c *CoinSource) ListCoins(minConfs int32,
 // its outpoint. If the coin isn't under the control of the backing CoinSource,
 // then an error should be returned.
 func (c *CoinSource) CoinFromOutPoint(op wire.OutPoint) (*wallet.Coin, error) {
-	inputInfo, err := c.wallet.FetchInputInfo(&op)
+	inputInfo, err := c.wallet.FetchOutpointInfo(&op)
 	if err != nil {
 		return nil, err
 	}
@@ -2838,7 +2839,7 @@ func NewWalletPrevOutputFetcher(wc WalletController) *WalletPrevOutputFetcher {
 // passed outpoint. A nil value will be returned if the passed outpoint doesn't
 // exist.
 func (w *WalletPrevOutputFetcher) FetchPrevOutput(op wire.OutPoint) *wire.TxOut {
-	utxo, err := w.wc.FetchInputInfo(&op)
+	utxo, err := w.wc.FetchOutpointInfo(&op)
 	if err != nil {
 		return nil
 	}

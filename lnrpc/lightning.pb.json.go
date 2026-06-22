@@ -806,56 +806,6 @@ func RegisterLightningJSONCallbacks(registry map[string]func(ctx context.Context
 		callback(string(respBytes), nil)
 	}
 
-	registry["lnrpc.Lightning.SendPaymentSync"] = func(ctx context.Context,
-		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
-
-		req := &SendRequest{}
-		err := marshaler.Unmarshal([]byte(reqJSON), req)
-		if err != nil {
-			callback("", err)
-			return
-		}
-
-		client := NewLightningClient(conn)
-		resp, err := client.SendPaymentSync(ctx, req)
-		if err != nil {
-			callback("", err)
-			return
-		}
-
-		respBytes, err := marshaler.Marshal(resp)
-		if err != nil {
-			callback("", err)
-			return
-		}
-		callback(string(respBytes), nil)
-	}
-
-	registry["lnrpc.Lightning.SendToRouteSync"] = func(ctx context.Context,
-		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
-
-		req := &SendToRouteRequest{}
-		err := marshaler.Unmarshal([]byte(reqJSON), req)
-		if err != nil {
-			callback("", err)
-			return
-		}
-
-		client := NewLightningClient(conn)
-		resp, err := client.SendToRouteSync(ctx, req)
-		if err != nil {
-			callback("", err)
-			return
-		}
-
-		respBytes, err := marshaler.Marshal(resp)
-		if err != nil {
-			callback("", err)
-			return
-		}
-		callback(string(respBytes), nil)
-	}
-
 	registry["lnrpc.Lightning.AddInvoice"] = func(ctx context.Context,
 		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
 
@@ -971,6 +921,31 @@ func RegisterLightningJSONCallbacks(registry map[string]func(ctx context.Context
 				callback(string(respBytes), nil)
 			}
 		}()
+	}
+
+	registry["lnrpc.Lightning.DeleteCanceledInvoice"] = func(ctx context.Context,
+		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
+
+		req := &DelCanceledInvoiceReq{}
+		err := marshaler.Unmarshal([]byte(reqJSON), req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		client := NewLightningClient(conn)
+		resp, err := client.DeleteCanceledInvoice(ctx, req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		respBytes, err := marshaler.Marshal(resp)
+		if err != nil {
+			callback("", err)
+			return
+		}
+		callback(string(respBytes), nil)
 	}
 
 	registry["lnrpc.Lightning.DecodePayReq"] = func(ctx context.Context,
@@ -1694,6 +1669,73 @@ func RegisterLightningJSONCallbacks(registry map[string]func(ctx context.Context
 
 		client := NewLightningClient(conn)
 		stream, err := client.SubscribeCustomMessages(ctx, req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		go func() {
+			for {
+				select {
+				case <-stream.Context().Done():
+					callback("", stream.Context().Err())
+					return
+				default:
+				}
+
+				resp, err := stream.Recv()
+				if err != nil {
+					callback("", err)
+					return
+				}
+
+				respBytes, err := marshaler.Marshal(resp)
+				if err != nil {
+					callback("", err)
+					return
+				}
+				callback(string(respBytes), nil)
+			}
+		}()
+	}
+
+	registry["lnrpc.Lightning.SendOnionMessage"] = func(ctx context.Context,
+		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
+
+		req := &SendOnionMessageRequest{}
+		err := marshaler.Unmarshal([]byte(reqJSON), req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		client := NewLightningClient(conn)
+		resp, err := client.SendOnionMessage(ctx, req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		respBytes, err := marshaler.Marshal(resp)
+		if err != nil {
+			callback("", err)
+			return
+		}
+		callback(string(respBytes), nil)
+	}
+
+	registry["lnrpc.Lightning.SubscribeOnionMessages"] = func(ctx context.Context,
+		conn *grpc.ClientConn, reqJSON string, callback func(string, error)) {
+
+		req := &SubscribeOnionMessagesRequest{}
+		err := marshaler.Unmarshal([]byte(reqJSON), req)
+		if err != nil {
+			callback("", err)
+			return
+		}
+
+		client := NewLightningClient(conn)
+		stream, err := client.SubscribeOnionMessages(ctx, req)
 		if err != nil {
 			callback("", err)
 			return

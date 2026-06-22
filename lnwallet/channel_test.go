@@ -20,13 +20,14 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/txsort"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -66,8 +67,8 @@ func addAndReceiveHTLC(t *testing.T, channel1, channel2 *LightningChannel,
 }
 
 func assertOutputExistsByValue(t *testing.T, commitTx *wire.MsgTx,
-	value btcutil.Amount,
-) {
+	value btcutil.Amount) {
+
 	for _, txOut := range commitTx.TxOut {
 		if txOut.Value == int64(value) {
 			return
@@ -82,8 +83,8 @@ func assertOutputExistsByValue(t *testing.T, commitTx *wire.MsgTx,
 // add, the settle an HTLC between themselves.
 func testAddSettleWorkflow(t *testing.T, tweakless bool,
 	chanTypeModifier channeldb.ChannelType,
-	storeFinalHtlcResolutions bool,
-) {
+	storeFinalHtlcResolutions bool) {
+
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
@@ -535,6 +536,7 @@ func TestCheckCommitTxSize(t *testing.T) {
 		if 0 > diff || BaseCommitmentTxSizeEstimationError < diff {
 			t.Fatalf("estimation is wrong, diff: %v", diff)
 		}
+
 	}
 
 	// Create a test channel which will be used for the duration of this
@@ -729,9 +731,12 @@ func TestCommitHTLCSigCustomRecordSize(t *testing.T) {
 
 		// Replace the default PackSigs implementation to return a
 		// large custom records blob.
-		mockSigner.ExpectedCalls = fn.Filter(func(c *mock.Call) bool {
-			return c.Method != "PackSigs"
-		}, mockSigner.ExpectedCalls)
+		mockSigner.ExpectedCalls = fn.Filter(
+			mockSigner.ExpectedCalls,
+			func(c *mock.Call) bool {
+				return c.Method != "PackSigs"
+			},
+		)
 		mockSigner.On("PackSigs", mock.Anything).
 			Return(fn.Ok(fn.Some(largeBlob)))
 	})
@@ -766,29 +771,66 @@ func TestCommitHTLCSigCustomRecordSize(t *testing.T) {
 }
 
 // TestCooperativeChannelClosure checks that the coop close process finishes
-// with an agreement from both parties, and that the final balances of the
-// close tx check out.
+// with an agreement from both parties, and that the final balances of the close
+// tx check out.
 func TestCooperativeChannelClosure(t *testing.T) {
-	t.Run("tweakless", func(t *testing.T) {
-		testCoopClose(t, &coopCloseTestCase{
-			chanType: channeldb.SingleFunderTweaklessBit,
+	testCases := []struct {
+		name      string
+		closeCase coopCloseTestCase
+	}{
+		{
+			name: "tweakless",
+			closeCase: coopCloseTestCase{
+				chanType: channeldb.SingleFunderTweaklessBit,
+			},
+		},
+		{
+			name: "anchors",
+			closeCase: coopCloseTestCase{
+				chanType: channeldb.SingleFunderTweaklessBit |
+					channeldb.AnchorOutputsBit,
+				anchorAmt: AnchorSize * 2,
+			},
+		},
+		{
+			name: "anchors local pay",
+			closeCase: coopCloseTestCase{
+				chanType: channeldb.SingleFunderTweaklessBit |
+					channeldb.AnchorOutputsBit,
+				anchorAmt:   AnchorSize * 2,
+				customPayer: fn.Some(lntypes.Local),
+			},
+		},
+		{
+			name: "anchors remote pay",
+			closeCase: coopCloseTestCase{
+				chanType: channeldb.SingleFunderTweaklessBit |
+					channeldb.AnchorOutputsBit,
+				anchorAmt:   AnchorSize * 2,
+				customPayer: fn.Some(lntypes.Remote),
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testCoopClose(t, testCase.closeCase)
 		})
-	})
-	t.Run("anchors", func(t *testing.T) {
-		testCoopClose(t, &coopCloseTestCase{
-			chanType: channeldb.SingleFunderTweaklessBit |
-				channeldb.AnchorOutputsBit,
-			anchorAmt: AnchorSize * 2,
-		})
-	})
+	}
 }
 
 type coopCloseTestCase struct {
 	chanType  channeldb.ChannelType
 	anchorAmt btcutil.Amount
+
+	customPayer fn.Option[lntypes.ChannelParty]
 }
 
-func testCoopClose(t *testing.T, testCase *coopCloseTestCase) {
+type closeOpts struct {
+	aliceOpts []ChanCloseOpt
+	bobOpts   []ChanCloseOpt
+}
+
+func testCoopClose(t *testing.T, testCase coopCloseTestCase) {
 	t.Parallel()
 
 	// Create a test channel which will be used for the duration of this
@@ -809,17 +851,38 @@ func testCoopClose(t *testing.T, testCase *coopCloseTestCase) {
 		bobChannel.channelState.LocalCommitment.FeePerKw,
 	)
 
+	customPayer := testCase.customPayer
+
+	closeOpts := fn.MapOptionZ(
+		customPayer, func(payer lntypes.ChannelParty) closeOpts {
+			// If the local party is paying then from Alice's PoV,
+			// then local party is paying. From Bob's PoV, the
+			// remote party is paying. If the remote party is, then
+			// the opposite is true.
+			return closeOpts{
+				aliceOpts: []ChanCloseOpt{
+					WithCustomPayer(payer),
+				},
+				bobOpts: []ChanCloseOpt{
+					WithCustomPayer(payer.CounterParty()),
+				},
+			}
+		},
+	)
+
 	// We'll start with both Alice and Bob creating a new close proposal
 	// with the same fee.
 	aliceFee := aliceChannel.CalcFee(aliceFeeRate)
 	aliceSig, _, _, err := aliceChannel.CreateCloseProposal(
 		aliceFee, aliceDeliveryScript, bobDeliveryScript,
+		closeOpts.aliceOpts...,
 	)
 	require.NoError(t, err, "unable to create alice coop close proposal")
 
 	bobFee := bobChannel.CalcFee(bobFeeRate)
 	bobSig, _, _, err := bobChannel.CreateCloseProposal(
 		bobFee, bobDeliveryScript, aliceDeliveryScript,
+		closeOpts.bobOpts...,
 	)
 	require.NoError(t, err, "unable to create bob coop close proposal")
 
@@ -828,14 +891,14 @@ func testCoopClose(t *testing.T, testCase *coopCloseTestCase) {
 	// transaction is well formed, and the signatures verify.
 	aliceCloseTx, bobTxBalance, err := bobChannel.CompleteCooperativeClose(
 		bobSig, aliceSig, bobDeliveryScript, aliceDeliveryScript,
-		bobFee,
+		bobFee, closeOpts.bobOpts...,
 	)
 	require.NoError(t, err, "unable to complete alice cooperative close")
 	bobCloseSha := aliceCloseTx.TxHash()
 
 	bobCloseTx, aliceTxBalance, err := aliceChannel.CompleteCooperativeClose(
 		aliceSig, bobSig, aliceDeliveryScript, bobDeliveryScript,
-		aliceFee,
+		aliceFee, closeOpts.aliceOpts...,
 	)
 	require.NoError(t, err, "unable to complete bob cooperative close")
 	aliceCloseSha := bobCloseTx.TxHash()
@@ -844,18 +907,43 @@ func testCoopClose(t *testing.T, testCase *coopCloseTestCase) {
 		t.Fatalf("alice and bob close transactions don't match: %v", err)
 	}
 
-	// Finally, make sure the final balances are correct from both's
-	// perspective.
+	type chanFees struct {
+		alice btcutil.Amount
+		bob   btcutil.Amount
+	}
+
+	// Compute the closing fees for each party. If not specified, Alice will
+	// always pay the fees. Otherwise, it depends on who the payer is.
+	closeFees := fn.MapOption(func(payer lntypes.ChannelParty) chanFees {
+		var alice, bob btcutil.Amount
+
+		switch payer {
+		case lntypes.Local:
+			alice = bobFee
+			bob = 0
+		case lntypes.Remote:
+			bob = bobFee
+			alice = 0
+		}
+
+		return chanFees{
+			alice: alice,
+			bob:   bob,
+		}
+	})(testCase.customPayer).UnwrapOr(chanFees{alice: bobFee})
+
+	// Finally, make sure the final balances are correct from both
+	// perspectives.
 	aliceBalance := aliceChannel.channelState.LocalCommitment.
 		LocalBalance.ToSatoshis()
 
-	// The commit balance have had the initiator's (Alice) commitfee and
+	// The commit balance have had the initiator's (Alice) commit fee and
 	// any anchors subtracted, so add that back to the final expected
 	// balance. Alice also pays the coop close fee, so that must be
 	// subtracted.
 	commitFee := aliceChannel.channelState.LocalCommitment.CommitFee
 	expBalanceAlice := aliceBalance + commitFee +
-		testCase.anchorAmt - bobFee
+		testCase.anchorAmt - closeFees.alice
 	if aliceTxBalance != expBalanceAlice {
 		t.Fatalf("expected balance %v got %v", expBalanceAlice,
 			aliceTxBalance)
@@ -864,7 +952,7 @@ func testCoopClose(t *testing.T, testCase *coopCloseTestCase) {
 	// Bob is not the initiator, so his final balance should simply be
 	// equal to the latest commitment balance.
 	expBalanceBob := bobChannel.channelState.LocalCommitment.
-		LocalBalance.ToSatoshis()
+		LocalBalance.ToSatoshis() - closeFees.bob
 	if bobTxBalance != expBalanceBob {
 		t.Fatalf("expected bob's balance to be %v got %v",
 			expBalanceBob, bobTxBalance)
@@ -1540,8 +1628,8 @@ func TestHTLCSigNumber(t *testing.T) {
 	// createChanWithHTLC is a helper method that sets ut two channels, and
 	// adds HTLCs with the passed values to the channels.
 	createChanWithHTLC := func(htlcValues ...btcutil.Amount) (
-		*LightningChannel, *LightningChannel,
-	) {
+		*LightningChannel, *LightningChannel) {
+
 		// Create a test channel funded evenly with Alice having 5 BTC,
 		// and Bob having 5 BTC. Alice's dustlimit is 200 sat, while
 		// Bob has 1300 sat.
@@ -2363,6 +2451,72 @@ func TestCooperativeCloseDustAdherence(t *testing.T) {
 	}
 }
 
+// TestCooperativeCloseOpReturn tests that if either party's script is an
+// OP_RETURN script, then we'll set their output value as zero on the closing
+// transaction.
+func TestCooperativeCloseOpReturn(t *testing.T) {
+	t.Parallel()
+
+	// Create a test channel which will be used for the duration of this
+	// unittest. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	// Alice will have a "normal" looking script, while Bob will have a
+	// script that's just an OP_RETURN.
+	aliceDeliveryScript := bobsPrivKey
+	bobDeliveryScript := []byte{txscript.OP_RETURN}
+
+	aliceFeeRate := chainfee.SatPerKWeight(
+		aliceChannel.channelState.LocalCommitment.FeePerKw,
+	)
+	aliceFee := aliceChannel.CalcFee(aliceFeeRate) + 1000
+
+	assertBobOpReturn := func(tx *wire.MsgTx) {
+		// We should still have two outputs on the commitment
+		// transaction, as Alice's is non-dust.
+		require.Len(t, tx.TxOut, 2)
+
+		// We should find that Bob's output has a zero value.
+		bobTxOut := fn.Filter(tx.TxOut, func(txOut *wire.TxOut) bool {
+			return bytes.Equal(txOut.PkScript, bobDeliveryScript)
+		})
+		require.Len(t, bobTxOut, 1)
+
+		require.True(t, bobTxOut[0].Value == 0)
+	}
+
+	// Next, we'll make a new co-op close proposal, initiated by Alice.
+	aliceSig, closeTxAlice, _, err := aliceChannel.CreateCloseProposal(
+		aliceFee, aliceDeliveryScript, bobDeliveryScript,
+		// We use a custom sequence as this rule only applies to the RBF
+		// coop channel type.
+		WithCustomSequence(mempool.MaxRBFSequence),
+	)
+	require.NoError(t, err, "unable to close channel")
+
+	assertBobOpReturn(closeTxAlice)
+
+	bobSig, _, _, err := bobChannel.CreateCloseProposal(
+		aliceFee, bobDeliveryScript, aliceDeliveryScript,
+		WithCustomSequence(mempool.MaxRBFSequence),
+	)
+	require.NoError(t, err, "unable to close channel")
+
+	// We should now be able to complete the cooperative channel closure,
+	// finding that the close tx still only has a single output.
+	closeTx, _, err := bobChannel.CompleteCooperativeClose(
+		bobSig, aliceSig, bobDeliveryScript, aliceDeliveryScript,
+		aliceFee, WithCustomSequence(mempool.MaxRBFSequence),
+	)
+	require.NoError(t, err, "unable to accept channel close")
+
+	assertBobOpReturn(closeTx)
+}
+
 // TestUpdateFeeAdjustments tests that the state machine is able to properly
 // accept valid fee changes, as well as reject any invalid fee updates.
 func TestUpdateFeeAdjustments(t *testing.T) {
@@ -2445,6 +2599,7 @@ func TestUpdateFeeFail(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected bob to fail receiving alice's signature")
 	}
+
 }
 
 // TestUpdateFeeConcurrentSig tests that the channel can properly handle a fee
@@ -2614,6 +2769,7 @@ func TestUpdateFeeSenderCommits(t *testing.T) {
 	// Bob receives revocation from Alice.
 	_, _, err = bobChannel.ReceiveRevocation(aliceRevocation)
 	require.NoError(t, err, "bob unable to process alice's revocation")
+
 }
 
 // TestUpdateFeeReceiverCommits tests that the state machine progresses as
@@ -2914,12 +3070,35 @@ func TestAddHTLCNegativeBalance(t *testing.T) {
 	require.ErrorIs(t, err, ErrBelowChanReserve)
 }
 
+// extractCommitmentNonce extracts the commitment nonce from a
+// ChannelReestablish message, prioritizing LocalNonces over the legacy
+// LocalNonce field. The fundingTxid is used to look up the correct nonce
+// in the LocalNonces map.
+func extractCommitmentNonce(t *testing.T,
+	msg *lnwire.ChannelReestablish,
+	fundingTxid chainhash.Hash) lnwire.Musig2Nonce {
+
+	// Prefer LocalNonces if present, doing a keyed lookup by funding
+	// TXID.
+	if msg.LocalNonces.IsSome() {
+		noncesData := msg.LocalNonces.UnwrapOrFail(t)
+
+		nonce, ok := noncesData.NoncesMap[fundingTxid]
+		require.True(t, ok, "LocalNonces missing funding txid")
+
+		return nonce
+	}
+
+	// Fall back to legacy LocalNonce field.
+	return msg.LocalNonce.UnwrapOrFailV(t)
+}
+
 // assertNoChanSyncNeeded is a helper function that asserts that upon restart,
 // two channels conclude that they're fully synchronized and don't need to
 // retransmit any new messages.
 func assertNoChanSyncNeeded(t *testing.T, aliceChannel *LightningChannel,
-	bobChannel *LightningChannel,
-) {
+	bobChannel *LightningChannel) {
+
 	_, _, line, _ := runtime.Caller(1)
 
 	aliceChanSyncMsg, err := aliceChannel.channelState.ChanSyncMsg()
@@ -2934,13 +3113,19 @@ func assertNoChanSyncNeeded(t *testing.T, aliceChannel *LightningChannel,
 	}
 
 	// For taproot channels, simulate the link/peer binding the generated
-	// nonces.
+	// nonces. Use helper to extract nonces from either LocalNonces or
+	// LocalNonce.
 	if aliceChannel.channelState.ChanType.IsTaproot() {
+		fundingTxid := aliceChannel.channelState.FundingOutpoint.Hash
 		aliceChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: aliceChanSyncMsg.LocalNonce.UnwrapOrFailV(t),
+			PubNonce: extractCommitmentNonce(
+				t, aliceChanSyncMsg, fundingTxid,
+			),
 		}
 		bobChannel.pendingVerificationNonce = &musig2.Nonces{
-			PubNonce: bobChanSyncMsg.LocalNonce.UnwrapOrFailV(t),
+			PubNonce: extractCommitmentNonce(
+				t, bobChanSyncMsg, fundingTxid,
+			),
 		}
 	}
 
@@ -3076,7 +3261,9 @@ func restartChannel(channelOld *LightningChannel) (*LightningChannel, error) {
 // he receives Alice's CommitSig message, then Alice concludes that she needs
 // to re-send the CommitDiff. After the diff has been sent, both nodes should
 // resynchronize and be able to complete the dangling commit.
-func testChanSyncOweCommitment(t *testing.T, chanType channeldb.ChannelType) {
+func testChanSyncOweCommitment(t *testing.T,
+	chanType channeldb.ChannelType, noop bool) {
+
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
@@ -3085,6 +3272,17 @@ func testChanSyncOweCommitment(t *testing.T, chanType channeldb.ChannelType) {
 
 	var fakeOnionBlob [lnwire.OnionPacketSize]byte
 	copy(fakeOnionBlob[:], bytes.Repeat([]byte{0x05}, lnwire.OnionPacketSize))
+
+	// Let's create the noop add TLV record. This will only be
+	// effective for channels that have a tapscript root.
+	noopRecord := tlv.NewPrimitiveRecord[NoOpHtlcTLVType, bool](true)
+	records, err := tlv.RecordsToMap([]tlv.Record{noopRecord.Record()})
+	require.NoError(t, err)
+
+	// If the noop flag is not set for this test, nullify the records.
+	if !noop {
+		records = nil
+	}
 
 	// We'll start off the scenario with Bob sending 3 HTLC's to Alice in a
 	// single state update.
@@ -3095,10 +3293,11 @@ func testChanSyncOweCommitment(t *testing.T, chanType channeldb.ChannelType) {
 	for i := 0; i < 3; i++ {
 		rHash := sha256.Sum256(bobPreimage[:])
 		h := &lnwire.UpdateAddHTLC{
-			PaymentHash: rHash,
-			Amount:      htlcAmt,
-			Expiry:      uint32(10),
-			OnionBlob:   fakeOnionBlob,
+			PaymentHash:   rHash,
+			Amount:        htlcAmt,
+			Expiry:        uint32(10),
+			OnionBlob:     fakeOnionBlob,
+			CustomRecords: records,
 		}
 
 		htlcIndex, err := bobChannel.AddHTLC(h, nil)
@@ -3134,15 +3333,17 @@ func testChanSyncOweCommitment(t *testing.T, chanType channeldb.ChannelType) {
 			t.Fatalf("unable to settle htlc: %v", err)
 		}
 	}
+
 	var alicePreimage [32]byte
 	copy(alicePreimage[:], bytes.Repeat([]byte{0xaa}, 32))
 	rHash := sha256.Sum256(alicePreimage[:])
 	aliceHtlc := &lnwire.UpdateAddHTLC{
-		ChanID:      chanID,
-		PaymentHash: rHash,
-		Amount:      htlcAmt,
-		Expiry:      uint32(10),
-		OnionBlob:   fakeOnionBlob,
+		ChanID:        chanID,
+		PaymentHash:   rHash,
+		Amount:        htlcAmt,
+		Expiry:        uint32(10),
+		OnionBlob:     fakeOnionBlob,
+		CustomRecords: records,
 	}
 	aliceHtlcIndex, err := aliceChannel.AddHTLC(aliceHtlc, nil)
 	require.NoError(t, err, "unable to add alice's htlc")
@@ -3363,23 +3564,207 @@ func testChanSyncOweCommitment(t *testing.T, chanType channeldb.ChannelType) {
 
 	// At this point, the final balances of both parties should properly
 	// reflect the amount of HTLC's sent.
-	bobMsatSent := numBobHtlcs * htlcAmt
-	if aliceChannel.channelState.TotalMSatSent != htlcAmt {
-		t.Fatalf("wrong value for msat sent: expected %v, got %v",
-			htlcAmt, aliceChannel.channelState.TotalMSatSent)
+	if noop {
+		// If this test-case includes noop HTLCs, then we don't expect
+		// any balance changes.
+		require.Zero(t, aliceChannel.channelState.TotalMSatSent)
+		require.Zero(t, aliceChannel.channelState.TotalMSatReceived)
+		require.Zero(t, bobChannel.channelState.TotalMSatSent)
+		require.Zero(t, bobChannel.channelState.TotalMSatReceived)
+	} else {
+		// Otherwise, calculate the expected changes and assert them.
+		bobMsatSent := numBobHtlcs * htlcAmt
+
+		aliceChan := aliceChannel.channelState
+		bobChan := bobChannel.channelState
+
+		require.Equal(t, aliceChan.TotalMSatSent, htlcAmt)
+		require.Equal(t, aliceChan.TotalMSatReceived, bobMsatSent)
+
+		require.Equal(t, bobChan.TotalMSatSent, bobMsatSent)
+		require.Equal(t, bobChan.TotalMSatReceived, htlcAmt)
 	}
-	if aliceChannel.channelState.TotalMSatReceived != bobMsatSent {
-		t.Fatalf("wrong value for msat recv: expected %v, got %v",
-			bobMsatSent, aliceChannel.channelState.TotalMSatReceived)
-	}
-	if bobChannel.channelState.TotalMSatSent != bobMsatSent {
-		t.Fatalf("wrong value for msat sent: expected %v, got %v",
-			bobMsatSent, bobChannel.channelState.TotalMSatSent)
-	}
-	if bobChannel.channelState.TotalMSatReceived != htlcAmt {
-		t.Fatalf("wrong value for msat recv: expected %v, got %v",
-			htlcAmt, bobChannel.channelState.TotalMSatReceived)
-	}
+}
+
+// TestChanSyncTaprootLocalNonces tests the nonce synchronization behavior for
+// taproot channels. The nonce field populated is auto-detected from the
+// channel type:
+// - Staging taproot: only LocalNonce is populated (legacy format).
+// - Final taproot: only LocalNonces map is populated (map format).
+func TestChanSyncTaprootLocalNonces(t *testing.T) {
+	t.Parallel()
+
+	// Staging taproot channels use the legacy single nonce field.
+	t.Run(
+		"staging channel populates LocalNonce",
+		func(t *testing.T) {
+			chanType := channeldb.SimpleTaprootFeatureBit
+			aliceChannel, bobChannel, err := CreateTestChannels(
+				t, chanType,
+			)
+			require.NoError(t, err)
+
+			assertNoChanSyncNeeded(t, aliceChannel, bobChannel)
+
+			aliceChanSyncMsg, err :=
+				aliceChannel.channelState.ChanSyncMsg()
+			require.NoError(t, err)
+			bobChanSyncMsg, err :=
+				bobChannel.channelState.ChanSyncMsg()
+			require.NoError(t, err)
+
+			// Only LocalNonce should be populated.
+			require.True(t, aliceChanSyncMsg.LocalNonce.IsSome())
+			require.True(t, aliceChanSyncMsg.LocalNonces.IsNone())
+			require.True(t, bobChanSyncMsg.LocalNonce.IsSome())
+			require.True(t, bobChanSyncMsg.LocalNonces.IsNone())
+		},
+	)
+
+	// Final taproot channels use the map-based nonce field.
+	t.Run("final channel populates LocalNonces", func(t *testing.T) {
+		chanType := channeldb.SimpleTaprootFeatureBit |
+			channeldb.TaprootFinalBit
+		aliceChannel, _, err := CreateTestChannels(t, chanType)
+		require.NoError(t, err)
+
+		aliceChanSyncMsg, err := aliceChannel.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+
+		// Only LocalNonces should be populated.
+		require.True(t, aliceChanSyncMsg.LocalNonce.IsNone())
+		require.True(t, aliceChanSyncMsg.LocalNonces.IsSome())
+
+		noncesData := aliceChanSyncMsg.LocalNonces.UnwrapOrFail(t)
+		require.Len(t, noncesData.NoncesMap, 1)
+	})
+
+	t.Run("sync with final channel LocalNonces", func(t *testing.T) {
+		chanType := channeldb.SimpleTaprootFeatureBit |
+			channeldb.TaprootFinalBit
+		aliceChannel, bobChannel, err := CreateTestChannels(
+			t, chanType,
+		)
+		require.NoError(t, err)
+
+		fundingTxid := aliceChannel.channelState.FundingOutpoint.Hash
+
+		// Both channels are final, so both use map nonces.
+		aliceChanSyncMsg, err := aliceChannel.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+		bobChanSyncMsg, err := bobChannel.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+
+		bobChannel.pendingVerificationNonce = &musig2.Nonces{
+			PubNonce: extractCommitmentNonce(
+				t, bobChanSyncMsg, fundingTxid,
+			),
+		}
+
+		// Bob should be able to process Alice's message with only
+		// LocalNonces.
+		bobMsgsToSend, _, _, err := bobChannel.ProcessChanSyncMsg(
+			ctxb, aliceChanSyncMsg,
+		)
+		require.NoError(t, err)
+		require.Empty(t, bobMsgsToSend)
+	})
+
+	t.Run("sync with only legacy LocalNonce field", func(t *testing.T) {
+		chanType := channeldb.SimpleTaprootFeatureBit
+		aliceChan, bobChan, err := CreateTestChannels(t, chanType)
+		require.NoError(t, err)
+
+		fundTxid := aliceChan.channelState.FundingOutpoint.Hash
+
+		aliceChanSyncMsg, err := aliceChan.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+		bobChanSyncMsg, err := bobChan.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+
+		// Simulate an older peer that only sends LocalNonce.
+		aliceModifiedMsg := *aliceChanSyncMsg
+		aliceModifiedMsg.LocalNonces = lnwire.OptLocalNonces{}
+
+		bobChan.pendingVerificationNonce = &musig2.Nonces{
+			PubNonce: extractCommitmentNonce(
+				t, bobChanSyncMsg, fundTxid,
+			),
+		}
+
+		bobMsgsToSend, _, _, err := bobChan.ProcessChanSyncMsg(
+			ctxb, &aliceModifiedMsg,
+		)
+		require.NoError(t, err)
+		require.Empty(t, bobMsgsToSend)
+	})
+
+	t.Run("error when LocalNonces missing txid", func(t *testing.T) {
+		chanType := channeldb.SimpleTaprootFeatureBit
+		aliceChan, bobChan, err := CreateTestChannels(t, chanType)
+		require.NoError(t, err)
+
+		fundTxid := aliceChan.channelState.FundingOutpoint.Hash
+
+		aliceChanSyncMsg, err := aliceChan.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+		bobChanSyncMsg, err := bobChan.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+
+		// Use a wrong txid in the LocalNonces map.
+		wrongTxid := chainhash.Hash{0xff, 0xff}
+		nonce := extractCommitmentNonce(
+			t, aliceChanSyncMsg, fundTxid,
+		)
+		aliceModifiedMsg := *aliceChanSyncMsg
+		noncesMap := map[chainhash.Hash]lnwire.Musig2Nonce{
+			wrongTxid: nonce,
+		}
+		aliceModifiedMsg.LocalNonces = lnwire.SomeLocalNonces(
+			lnwire.LocalNoncesData{NoncesMap: noncesMap},
+		)
+
+		bobChan.pendingVerificationNonce = &musig2.Nonces{
+			PubNonce: extractCommitmentNonce(
+				t, bobChanSyncMsg, fundTxid,
+			),
+		}
+
+		_, _, _, err = bobChan.ProcessChanSyncMsg(
+			ctxb, &aliceModifiedMsg,
+		)
+		require.Error(t, err)
+		require.Contains(
+			t, err.Error(),
+			"missing nonce for funding txid",
+		)
+	})
+
+	t.Run("error when both fields missing", func(t *testing.T) {
+		chanType := channeldb.SimpleTaprootFeatureBit
+		aliceChan, _, err := CreateTestChannels(t, chanType)
+		require.NoError(t, err)
+
+		aliceChanSyncMsg, err := aliceChan.channelState.ChanSyncMsg()
+		require.NoError(t, err)
+
+		aliceEmptyMsg := *aliceChanSyncMsg
+		aliceEmptyMsg.LocalNonce = lnwire.OptMusig2NonceTLV{}
+		aliceEmptyMsg.LocalNonces = lnwire.OptLocalNonces{}
+
+		// Create a bob to process against.
+		_, bobChan, err := CreateTestChannels(t, chanType)
+		require.NoError(t, err)
+
+		_, _, _, err = bobChan.ProcessChanSyncMsg(
+			ctxb, &aliceEmptyMsg,
+		)
+		require.Error(t, err)
+		require.Contains(
+			t, err.Error(),
+			"remote verification nonce not sent",
+		)
+	})
 }
 
 // TestChanSyncOweCommitment tests that if Bob restarts (and then Alice) before
@@ -3392,6 +3777,7 @@ func TestChanSyncOweCommitment(t *testing.T) {
 	testCases := []struct {
 		name     string
 		chanType channeldb.ChannelType
+		noop     bool
 	}{
 		{
 			name:     "tweakless",
@@ -3408,10 +3794,25 @@ func TestChanSyncOweCommitment(t *testing.T) {
 				channeldb.AnchorOutputsBit |
 				channeldb.SimpleTaprootFeatureBit,
 		},
+		{
+			name: "taproot with tapscript root",
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.SimpleTaprootFeatureBit |
+				channeldb.TapscriptRootBit,
+		},
+		{
+			name: "tapscript root with noop",
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.SimpleTaprootFeatureBit |
+				channeldb.TapscriptRootBit,
+			noop: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			testChanSyncOweCommitment(t, tc.chanType)
+			testChanSyncOweCommitment(t, tc.chanType, tc.noop)
 		})
 	}
 }
@@ -3645,7 +4046,7 @@ func TestQuitDuringSignNextCommitment(t *testing.T) {
 	)
 
 	quitDelay := time.Millisecond * 20
-	quit, quitFunc := context.WithCancel(context.Background())
+	quit, quitFunc := context.WithCancel(t.Context())
 
 	// Alice's channel will be stuck waiting for aux sig job responses until
 	// we send the quit signal. We add an explicit sleep here so that we can
@@ -3660,8 +4061,8 @@ func TestQuitDuringSignNextCommitment(t *testing.T) {
 }
 
 func testChanSyncOweCommitmentPendingRemote(t *testing.T,
-	chanType channeldb.ChannelType,
-) {
+	chanType channeldb.ChannelType) {
+
 	// Create a test channel which will be used for the duration of this
 	// unittest.
 	aliceChannel, bobChannel, err := CreateTestChannels(t, chanType)
@@ -3808,6 +4209,13 @@ func TestChanSyncOweCommitmentPendingRemote(t *testing.T) {
 			chanType: channeldb.SingleFunderTweaklessBit |
 				channeldb.AnchorOutputsBit |
 				channeldb.SimpleTaprootFeatureBit,
+		},
+		{
+			name: "taproot with tapscript root",
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.SimpleTaprootFeatureBit |
+				channeldb.TapscriptRootBit,
 		},
 	}
 	for _, tc := range testCases {
@@ -4011,19 +4419,20 @@ func TestChanSyncOweRevocation(t *testing.T) {
 
 		testChanSyncOweRevocation(t, taprootBits)
 	})
-	t.Run("taproot", func(t *testing.T) {
+	t.Run("taproot with tapscript root", func(t *testing.T) {
 		taprootBits := channeldb.SimpleTaprootFeatureBit |
 			channeldb.AnchorOutputsBit |
 			channeldb.ZeroHtlcTxFeeBit |
-			channeldb.SingleFunderTweaklessBit
+			channeldb.SingleFunderTweaklessBit |
+			channeldb.TapscriptRootBit
 
 		testChanSyncOweRevocation(t, taprootBits)
 	})
 }
 
 func testChanSyncOweRevocationAndCommit(t *testing.T,
-	chanType channeldb.ChannelType,
-) {
+	chanType channeldb.ChannelType) {
+
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
@@ -4214,11 +4623,20 @@ func TestChanSyncOweRevocationAndCommit(t *testing.T) {
 
 		testChanSyncOweRevocationAndCommit(t, taprootBits)
 	})
+	t.Run("taproot with tapscript root", func(t *testing.T) {
+		taprootBits := channeldb.SimpleTaprootFeatureBit |
+			channeldb.AnchorOutputsBit |
+			channeldb.ZeroHtlcTxFeeBit |
+			channeldb.SingleFunderTweaklessBit |
+			channeldb.TapscriptRootBit
+
+		testChanSyncOweRevocationAndCommit(t, taprootBits)
+	})
 }
 
 func testChanSyncOweRevocationAndCommitForceTransition(t *testing.T,
-	chanType channeldb.ChannelType,
-) {
+	chanType channeldb.ChannelType) {
+
 	// Create a test channel which will be used for the duration of this
 	// unittest. The channel will be funded evenly with Alice having 5 BTC,
 	// and Bob having 5 BTC.
@@ -4441,6 +4859,17 @@ func TestChanSyncOweRevocationAndCommitForceTransition(t *testing.T) {
 			channeldb.AnchorOutputsBit |
 			channeldb.ZeroHtlcTxFeeBit |
 			channeldb.SingleFunderTweaklessBit
+
+		testChanSyncOweRevocationAndCommitForceTransition(
+			t, taprootBits,
+		)
+	})
+	t.Run("taproot with tapscript root", func(t *testing.T) {
+		taprootBits := channeldb.SimpleTaprootFeatureBit |
+			channeldb.AnchorOutputsBit |
+			channeldb.ZeroHtlcTxFeeBit |
+			channeldb.SingleFunderTweaklessBit |
+			channeldb.TapscriptRootBit
 
 		testChanSyncOweRevocationAndCommitForceTransition(
 			t, taprootBits,
@@ -5199,8 +5628,8 @@ func TestChanAvailableBandwidth(t *testing.T) {
 	)
 
 	assertBandwidthEstimateCorrect := func(aliceInitiate bool,
-		numNonDustHtlcsOnCommit lntypes.WeightUnit,
-	) {
+		numNonDustHtlcsOnCommit lntypes.WeightUnit) {
+
 		// With the HTLC's added, we'll now query the AvailableBalance
 		// method for the current available channel bandwidth from
 		// Alice's PoV.
@@ -5362,8 +5791,8 @@ func TestChanAvailableBalanceNearHtlcFee(t *testing.T) {
 
 	// Helper method to check the current reported balance.
 	checkBalance := func(t *testing.T, expBalanceAlice,
-		expBalanceBob lnwire.MilliSatoshi,
-	) {
+		expBalanceBob lnwire.MilliSatoshi) {
+
 		t.Helper()
 		aliceBalance := aliceChannel.AvailableBalance()
 		if aliceBalance != expBalanceAlice {
@@ -6595,8 +7024,8 @@ func TestMaxPendingAmount(t *testing.T) {
 }
 
 func assertChannelBalances(t *testing.T, alice, bob *LightningChannel,
-	aliceBalance, bobBalance btcutil.Amount,
-) {
+	aliceBalance, bobBalance btcutil.Amount) {
+
 	_, _, line, _ := runtime.Caller(1)
 
 	aliceSelfBalance := alice.channelState.LocalCommitment.LocalBalance.ToSatoshis()
@@ -7274,8 +7703,8 @@ func assertInLogs(t *testing.T, channel *LightningChannel, numAddsLocal,
 // state, and asserts that the new channel has had its logs restored to the
 // expected state.
 func restoreAndAssert(t *testing.T, channel *LightningChannel, numAddsLocal,
-	numFailsLocal, numAddsRemote, numFailsRemote int,
-) {
+	numFailsLocal, numAddsRemote, numFailsRemote int) {
+
 	newChannel, err := NewLightningChannel(
 		channel.Signer, channel.channelState,
 		channel.sigPool,
@@ -7530,8 +7959,8 @@ func TestChannelRestoreCommitHeight(t *testing.T) {
 	// log after a restore.
 	restoreAndAssertCommitHeights := func(t *testing.T,
 		channel *LightningChannel, remoteLog bool, htlcIndex uint64,
-		expLocal, expRemote uint64,
-	) *LightningChannel {
+		expLocal, expRemote uint64) *LightningChannel {
+
 		newChannel, err := NewLightningChannel(
 			channel.Signer, channel.channelState, channel.sigPool,
 		)
@@ -7558,13 +7987,13 @@ func TestChannelRestoreCommitHeight(t *testing.T) {
 			t.Fatalf("htlc not found in log")
 		}
 
-		if pd.addCommitHeightLocal != expLocal {
+		if pd.addCommitHeights.Local != expLocal {
 			t.Fatalf("expected local add height to be %d, was %d",
-				expLocal, pd.addCommitHeightLocal)
+				expLocal, pd.addCommitHeights.Local)
 		}
-		if pd.addCommitHeightRemote != expRemote {
+		if pd.addCommitHeights.Remote != expRemote {
 			t.Fatalf("expected remote add height to be %d, was %d",
-				expRemote, pd.addCommitHeightRemote)
+				expRemote, pd.addCommitHeights.Remote)
 		}
 		return newChannel
 	}
@@ -7978,9 +8407,10 @@ func TestIdealCommitFeeRate(t *testing.T) {
 	// inputs fed to IdealCommitFeeRate.
 	propertyTest := func(c *LightningChannel) func(ma maxAlloc,
 		netFee, minRelayFee, maxAnchorFee fee) bool {
+
 		return func(ma maxAlloc, netFee, minRelayFee,
-			maxAnchorFee fee,
-		) bool {
+			maxAnchorFee fee) bool {
+
 			idealFeeRate := c.IdealCommitFeeRate(
 				chainfee.SatPerKWeight(netFee),
 				chainfee.SatPerKWeight(minRelayFee),
@@ -8025,8 +8455,8 @@ func TestIdealCommitFeeRate(t *testing.T) {
 	// a channel is allowed to allocate to fees. It does not take a minimum
 	// fee rate into account.
 	maxFeeRate := func(c *LightningChannel,
-		maxFeeAlloc float64,
-	) chainfee.SatPerKWeight {
+		maxFeeAlloc float64) chainfee.SatPerKWeight {
+
 		balance, weight := c.availableBalance(AdditionalHtlc)
 		feeRate := c.commitChains.Local.tip().feePerKw
 		currentFee := feeRate.FeeForWeight(weight)
@@ -8195,8 +8625,8 @@ func TestIdealCommitFeeRate(t *testing.T) {
 
 	assertIdealFeeRate := func(c *LightningChannel, netFee, minRelay,
 		maxAnchorCommit chainfee.SatPerKWeight,
-		maxFeeAlloc float64, expectedFeeRate chainfee.SatPerKWeight,
-	) {
+		maxFeeAlloc float64, expectedFeeRate chainfee.SatPerKWeight) {
+
 		feeRate := c.IdealCommitFeeRate(
 			netFee, minRelay, maxAnchorCommit, maxFeeAlloc,
 		)
@@ -8335,16 +8765,20 @@ func TestFetchParent(t *testing.T) {
 			remoteEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 0,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 0,
+					},
 				},
 			},
 			whoseCommitChain: lntypes.Remote,
@@ -8357,16 +8791,20 @@ func TestFetchParent(t *testing.T) {
 			remoteEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  0,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  0,
+						Remote: 100,
+					},
 				},
 			},
 			localEntries:     nil,
@@ -8380,16 +8818,20 @@ func TestFetchParent(t *testing.T) {
 			localEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  0,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  0,
+						Remote: 100,
+					},
 				},
 			},
 			remoteEntries:    nil,
@@ -8404,16 +8846,20 @@ func TestFetchParent(t *testing.T) {
 			localEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 0,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 0,
+					},
 				},
 			},
 			remoteEntries:    nil,
@@ -8428,16 +8874,20 @@ func TestFetchParent(t *testing.T) {
 			remoteEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 0,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 0,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 			},
 			whoseCommitChain: lntypes.Remote,
@@ -8451,16 +8901,20 @@ func TestFetchParent(t *testing.T) {
 			localEntries: []*paymentDescriptor{
 				// This entry will be added at log index =0.
 				{
-					HtlcIndex:             1,
-					addCommitHeightLocal:  0,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 1,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  0,
+						Remote: 100,
+					},
 				},
 				// This entry will be added at log index =1, it
 				// is the parent entry we are looking for.
 				{
-					HtlcIndex:             2,
-					addCommitHeightLocal:  100,
-					addCommitHeightRemote: 100,
+					HtlcIndex: 2,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local:  100,
+						Remote: 100,
+					},
 				},
 			},
 			remoteEntries:    nil,
@@ -8559,6 +9013,7 @@ func TestEvaluateView(t *testing.T) {
 		name             string
 		ourHtlcs         []*paymentDescriptor
 		theirHtlcs       []*paymentDescriptor
+		channelInitiator lntypes.ChannelParty
 		whoseCommitChain lntypes.ChannelParty
 		mutateState      bool
 
@@ -8588,6 +9043,7 @@ func TestEvaluateView(t *testing.T) {
 	}{
 		{
 			name:             "our fee update is applied",
+			channelInitiator: lntypes.Local,
 			whoseCommitChain: lntypes.Local,
 			mutateState:      false,
 			ourHtlcs: []*paymentDescriptor{
@@ -8605,6 +9061,7 @@ func TestEvaluateView(t *testing.T) {
 		},
 		{
 			name:             "their fee update is applied",
+			channelInitiator: lntypes.Remote,
 			whoseCommitChain: lntypes.Local,
 			mutateState:      false,
 			ourHtlcs:         []*paymentDescriptor{},
@@ -8661,10 +9118,12 @@ func TestEvaluateView(t *testing.T) {
 			mutateState:      true,
 			ourHtlcs: []*paymentDescriptor{
 				{
-					HtlcIndex:            0,
-					Amount:               htlcAddAmount,
-					EntryType:            Add,
-					addCommitHeightLocal: addHeight,
+					HtlcIndex: 0,
+					Amount:    htlcAddAmount,
+					EntryType: Add,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local: addHeight,
+					},
 				},
 			},
 			theirHtlcs: []*paymentDescriptor{
@@ -8696,10 +9155,12 @@ func TestEvaluateView(t *testing.T) {
 			mutateState:      false,
 			ourHtlcs: []*paymentDescriptor{
 				{
-					HtlcIndex:            0,
-					Amount:               htlcAddAmount,
-					EntryType:            Add,
-					addCommitHeightLocal: addHeight,
+					HtlcIndex: 0,
+					Amount:    htlcAddAmount,
+					EntryType: Add,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local: addHeight,
+					},
 				},
 			},
 			theirHtlcs: []*paymentDescriptor{
@@ -8746,16 +9207,20 @@ func TestEvaluateView(t *testing.T) {
 			},
 			theirHtlcs: []*paymentDescriptor{
 				{
-					HtlcIndex:            0,
-					Amount:               htlcAddAmount,
-					EntryType:            Add,
-					addCommitHeightLocal: addHeight,
+					HtlcIndex: 0,
+					Amount:    htlcAddAmount,
+					EntryType: Add,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local: addHeight,
+					},
 				},
 				{
-					HtlcIndex:            1,
-					Amount:               htlcAddAmount,
-					EntryType:            Add,
-					addCommitHeightLocal: addHeight,
+					HtlcIndex: 1,
+					Amount:    htlcAddAmount,
+					EntryType: Add,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local: addHeight,
+					},
 				},
 			},
 			expectedFee: feePerKw,
@@ -8790,10 +9255,12 @@ func TestEvaluateView(t *testing.T) {
 			},
 			theirHtlcs: []*paymentDescriptor{
 				{
-					HtlcIndex:            0,
-					Amount:               htlcAddAmount,
-					EntryType:            Add,
-					addCommitHeightLocal: addHeight,
+					HtlcIndex: 0,
+					Amount:    htlcAddAmount,
+					EntryType: Add,
+					addCommitHeights: lntypes.Dual[uint64]{
+						Local: addHeight,
+					},
 				},
 			},
 			expectedFee: feePerKw,
@@ -8810,8 +9277,10 @@ func TestEvaluateView(t *testing.T) {
 		test := test
 
 		t.Run(test.name, func(t *testing.T) {
+			isInitiator := test.channelInitiator == lntypes.Local
 			lc := LightningChannel{
 				channelState: &channeldb.OpenChannel{
+					IsInitiator:       isInitiator,
 					TotalMSatSent:     0,
 					TotalMSatReceived: 0,
 				},
@@ -8840,27 +9309,48 @@ func TestEvaluateView(t *testing.T) {
 			}
 
 			view := &HtlcView{
-				OurUpdates:   test.ourHtlcs,
-				TheirUpdates: test.theirHtlcs,
-				FeePerKw:     feePerKw,
+				Updates: lntypes.Dual[[]*paymentDescriptor]{
+					Local:  test.ourHtlcs,
+					Remote: test.theirHtlcs,
+				},
+				FeePerKw: feePerKw,
 			}
 
-			var (
-				// Create vars to store balance changes. We do
-				// not check these values in this test because
-				// balance modification happens on the htlc
-				// processing level.
-				ourBalance   lnwire.MilliSatoshi
-				theirBalance lnwire.MilliSatoshi
+			// Evaluate the htlc view, mutate as test expects.
+			// We do not check the balance deltas in this test
+			// because balance modification happens on the htlc
+			// processing level.
+			result, uncommitted, _, err := lc.evaluateHTLCView(
+				view, test.whoseCommitChain, nextHeight,
 			)
 
-			// Evaluate the htlc view, mutate as test expects.
-			result, err := lc.evaluateHTLCView(
-				view, &ourBalance, &theirBalance, nextHeight,
-				test.whoseCommitChain, test.mutateState,
-			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// TODO(proofofkeags): This block is here because we
+			// extracted this code from a previous implementation
+			// of evaluateHTLCView, due to a reduced scope of
+			// responsibility of that function. Consider removing
+			// it from the test altogether.
+			if test.mutateState {
+				for _, party := range lntypes.BothParties {
+					us := uncommitted.GetForParty(party)
+					for _, u := range us {
+						u.setCommitHeight(
+							test.whoseCommitChain,
+							nextHeight,
+						)
+						if test.whoseCommitChain ==
+							lntypes.Local &&
+							u.EntryType == Settle {
+
+							lc.recordSettlement(
+								party, u.Amount,
+							)
+						}
+					}
+				}
 			}
 
 			if result.FeePerKw != test.expectedFee {
@@ -8869,11 +9359,12 @@ func TestEvaluateView(t *testing.T) {
 			}
 
 			checkExpectedHtlcs(
-				t, result.OurUpdates, test.ourExpectedHtlcs,
+				t, result.Updates.Local, test.ourExpectedHtlcs,
 			)
 
 			checkExpectedHtlcs(
-				t, result.TheirUpdates, test.theirExpectedHtlcs,
+				t, result.Updates.Remote,
+				test.theirExpectedHtlcs,
 			)
 
 			if lc.channelState.TotalMSatSent != test.expectSent {
@@ -8918,615 +9409,6 @@ type heights struct {
 	localRemove  uint64
 	remoteAdd    uint64
 	remoteRemove uint64
-}
-
-// TestProcessFeeUpdate tests the applying of fee updates and mutation of
-// local and remote add and remove heights on update messages.
-func TestProcessFeeUpdate(t *testing.T) {
-	const (
-		// height is a non-zero height that can be used for htlcs
-		// heights.
-		height = 200
-
-		// nextHeight is a constant that we use for the next height in
-		// all unit tests.
-		nextHeight = 400
-
-		// feePerKw is the fee we start all of our unit tests with.
-		feePerKw = 1
-
-		// ourFeeUpdateAmt is an amount that we update fees to expressed
-		// in msat.
-		ourFeeUpdateAmt = 20000
-
-		// ourFeeUpdatePerSat is the fee rate *in satoshis* that we
-		// expect if we update to ourFeeUpdateAmt.
-		ourFeeUpdatePerSat = chainfee.SatPerKWeight(20)
-	)
-
-	tests := []struct {
-		name             string
-		startHeights     heights
-		expectedHeights  heights
-		whoseCommitChain lntypes.ChannelParty
-		mutate           bool
-		expectedFee      chainfee.SatPerKWeight
-	}{
-		{
-			// Looking at local chain, local add is non-zero so
-			// the update has been applied already; no fee change.
-			name: "non-zero local height, fee unchanged",
-			startHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: height,
-			},
-			expectedHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: height,
-			},
-			whoseCommitChain: lntypes.Local,
-			mutate:           false,
-			expectedFee:      feePerKw,
-		},
-		{
-			// Looking at local chain, local add is zero so the
-			// update has not been applied yet; we expect a fee
-			// update.
-			name: "zero local height, fee changed",
-			startHeights: heights{
-				localAdd:     0,
-				localRemove:  0,
-				remoteAdd:    height,
-				remoteRemove: 0,
-			},
-			expectedHeights: heights{
-				localAdd:     0,
-				localRemove:  0,
-				remoteAdd:    height,
-				remoteRemove: 0,
-			},
-			whoseCommitChain: lntypes.Local,
-			mutate:           false,
-			expectedFee:      ourFeeUpdatePerSat,
-		},
-		{
-			// Looking at remote chain, the remote add height is
-			// zero, so the update has not been applied so we expect
-			// a fee change.
-			name: "zero remote height, fee changed",
-			startHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: 0,
-			},
-			expectedHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain: lntypes.Remote,
-			mutate:           false,
-			expectedFee:      ourFeeUpdatePerSat,
-		},
-		{
-			// Looking at remote chain, the remote add height is
-			// non-zero, so the update has been applied so we expect
-			// no fee change.
-			name: "non-zero remote height, no fee change",
-			startHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    height,
-				remoteRemove: 0,
-			},
-			expectedHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    height,
-				remoteRemove: 0,
-			},
-			whoseCommitChain: lntypes.Remote,
-			mutate:           false,
-			expectedFee:      feePerKw,
-		},
-		{
-			// Local add height is non-zero, so the update has
-			// already been applied; we do not expect fee to
-			// change or any mutations to be applied.
-			name: "non-zero local height, mutation not applied",
-			startHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: height,
-			},
-			expectedHeights: heights{
-				localAdd:     height,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: height,
-			},
-			whoseCommitChain: lntypes.Local,
-			mutate:           true,
-			expectedFee:      feePerKw,
-		},
-		{
-			// Local add is zero and we are looking at our local
-			// chain, so the update has not been applied yet. We
-			// expect the local add and remote heights to be
-			// mutated.
-			name: "zero height, fee changed, mutation applied",
-			startHeights: heights{
-				localAdd:     0,
-				localRemove:  0,
-				remoteAdd:    0,
-				remoteRemove: 0,
-			},
-			expectedHeights: heights{
-				localAdd:     nextHeight,
-				localRemove:  nextHeight,
-				remoteAdd:    0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain: lntypes.Local,
-			mutate:           true,
-			expectedFee:      ourFeeUpdatePerSat,
-		},
-	}
-
-	for _, test := range tests {
-		test := test
-
-		t.Run(test.name, func(t *testing.T) {
-			// Create a fee update with add and remove heights as
-			// set in the test.
-			heights := test.startHeights
-			update := &paymentDescriptor{
-				Amount:                   ourFeeUpdateAmt,
-				addCommitHeightRemote:    heights.remoteAdd,
-				addCommitHeightLocal:     heights.localAdd,
-				removeCommitHeightRemote: heights.remoteRemove,
-				removeCommitHeightLocal:  heights.localRemove,
-				EntryType:                FeeUpdate,
-			}
-
-			view := &HtlcView{
-				FeePerKw: chainfee.SatPerKWeight(feePerKw),
-			}
-			processFeeUpdate(
-				update, nextHeight, test.whoseCommitChain,
-				test.mutate, view,
-			)
-
-			if view.FeePerKw != test.expectedFee {
-				t.Fatalf("expected fee: %v, got: %v",
-					test.expectedFee, feePerKw)
-			}
-
-			checkHeights(t, update, test.expectedHeights)
-		})
-	}
-}
-
-func checkHeights(t *testing.T, update *paymentDescriptor, expected heights) {
-	updateHeights := heights{
-		localAdd:     update.addCommitHeightLocal,
-		localRemove:  update.removeCommitHeightLocal,
-		remoteAdd:    update.addCommitHeightRemote,
-		remoteRemove: update.removeCommitHeightRemote,
-	}
-
-	if !reflect.DeepEqual(updateHeights, expected) {
-		t.Fatalf("expected: %v, got: %v", expected, updateHeights)
-	}
-}
-
-// TestProcessAddRemoveEntry tests the updating of our and their balances when
-// we process adds, settles and fails. It also tests the mutating of add and
-// remove heights.
-func TestProcessAddRemoveEntry(t *testing.T) {
-	const (
-		// addHeight is a non-zero addHeight that is used for htlc
-		// add heights.
-		addHeight = 100
-
-		// removeHeight is a non-zero removeHeight that is used for
-		// htlc remove heights.
-		removeHeight = 200
-
-		// nextHeight is a constant that we use for the nextHeight in
-		// all unit tests.
-		nextHeight = 400
-
-		// updateAmount is the amount that the update is set to.
-		updateAmount = lnwire.MilliSatoshi(10)
-
-		// startBalance is a balance we start both sides out with
-		// so that balances can be incremented.
-		startBalance = lnwire.MilliSatoshi(100)
-	)
-
-	tests := []struct {
-		name                 string
-		startHeights         heights
-		whoseCommitChain     lntypes.ChannelParty
-		isIncoming           bool
-		mutateState          bool
-		ourExpectedBalance   lnwire.MilliSatoshi
-		theirExpectedBalance lnwire.MilliSatoshi
-		expectedHeights      heights
-		updateType           updateType
-	}{
-		{
-			name: "add, remote chain, already processed",
-			startHeights: heights{
-				localAdd:     0,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     0,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-		{
-			name: "add, local chain, already processed",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Local,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-		{
-			name: "incoming add, local chain, not mutated",
-			startHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Local,
-			isIncoming:           true,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance - updateAmount,
-			expectedHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-		{
-			name: "incoming add, local chain, mutated",
-			startHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Local,
-			isIncoming:           true,
-			mutateState:          true,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance - updateAmount,
-			expectedHeights: heights{
-				localAdd:     nextHeight,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-
-		{
-			name: "outgoing add, remote chain, not mutated",
-			startHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance - updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-		{
-			name: "outgoing add, remote chain, mutated",
-			startHeights: heights{
-				localAdd:     0,
-				remoteAdd:    0,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          true,
-			ourExpectedBalance:   startBalance - updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     0,
-				remoteAdd:    nextHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Add,
-		},
-		{
-			name: "settle, remote chain, already processed",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: removeHeight,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: removeHeight,
-			},
-			updateType: Settle,
-		},
-		{
-			name: "settle, local chain, already processed",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  removeHeight,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Local,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  removeHeight,
-				remoteRemove: 0,
-			},
-			updateType: Settle,
-		},
-		{
-			// Remote chain, and not processed yet. Incoming settle,
-			// so we expect our balance to increase.
-			name: "incoming settle",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           true,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance + updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Settle,
-		},
-		{
-			// Remote chain, and not processed yet. Incoming settle,
-			// so we expect our balance to increase.
-			name: "outgoing settle",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance + updateAmount,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Settle,
-		},
-		{
-			// Remote chain, and not processed yet. Incoming fail,
-			// so we expect their balance to increase.
-			name: "incoming fail",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           true,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance,
-			theirExpectedBalance: startBalance + updateAmount,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Fail,
-		},
-		{
-			// Remote chain, and not processed yet. Outgoing fail,
-			// so we expect our balance to increase.
-			name: "outgoing fail",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           false,
-			mutateState:          false,
-			ourExpectedBalance:   startBalance + updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			updateType: Fail,
-		},
-		{
-			// Local chain, and not processed yet. Incoming settle,
-			// so we expect our balance to increase. Mutate is
-			// true, so we expect our remove removeHeight to have
-			// changed.
-			name: "fail, our remove height mutated",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Local,
-			isIncoming:           true,
-			mutateState:          true,
-			ourExpectedBalance:   startBalance + updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  nextHeight,
-				remoteRemove: 0,
-			},
-			updateType: Settle,
-		},
-		{
-			// Remote chain, and not processed yet. Incoming settle,
-			// so we expect our balance to increase. Mutate is
-			// true, so we expect their remove removeHeight to have
-			// changed.
-			name: "fail, their remove height mutated",
-			startHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: 0,
-			},
-			whoseCommitChain:     lntypes.Remote,
-			isIncoming:           true,
-			mutateState:          true,
-			ourExpectedBalance:   startBalance + updateAmount,
-			theirExpectedBalance: startBalance,
-			expectedHeights: heights{
-				localAdd:     addHeight,
-				remoteAdd:    addHeight,
-				localRemove:  0,
-				remoteRemove: nextHeight,
-			},
-			updateType: Settle,
-		},
-	}
-
-	for _, test := range tests {
-		test := test
-
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			heights := test.startHeights
-			update := &paymentDescriptor{
-				Amount:                   updateAmount,
-				addCommitHeightLocal:     heights.localAdd,
-				addCommitHeightRemote:    heights.remoteAdd,
-				removeCommitHeightLocal:  heights.localRemove,
-				removeCommitHeightRemote: heights.remoteRemove,
-				EntryType:                test.updateType,
-			}
-
-			// Start both parties off with an initial
-			// balance. Copy by value here so that we do
-			// not mutate the startBalance constant.
-			ourBalance, theirBalance := startBalance,
-				startBalance
-
-			// Choose the processing function we need based on the
-			// update type. Process remove is used for settles,
-			// fails and malformed htlcs.
-			process := processRemoveEntry
-			if test.updateType == Add {
-				process = processAddEntry
-			}
-
-			process(
-				update, &ourBalance, &theirBalance, nextHeight,
-				test.whoseCommitChain, test.isIncoming,
-				test.mutateState,
-			)
-
-			// Check that balances were updated as expected.
-			if ourBalance != test.ourExpectedBalance {
-				t.Fatalf("expected our balance: %v, got: %v",
-					test.ourExpectedBalance, ourBalance)
-			}
-
-			if theirBalance != test.theirExpectedBalance {
-				t.Fatalf("expected their balance: %v, got: %v",
-					test.theirExpectedBalance, theirBalance)
-			}
-
-			// Check that heights on the update are as expected.
-			checkHeights(t, update, test.expectedHeights)
-		})
-	}
 }
 
 // TestChannelUnsignedAckedFailure tests that unsigned acked updates are
@@ -10004,8 +9886,8 @@ func TestIsChannelClean(t *testing.T) {
 // assertCleanOrDirty is a helper function that asserts that both channels are
 // clean if clean is true, and dirty if clean is false.
 func assertCleanOrDirty(clean bool, alice, bob *LightningChannel,
-	t *testing.T,
-) {
+	t *testing.T) {
+
 	t.Helper()
 
 	if clean {
@@ -10043,8 +9925,8 @@ func testGetDustSum(t *testing.T, chantype channeldb.ChannelType) {
 	// Use a function closure to assert the dust sum for a passed channel's
 	// local and remote commitments match the expected values.
 	checkDust := func(c *LightningChannel, expLocal,
-		expRemote lnwire.MilliSatoshi,
-	) {
+		expRemote lnwire.MilliSatoshi) {
+
 		localDustSum := c.GetDustSum(
 			lntypes.Local, fn.None[chainfee.SatPerKWeight](),
 		)
@@ -10190,8 +10072,8 @@ func testGetDustSum(t *testing.T, chantype channeldb.ChannelType) {
 // deriveDummyRetributionParams is a helper function that derives a list of
 // dummy params to assist retribution creation related tests.
 func deriveDummyRetributionParams(chanState *channeldb.OpenChannel) (uint32,
-	*CommitmentKeyRing, chainhash.Hash,
-) {
+	*CommitmentKeyRing, chainhash.Hash) {
+
 	config := chanState.RemoteChanCfg
 	commitHash := chanState.RemoteCommitment.CommitTx.TxHash()
 	keyRing := DeriveCommitmentKeys(
@@ -10338,7 +10220,7 @@ func TestCreateBreachRetribution(t *testing.T) {
 		{
 			name: "fail due to our index too big",
 			revocationLog: &channeldb.RevocationLog{
-				//nolint:lll
+				//nolint:ll
 				OurOutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType0](
 					uint16(htlcIndex + 1),
 				),
@@ -10348,7 +10230,7 @@ func TestCreateBreachRetribution(t *testing.T) {
 		{
 			name: "fail due to their index too big",
 			revocationLog: &channeldb.RevocationLog{
-				//nolint:lll
+				//nolint:ll
 				TheirOutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType1](
 					uint16(htlcIndex + 1),
 				),
@@ -10583,8 +10465,8 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// assertRetribution is a helper closure that checks a given breach
 	// retribution has the expected values on certain fields.
 	assertRetribution := func(br *BreachRetribution,
-		localIndex, remoteIndex uint32,
-	) {
+		localIndex, remoteIndex uint32) {
+
 		require.Equal(t, txid, br.BreachTxHash)
 		require.Equal(t, chainHash, br.ChainHash)
 		require.Equal(t, breachHeight, br.BreachHeight)
@@ -10808,6 +10690,7 @@ func TestApplyCommitmentFee(t *testing.T) {
 		balance           lnwire.MilliSatoshi
 		expectedBalance   lnwire.MilliSatoshi
 		expectedBufferAmt lnwire.MilliSatoshi
+		expectedCommitFee lnwire.MilliSatoshi
 		bufferAmt         lnwire.MilliSatoshi
 		expectedErr       error
 	}{
@@ -10818,6 +10701,7 @@ func TestApplyCommitmentFee(t *testing.T) {
 			balance:           balance,
 			expectedBalance:   balance - feeBuffer,
 			expectedBufferAmt: feeBuffer - commitFee,
+			expectedCommitFee: commitFee,
 		},
 		{
 			name:        "apply feebuffer remote initiator",
@@ -10833,6 +10717,7 @@ func TestApplyCommitmentFee(t *testing.T) {
 			balance:           balance,
 			expectedBalance:   balance - commitFee - additionalHtlc,
 			expectedBufferAmt: additionalHtlc,
+			expectedCommitFee: commitFee,
 		},
 		{
 			name:              "apply NoBuffer",
@@ -10841,6 +10726,7 @@ func TestApplyCommitmentFee(t *testing.T) {
 			balance:           balance,
 			expectedBalance:   balance - commitFee,
 			expectedBufferAmt: 0,
+			expectedCommitFee: commitFee,
 		},
 		{
 			name:              "apply FeeBuffer balance negative",
@@ -10850,18 +10736,22 @@ func TestApplyCommitmentFee(t *testing.T) {
 			expectedBalance:   balanceBelowReserve,
 			expectedErr:       ErrBelowChanReserve,
 			expectedBufferAmt: feeBuffer,
+			expectedCommitFee: commitFee,
 		},
 	}
 
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			balance, bufferAmt, err := tc.channel.applyCommitFee(
-				tc.balance, commitWeight, feePerKw, tc.buffer)
+			//nolint:ll
+			balance, bufferAmt, commitFee, err := tc.channel.applyCommitFee(
+				tc.balance, commitWeight, feePerKw, tc.buffer,
+			)
 
 			require.ErrorIs(t, err, tc.expectedErr)
 			require.Equal(t, tc.expectedBalance, balance)
 			require.Equal(t, tc.expectedBufferAmt, bufferAmt)
+			require.Equal(t, tc.expectedCommitFee, commitFee)
 		})
 	}
 }
@@ -11333,7 +11223,7 @@ func TestBlindingPointPersistence(t *testing.T) {
 	// Send a HTLC from Alice to Bob that has a blinding point populated.
 	htlc, _ := createHTLC(0, 100_000_000)
 	blinding, err := pubkeyFromHex(
-		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:ll
 	)
 	require.NoError(t, err)
 	htlc.BlindingPoint = tlv.SomeRecordT(
@@ -11685,5 +11575,395 @@ func TestCreateCooperativeCloseTx(t *testing.T) {
 				spew.Sdump(closeTx),
 			)
 		})
+	}
+}
+
+// TestNoopAddSettle tests that adding and settling an HTLC with no-op, no
+// balances are actually affected.
+func TestNoopAddSettle(t *testing.T) {
+	t.Parallel()
+
+	// Create a test channel which will be used for the duration of this
+	// unittest. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	chanType := channeldb.SimpleTaprootFeatureBit |
+		channeldb.AnchorOutputsBit | channeldb.ZeroHtlcTxFeeBit |
+		channeldb.SingleFunderTweaklessBit | channeldb.TapscriptRootBit
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, chanType,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	const htlcAmt = 10_000
+	htlc, preimage := createHTLC(0, htlcAmt)
+	noopRecord := tlv.NewPrimitiveRecord[tlv.TlvType65544, bool](true)
+
+	records, err := tlv.RecordsToMap([]tlv.Record{noopRecord.Record()})
+	require.NoError(t, err)
+	htlc.CustomRecords = records
+
+	aliceBalance := aliceChannel.channelState.LocalCommitment.LocalBalance
+	bobBalance := bobChannel.channelState.LocalCommitment.LocalBalance
+
+	// Have Alice add the HTLC, then lock it in with a new state transition.
+	aliceHtlcIndex, err := aliceChannel.AddHTLC(htlc, nil)
+	require.NoError(t, err, "alice unable to add htlc")
+	bobHtlcIndex, err := bobChannel.ReceiveHTLC(htlc)
+	require.NoError(t, err, "bob unable to receive htlc")
+
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	// We'll have Bob settle the HTLC, then force another state transition.
+	err = bobChannel.SettleHTLC(preimage, bobHtlcIndex, nil, nil, nil)
+	require.NoError(t, err, "bob unable to settle inbound htlc")
+	err = aliceChannel.ReceiveHTLCSettle(preimage, aliceHtlcIndex)
+	require.NoError(t, err)
+
+	err = ForceStateTransition(aliceChannel, bobChannel)
+	require.NoError(t, err)
+
+	aliceBalanceFinal := aliceChannel.channelState.LocalCommitment.LocalBalance //nolint:ll
+	bobBalanceFinal := bobChannel.channelState.LocalCommitment.LocalBalance
+
+	// The balances of Alice and Bob should be the exact same and shouldn't
+	// have changed.
+	require.Equal(t, aliceBalance, aliceBalanceFinal)
+	require.Equal(t, bobBalance, bobBalanceFinal)
+}
+
+// TestNoopAddBelowReserve tests that the noop HTLCs behave as expected when
+// added over a channel where a party is below their reserve.
+func TestNoopAddBelowReserve(t *testing.T) {
+	t.Parallel()
+
+	// Create a test channel which will be used for the duration of this
+	// unittest. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	chanType := channeldb.SimpleTaprootFeatureBit |
+		channeldb.AnchorOutputsBit | channeldb.ZeroHtlcTxFeeBit |
+		channeldb.SingleFunderTweaklessBit | channeldb.TapscriptRootBit
+	aliceChan, bobChan, err := CreateTestChannels(t, chanType)
+	require.NoError(t, err, "unable to create test channels")
+
+	aliceBalance := aliceChan.channelState.LocalCommitment.LocalBalance
+	bobBalance := bobChan.channelState.LocalCommitment.LocalBalance
+
+	const (
+		// htlcAmt is the default HTLC amount to be used, epxressed in
+		// milli-satoshis.
+		htlcAmt = lnwire.MilliSatoshi(500_000)
+
+		// numHtlc is the total number of HTLCs to be added/settled over
+		// the channel.
+		numHtlc = 20
+	)
+
+	// Let's create the noop add TLV record to be used in all added HTLCs
+	// over the channel.
+	noopRecord := tlv.NewPrimitiveRecord[NoOpHtlcTLVType, bool](true)
+	records, err := tlv.RecordsToMap([]tlv.Record{noopRecord.Record()})
+	require.NoError(t, err)
+
+	// Let's set Bob's reserve to whatever his local balance is, plus half
+	// of the total amount to be added by the total HTLCs. This way we can
+	// also verify that the noop-adds will start the nullification only once
+	// Bob is above reserve.
+	reserveTarget := (numHtlc / 2) * htlcAmt
+	bobReserve := bobBalance + reserveTarget
+
+	bobChan.channelState.LocalChanCfg.ChanReserve =
+		bobReserve.ToSatoshis()
+
+	aliceChan.channelState.RemoteChanCfg.ChanReserve =
+		bobReserve.ToSatoshis()
+
+	// Add and settle all the HTLCs over the channel.
+	for i := range numHtlc {
+		htlc, preimage := createHTLC(i, htlcAmt)
+		htlc.CustomRecords = records
+
+		aliceHtlcIndex, err := aliceChan.AddHTLC(htlc, nil)
+		require.NoError(t, err, "alice unable to add htlc")
+		bobHtlcIndex, err := bobChan.ReceiveHTLC(htlc)
+		require.NoError(t, err, "bob unable to receive htlc")
+
+		require.NoError(t, ForceStateTransition(aliceChan, bobChan))
+
+		// We'll have Bob settle the HTLC, then force another state
+		// transition.
+		err = bobChan.SettleHTLC(preimage, bobHtlcIndex, nil, nil, nil)
+		require.NoError(t, err, "bob unable to settle inbound htlc")
+		err = aliceChan.ReceiveHTLCSettle(preimage, aliceHtlcIndex)
+		require.NoError(t, err)
+		require.NoError(t, ForceStateTransition(aliceChan, bobChan))
+	}
+
+	// We need to kick the state transition one last time for the balances
+	// to be updated on both commitments.
+	require.NoError(t, ForceStateTransition(aliceChan, bobChan))
+
+	aliceBalanceFinal := aliceChan.channelState.LocalCommitment.LocalBalance
+	bobBalanceFinal := bobChan.channelState.LocalCommitment.LocalBalance
+
+	// The balances of Alice and Bob must have changed exactly by half the
+	// total number of HTLCs we added over the channel, plus one to get Bob
+	// above the reserve. Bob's final balance should be as much as his
+	// reserve plus one extra default HTLC amount.
+	require.Equal(t, aliceBalance-htlcAmt*(numHtlc/2+1), aliceBalanceFinal)
+	require.Equal(t, bobBalance+htlcAmt*(numHtlc/2+1), bobBalanceFinal)
+	require.Equal(
+		t, bobBalanceFinal.ToSatoshis(),
+		bobChan.LocalChanReserve()+htlcAmt.ToSatoshis(),
+	)
+}
+
+// TestEvaluateNoOpHtlc tests that the noop htlc evaluator helper function
+// produces the expected balance deltas from various starting states.
+func TestEvaluateNoOpHtlc(t *testing.T) {
+	testCases := []struct {
+		name                        string
+		localBalance, remoteBalance btcutil.Amount
+		localReserve, remoteReserve btcutil.Amount
+		entry                       *paymentDescriptor
+		receiver                    lntypes.ChannelParty
+		balanceDeltas               *lntypes.Dual[int64]
+		expectedDeltas              *lntypes.Dual[int64]
+	}{
+		{
+			name: "local above reserve",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver: lntypes.Local,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 2_500,
+			},
+		},
+		{
+			name: "remote above reserve",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver: lntypes.Remote,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  2_500,
+				Remote: 0,
+			},
+		},
+		{
+			name: "local below reserve",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:     lntypes.Local,
+			localBalance: 25_000,
+			localReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  2_500,
+				Remote: 0,
+			},
+		},
+		{
+			name: "remote below reserve",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:      lntypes.Remote,
+			remoteBalance: 25_000,
+			remoteReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 2_500,
+			},
+		},
+
+		{
+			name: "local above reserve with delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:     lntypes.Local,
+			localBalance: 25_000,
+			localReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  25_001_000,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  25_001_000,
+				Remote: 2_500,
+			},
+		},
+		{
+			name: "remote above reserve with delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:      lntypes.Remote,
+			remoteBalance: 25_000,
+			remoteReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 25_001_000,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  2_500,
+				Remote: 25_001_000,
+			},
+		},
+		{
+			name: "local below reserve with delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:     lntypes.Local,
+			localBalance: 25_000,
+			localReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  24_999_000,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  25_001_500,
+				Remote: 0,
+			},
+		},
+		{
+			name: "remote below reserve with delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:      lntypes.Remote,
+			remoteBalance: 25_000,
+			remoteReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 24_998_000,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: 25_000_500,
+			},
+		},
+		{
+			name: "local above reserve with negative delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:     lntypes.Remote,
+			localBalance: 55_000,
+			localReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  -4_999_000,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  -4_999_000,
+				Remote: 2_500,
+			},
+		},
+		{
+			name: "remote above reserve with negative delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:      lntypes.Remote,
+			remoteBalance: 55_000,
+			remoteReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: -4_999_000,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  2_500,
+				Remote: -4_999_000,
+			},
+		},
+		{
+			name: "local below reserve with negative delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:     lntypes.Local,
+			localBalance: 55_000,
+			localReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  -5_001_000,
+				Remote: 0,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  -4_998_500,
+				Remote: 0,
+			},
+		},
+		{
+			name: "remote below reserve with negative delta",
+			entry: &paymentDescriptor{
+				Amount: lnwire.MilliSatoshi(2500),
+			},
+			receiver:      lntypes.Remote,
+			remoteBalance: 55_000,
+			remoteReserve: 50_000,
+			balanceDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: -5_001_000,
+			},
+			expectedDeltas: &lntypes.Dual[int64]{
+				Local:  0,
+				Remote: -4_998_500,
+			},
+		},
+	}
+
+	chanType := channeldb.SimpleTaprootFeatureBit |
+		channeldb.AnchorOutputsBit | channeldb.ZeroHtlcTxFeeBit |
+		channeldb.SingleFunderTweaklessBit | channeldb.TapscriptRootBit
+	aliceChan, _, err := CreateTestChannels(t, chanType)
+	require.NoError(t, err, "unable to create test channels")
+
+	for _, testCase := range testCases {
+		tc := testCase
+
+		t.Logf("Running test case: %s", testCase.name)
+
+		if tc.localBalance != 0 && tc.localReserve != 0 {
+			aliceChan.channelState.LocalChanCfg.ChanReserve =
+				tc.localReserve
+
+			aliceChan.channelState.LocalCommitment.LocalBalance =
+				lnwire.NewMSatFromSatoshis(tc.localBalance)
+		}
+
+		if tc.remoteBalance != 0 && tc.remoteReserve != 0 {
+			aliceChan.channelState.RemoteChanCfg.ChanReserve =
+				tc.remoteReserve
+
+			aliceChan.channelState.RemoteCommitment.RemoteBalance =
+				lnwire.NewMSatFromSatoshis(tc.remoteBalance)
+		}
+
+		aliceChan.evaluateNoOpHtlc(
+			tc.entry, tc.receiver, tc.balanceDeltas,
+		)
+
+		require.Equal(t, tc.expectedDeltas, tc.balanceDeltas)
 	}
 }

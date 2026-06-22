@@ -1,7 +1,9 @@
 package discovery
 
 import (
+	"context"
 	"errors"
+	"math"
 	"sync"
 	"time"
 
@@ -13,14 +15,13 @@ import (
 )
 
 const (
+	// DefaultBanThreshold is the default value to be used for banThreshold.
+	DefaultBanThreshold = 100
+
 	// maxBannedPeers limits the maximum number of banned pubkeys that
 	// we'll store.
 	// TODO(eugene): tune.
 	maxBannedPeers = 10_000
-
-	// banThreshold is the point at which non-channel peers will be banned.
-	// TODO(eugene): tune.
-	banThreshold = 100
 
 	// banTime is the amount of time that the non-channel peer will be
 	// banned for. Channel announcements from channel peers will be dropped
@@ -55,10 +56,10 @@ type ClosedChannelTracker interface {
 type GraphCloser interface {
 	// PutClosedScid marks a channel as closed so that we won't validate
 	// channel announcements for it again.
-	PutClosedScid(lnwire.ShortChannelID) error
+	PutClosedScid(context.Context, lnwire.ShortChannelID) error
 
 	// IsClosedScid checks if a short channel id is closed.
-	IsClosedScid(lnwire.ShortChannelID) (bool, error)
+	IsClosedScid(context.Context, lnwire.ShortChannelID) (bool, error)
 }
 
 // NodeInfoInquirier handles queries relating to specific nodes and channels
@@ -88,16 +89,18 @@ func NewScidCloserMan(graph GraphCloser,
 
 // PutClosedScid marks scid as closed so the gossiper can ignore this channel
 // in the future.
-func (s *ScidCloserMan) PutClosedScid(scid lnwire.ShortChannelID) error {
-	return s.graph.PutClosedScid(scid)
+func (s *ScidCloserMan) PutClosedScid(ctx context.Context,
+	scid lnwire.ShortChannelID) error {
+
+	return s.graph.PutClosedScid(ctx, scid)
 }
 
 // IsClosedScid checks whether scid is closed so that the gossiper can ignore
 // it.
-func (s *ScidCloserMan) IsClosedScid(scid lnwire.ShortChannelID) (bool,
-	error) {
+func (s *ScidCloserMan) IsClosedScid(ctx context.Context,
+	scid lnwire.ShortChannelID) (bool, error) {
 
-	return s.graph.IsClosedScid(scid)
+	return s.graph.IsClosedScid(ctx, scid)
 }
 
 // IsChannelPeer checks whether we have a channel with the peer.
@@ -126,7 +129,7 @@ func (c *cachedBanInfo) Size() (uint64, error) {
 }
 
 // isBanned returns true if the ban score is greater than the ban threshold.
-func (c *cachedBanInfo) isBanned() bool {
+func (c *cachedBanInfo) isBanned(banThreshold uint64) bool {
 	return c.score >= banThreshold
 }
 
@@ -144,15 +147,26 @@ type banman struct {
 
 	wg   sync.WaitGroup
 	quit chan struct{}
+
+	// banThreshold is the point at which non-channel peers will be banned.
+	banThreshold uint64
 }
 
 // newBanman creates a new banman with the default maxBannedPeers.
-func newBanman() *banman {
+func newBanman(banThreshold uint64) *banman {
+	// If the ban threshold is set to 0, we'll use the max value to
+	// effectively disable banning.
+	if banThreshold == 0 {
+		log.Warn("Banning is disabled due to zero banThreshold")
+		banThreshold = math.MaxUint64
+	}
+
 	return &banman{
 		peerBanIndex: lru.NewCache[[33]byte, *cachedBanInfo](
 			maxBannedPeers,
 		),
-		quit: make(chan struct{}),
+		quit:         make(chan struct{}),
+		banThreshold: banThreshold,
 	}
 }
 
@@ -193,7 +207,7 @@ func (b *banman) purgeBanEntries() {
 	keysToRemove := make([][33]byte, 0)
 
 	sweepEntries := func(pubkey [33]byte, banInfo *cachedBanInfo) bool {
-		if banInfo.isBanned() {
+		if banInfo.isBanned(b.banThreshold) {
 			// If the peer is banned, check if the ban timer has
 			// expired.
 			if banInfo.lastUpdate.Add(banTime).Before(time.Now()) {
@@ -227,7 +241,7 @@ func (b *banman) isBanned(pubkey [33]byte) bool {
 		return false
 
 	default:
-		return banInfo.isBanned()
+		return banInfo.isBanned(b.banThreshold)
 	}
 }
 

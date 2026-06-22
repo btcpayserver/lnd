@@ -2,13 +2,16 @@ package routerrpc
 
 import (
 	"bytes"
-	"context"
 	"encoding/hex"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/stretchr/testify/require"
@@ -64,8 +67,8 @@ func testQueryRoutes(t *testing.T, useMissionControl bool, useMsat bool,
 	}
 
 	var (
-		lastHop      = route.Vertex{64}
-		outgoingChan = uint64(383322)
+		lastHop         = route.Vertex{64}
+		outgoingChanIds = []uint64{383322, 383323}
 	)
 
 	hintNode, err := route.NewVertexFromStr(hintNodeKey)
@@ -98,7 +101,6 @@ func testQueryRoutes(t *testing.T, useMissionControl bool, useMsat bool,
 		}},
 		UseMissionControl: useMissionControl,
 		LastHopPubkey:     lastHop[:],
-		OutgoingChanId:    outgoingChan,
 		DestFeatures:      []lnrpc.FeatureBit{lnrpc.FeatureBit_MPP_OPT},
 		RouteHints:        rpcRouteHints,
 	}
@@ -119,6 +121,8 @@ func testQueryRoutes(t *testing.T, useMissionControl bool, useMsat bool,
 			},
 		}
 	}
+
+	request.OutgoingChanIds = outgoingChanIds
 
 	findRoute := func(req *routing.RouteRequest) (*route.Route, float64,
 		error) {
@@ -161,9 +165,9 @@ func testQueryRoutes(t *testing.T, useMissionControl bool, useMsat bool,
 			t.Fatal("unexpected last hop")
 		}
 
-		if restrictions.OutgoingChannelIDs[0] != outgoingChan {
-			t.Fatal("unexpected outgoing channel id")
-		}
+		require.Equal(
+			t, restrictions.OutgoingChannelIDs, outgoingChanIds,
+		)
 
 		if !restrictions.DestFeatures.HasFeature(lnwire.MPPOptional) {
 			t.Fatal("unexpected dest features")
@@ -224,7 +228,7 @@ func testQueryRoutes(t *testing.T, useMissionControl bool, useMsat bool,
 		backend.MaxTotalTimelock = 1000
 	}
 
-	resp, err := backend.QueryRoutes(context.Background(), request)
+	resp, err := backend.QueryRoutes(t.Context(), request)
 
 	// If no MaxTotalTimelock was set for the QueryRoutes request, make
 	// sure an error was returned.
@@ -474,4 +478,461 @@ func testUnmarshalAMP(t *testing.T, test unmarshalAMPTest) {
 	default:
 		t.Fatalf("test case has non-standard outcome")
 	}
+}
+
+// extractIntentTestCase defines a test case for the
+// TestExtractIntentFromSendRequest function. It includes the test name, the
+// RouterBackend instance, the SendPaymentRequest to be tested, a boolean
+// indicating if the test case is valid, and the expected error message if
+// applicable.
+type extractIntentTestCase struct {
+	name             string
+	backend          *RouterBackend
+	sendReq          *SendPaymentRequest
+	valid            bool
+	expectedErrorMsg string
+}
+
+// TestExtractIntentFromSendRequest verifies that extractIntentFromSendRequest
+// correctly translates a SendPaymentRequest from an RPC client into a
+// LightningPayment intent.
+func TestExtractIntentFromSendRequest(t *testing.T) {
+	const paymentAmount = btcutil.Amount(300_000)
+
+	const paymentReq = "lnbcrt500u1pnh0xflpp56w08q26t896vg2e9mtdkrem320tp" +
+		"wws9z9sfr7dw86dx97d90u4sdqqcqzzsxqyz5vqsp5z9945kvfy5g9afmakz" +
+		"yrur2t4hhn2tr87un8j0r0e6l5m5zm0fus9qxpqysgqk98c6j7qefdpdmzt4" +
+		"g6aykds4ydvf2x9lpngqcfux3hv8qlraan9v3s9296r5w5eh959yzadgh5ck" +
+		"gjydgyfxdpumxtuk3p3caugmlqpz5necs"
+
+	const paymentReqMissingAddr = "lnbcrt100p1p70xwfzpp5qqqsyqcyq5rqwzqfq" +
+		"qqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kge" +
+		"tjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaqnp4q0n326hr8v9zprg8" +
+		"gsvezcch06gfaqqhde2aj730yg0durunfhv669qypqqqz3uu8wnr7883qzxr" +
+		"566nuhled49fx6e6q0jn06w6gpgyznwzxwf8xdmye87kpx0y8lqtcgwywsau" +
+		"0jkm66evelkw7cggwlegp4anv3cq62wusm"
+
+	destNodeBytes, err := hex.DecodeString(destKey)
+	require.NoError(t, err)
+
+	target, err := route.NewVertexFromBytes(destNodeBytes)
+	require.NoError(t, err)
+
+	mockClock := &lnmock.MockClock{}
+	mockClock.On("Now").Return(time.Date(2025, 3, 1, 13, 0, 0, 0, time.UTC))
+
+	testCases := []extractIntentTestCase{
+		{
+			name:    "Time preference out of range",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				TimePref: 2,
+			},
+			valid:            false,
+			expectedErrorMsg: "time preference out of range",
+		},
+		{
+			name:    "Invalid last hop pubkey length",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				LastHopPubkey: []byte{1},
+			},
+			valid:            false,
+			expectedErrorMsg: "invalid vertex length",
+		},
+		{
+			name: "total time lock exceeds max allowed",
+			backend: &RouterBackend{
+				MaxTotalTimelock: 1000,
+			},
+			sendReq: &SendPaymentRequest{
+				CltvLimit: 1001,
+			},
+			valid: false,
+			expectedErrorMsg: "total time lock of 1001 exceeds " +
+				"max allowed 1000",
+		},
+		{
+			name:    "Max parts exceed allowed limit",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				MaxParts:         1001,
+				MaxShardSizeMsat: 300_000,
+			},
+			valid: false,
+			expectedErrorMsg: "requested max_parts (1001) exceeds" +
+				" the allowed upper limit",
+		},
+		{
+			name: "Fee limit conflict, both sat and msat " +
+				"specified",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				FeeLimitSat:  1000000,
+				FeeLimitMsat: 1000000000,
+			},
+			valid: false,
+			expectedErrorMsg: "sat and msat arguments are " +
+				"mutually exclusive",
+		},
+		{
+			name:    "Fee limit cannot be negative",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				FeeLimitSat: -1,
+			},
+			valid:            false,
+			expectedErrorMsg: "amount cannot be negative",
+		},
+		{
+			name: "Dest custom records with type below minimum" +
+				" range",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				DestCustomRecords: map[uint64][]byte{
+					65530: {1, 2},
+				},
+			},
+			valid:            false,
+			expectedErrorMsg: "no custom records with types below",
+		},
+		{
+			name:    "MPP params with keysend payments",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				DestCustomRecords: map[uint64][]byte{
+					record.KeySendType: {1, 2},
+				},
+				MaxShardSizeMsat: 300_000,
+			},
+			valid: false,
+			expectedErrorMsg: "MPP not supported with keysend " +
+				"payments",
+		},
+		{
+			name: "Custom record entry with TLV type below " +
+				"minimum range",
+			backend: &RouterBackend{},
+			sendReq: &SendPaymentRequest{
+				FirstHopCustomRecords: map[uint64][]byte{
+					65530: {1, 2},
+				},
+			},
+			valid:            false,
+			expectedErrorMsg: "custom records entry with TLV type",
+		},
+		{
+			name: "Amount conflict, both sat and msat specified",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return true
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:     int64(paymentAmount),
+				AmtMsat: int64(paymentAmount) * 1000,
+			},
+			valid: false,
+			expectedErrorMsg: "sat and msat arguments are " +
+				"mutually exclusive",
+		},
+		{
+			name: "Both dest and payment_request provided",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:            int64(paymentAmount),
+				PaymentRequest: "test",
+				Dest:           destNodeBytes,
+			},
+			valid: false,
+			expectedErrorMsg: "dest and payment_request " +
+				"cannot appear together",
+		},
+		{
+			name: "Both payment_hash and payment_request provided",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:            int64(paymentAmount),
+				PaymentRequest: "test",
+				PaymentHash:    make([]byte, 32),
+			},
+			valid: false,
+			expectedErrorMsg: "payment_hash and payment_request " +
+				"cannot appear together",
+		},
+		{
+			name: "Both final_cltv_delta and payment_request " +
+				"provided",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:            int64(paymentAmount),
+				PaymentRequest: "test",
+				FinalCltvDelta: 100,
+			},
+			valid: false,
+			expectedErrorMsg: "final_cltv_delta and " +
+				"payment_request cannot appear together",
+		},
+		{
+			name: "Invalid payment request length",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+				ActiveNetParams: &chaincfg.RegressionNetParams,
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:            int64(paymentAmount),
+				PaymentRequest: "test",
+			},
+			valid:            false,
+			expectedErrorMsg: "invalid bech32 string length",
+		},
+		{
+			name: "Expired invoice payment request",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+				ActiveNetParams: &chaincfg.RegressionNetParams,
+				Clock:           mockClock,
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:            int64(paymentAmount),
+				PaymentRequest: paymentReq,
+			},
+			valid:            false,
+			expectedErrorMsg: "invoice expired.",
+		},
+		{
+			name: "Invoice missing payment address",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+				ActiveNetParams:  &chaincfg.RegressionNetParams,
+				MaxTotalTimelock: 1000,
+				Clock:            mockClock,
+			},
+			sendReq: &SendPaymentRequest{
+				PaymentRequest: paymentReqMissingAddr,
+			},
+			valid: false,
+			expectedErrorMsg: "payment request must contain " +
+				"either a payment address or blinded paths",
+		},
+		{
+			name: "Invalid dest vertex length",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Amt:  int64(paymentAmount),
+				Dest: []byte{1},
+			},
+			valid:            false,
+			expectedErrorMsg: "invalid vertex length",
+		},
+		{
+			name: "Payment request with missing amount",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:           destNodeBytes,
+				FinalCltvDelta: 100,
+			},
+			valid:            false,
+			expectedErrorMsg: "amount must be specified",
+		},
+		{
+			name: "Destination lacks AMP support",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:         destNodeBytes,
+				Amt:          int64(paymentAmount),
+				Amp:          true,
+				DestFeatures: []lnrpc.FeatureBit{},
+			},
+			valid: false,
+			expectedErrorMsg: "destination doesn't " +
+				"support AMP payments",
+		},
+		{
+			name: "Invalid payment hash length",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:        destNodeBytes,
+				Amt:         int64(paymentAmount),
+				PaymentHash: make([]byte, 1),
+			},
+			valid:            false,
+			expectedErrorMsg: "invalid hash length",
+		},
+		{
+			name: "Payment amount exceeds maximum possible amount",
+			backend: &RouterBackend{
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:             destNodeBytes,
+				Amt:              int64(paymentAmount),
+				PaymentHash:      make([]byte, 32),
+				MaxParts:         10,
+				MaxShardSizeMsat: 300_000,
+			},
+			valid: false,
+			expectedErrorMsg: "payment amount 300000000 mSAT " +
+				"exceeds maximum possible amount",
+		},
+		{
+			name: "Reject self-payments if not permitted",
+			backend: &RouterBackend{
+				MaxTotalTimelock: 1000,
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+				SelfNode: target,
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:        destNodeBytes,
+				Amt:         int64(paymentAmount),
+				PaymentHash: make([]byte, 32),
+			},
+			valid:            false,
+			expectedErrorMsg: "self-payments not allowed",
+		},
+		{
+			name: "Required and optional feature bits set",
+			backend: &RouterBackend{
+				MaxTotalTimelock: 1000,
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:             destNodeBytes,
+				Amt:              int64(paymentAmount),
+				PaymentHash:      make([]byte, 32),
+				MaxParts:         10,
+				MaxShardSizeMsat: 30_000_000,
+				DestFeatures: []lnrpc.FeatureBit{
+					lnrpc.FeatureBit_GOSSIP_QUERIES_OPT,
+					lnrpc.FeatureBit_GOSSIP_QUERIES_REQ,
+				},
+			},
+			valid: true,
+		},
+		{
+			name: "Valid send req parameters, payment settled",
+			backend: &RouterBackend{
+				MaxTotalTimelock: 1000,
+				ShouldSetExpAccountability: func() bool {
+					return false
+				},
+			},
+			sendReq: &SendPaymentRequest{
+				Dest:             destNodeBytes,
+				Amt:              int64(paymentAmount),
+				PaymentHash:      make([]byte, 32),
+				MaxParts:         10,
+				MaxShardSizeMsat: 30_000_000,
+			},
+			valid: true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := test.backend.
+				extractIntentFromSendRequest(test.sendReq)
+
+			if test.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err,
+					test.expectedErrorMsg)
+			}
+		})
+	}
+}
+
+// TestMarshallRouteChanCapacity verifies that MarshallRoute correctly sets the
+// ChanCapacity for each hop based on the incoming amount at that hop, not
+// the total route amount. This is a regression test to ensure the
+// incomingAmt is updated per hop.
+func TestMarshallRouteChanCapacity(t *testing.T) {
+	t.Parallel()
+
+	// Build a two-hop route: source -> hop1 -> hop2 -> dest.
+	//
+	// TotalAmount (incoming to hop1) = 1000 msat
+	// hop1.AmtToForward (incoming to hop2) = 900 msat (after fee)
+	const (
+		totalAmtMsat = lnwire.MilliSatoshi(1000)
+		hop1Forward  = lnwire.MilliSatoshi(900)
+		hop2Forward  = lnwire.MilliSatoshi(900)
+	)
+
+	hops := []*route.Hop{
+		{
+			ChannelID:    1,
+			AmtToForward: hop1Forward,
+			PubKeyBytes:  node1,
+		},
+		{
+			ChannelID:    2,
+			AmtToForward: hop2Forward,
+			PubKeyBytes:  node2,
+		},
+	}
+
+	r, err := route.NewRouteFromHops(totalAmtMsat, 100, sourceKey, hops)
+	require.NoError(t, err)
+
+	backend := &RouterBackend{}
+	rpcRoute, err := backend.MarshallRoute(r)
+	require.NoError(t, err)
+	require.Len(t, rpcRoute.Hops, 2)
+
+	// The first hop's capacity should reflect the total incoming amount
+	// (route.TotalAmount), converted to satoshis.
+	require.EqualValues(
+		t, totalAmtMsat.ToSatoshis(), rpcRoute.Hops[0].ChanCapacity,
+	)
+
+	// The second hop's capacity should reflect hop1's forwarded amount, not
+	// the total route amount. Before the fix, both hops incorrectly used
+	// the total route amount.
+	require.EqualValues(
+		t, hop1Forward.ToSatoshis(), rpcRoute.Hops[1].ChanCapacity,
+	)
 }

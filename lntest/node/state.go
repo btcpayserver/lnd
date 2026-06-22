@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest/rpc"
@@ -308,13 +309,26 @@ func (s *State) updateUTXOStats() {
 
 // updateEdgeStats counts the total edges.
 func (s *State) updateEdgeStats() {
+	// filterDisabled is a helper closure that filters out disabled
+	// channels.
+	filterDisabled := func(edge *lnrpc.ChannelEdge) bool {
+		if edge.Node1Policy != nil && edge.Node1Policy.Disabled {
+			return false
+		}
+		if edge.Node2Policy != nil && edge.Node2Policy.Disabled {
+			return false
+		}
+
+		return true
+	}
+
 	req := &lnrpc.ChannelGraphRequest{IncludeUnannounced: true}
 	resp := s.rpc.DescribeGraph(req)
-	s.Edge.Total = len(resp.Edges)
+	s.Edge.Total = len(fn.Filter(resp.Edges, filterDisabled))
 
 	req = &lnrpc.ChannelGraphRequest{IncludeUnannounced: false}
 	resp = s.rpc.DescribeGraph(req)
-	s.Edge.Public = len(resp.Edges)
+	s.Edge.Public = len(fn.Filter(resp.Edges, filterDisabled))
 }
 
 // updateWalletBalance creates stats for the node's wallet balance.

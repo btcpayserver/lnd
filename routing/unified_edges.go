@@ -1,12 +1,12 @@
 package routing
 
 import (
+	"context"
 	"math"
 
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/lntypes"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -59,6 +59,9 @@ func (u *nodeEdgeUnifier) addPolicy(fromNode route.Vertex,
 	// Skip channels if there is an outgoing channel restriction.
 	if localChan && u.outChanRestr != nil {
 		if _, ok := u.outChanRestr[edge.ChannelID]; !ok {
+			log.Debugf("Skipped adding policy for restricted edge "+
+				"%v", edge.ChannelID)
+
 			return
 		}
 	}
@@ -95,14 +98,34 @@ func (u *nodeEdgeUnifier) addPolicy(fromNode route.Vertex,
 // addGraphPolicies adds all policies that are known for the toNode in the
 // graph.
 func (u *nodeEdgeUnifier) addGraphPolicies(g Graph) error {
-	cb := func(channel *channeldb.DirectedChannel) error {
+	var channels []*graphdb.DirectedChannel
+	cb := func(channel *graphdb.DirectedChannel) error {
 		// If there is no edge policy for this candidate node, skip.
 		// Note that we are searching backwards so this node would have
 		// come prior to the pivot node in the route.
 		if channel.InPolicy == nil {
+			log.Debugf("Skipped adding edge %v due to nil policy",
+				channel.ChannelID)
+
 			return nil
 		}
 
+		channels = append(channels, channel)
+
+		return nil
+	}
+
+	// Iterate over all channels of the to node.
+	err := g.ForEachNodeDirectedChannel(
+		context.TODO(), u.toNode, cb, func() {
+			channels = nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, channel := range channels {
 		// Add this policy to the corresponding edgeUnifier. We default
 		// to the clear hop payload size function because
 		// `addGraphPolicies` is only used for cleartext intermediate
@@ -115,12 +138,9 @@ func (u *nodeEdgeUnifier) addGraphPolicies(g Graph) error {
 			channel.OtherNode, channel.InPolicy, inboundFee,
 			channel.Capacity, defaultHopPayloadSize, nil,
 		)
-
-		return nil
 	}
 
-	// Iterate over all channels of the to node.
-	return g.ForEachNodeChannel(u.toNode, cb)
+	return nil
 }
 
 // unifiedEdge is the individual channel data that is kept inside an edgeUnifier
@@ -169,7 +189,7 @@ func (u *unifiedEdge) amtInRange(amt lnwire.MilliSatoshi) bool {
 	}
 
 	// Skip channels for which this htlc is too large.
-	if u.policy.MessageFlags.HasMaxHtlc() &&
+	if u.policy.HasMaxHTLC &&
 		amt > u.policy.MaxHTLC {
 
 		log.Tracef("Exceeds policy's MaxHTLC: amt=%v, MaxHTLC=%v",
@@ -246,12 +266,13 @@ func (u *edgeUnifier) getEdgeLocal(netAmtReceived lnwire.MilliSatoshi,
 		// Add inbound fee to get to the amount that is sent over the
 		// local channel.
 		amt := netAmtReceived + lnwire.MilliSatoshi(inboundFee)
-
 		// Check valid amount range for the channel. We skip this test
-		// for payments with custom HTLC data, as the amount sent on
-		// the BTC layer may differ from the amount that is actually
-		// forwarded in custom channels.
-		if bandwidthHints.firstHopCustomBlob().IsNone() &&
+
+		// for payments with custom htlc data we skip the amount range
+		// check because the amt of the payment does not relate to the
+		// actual amount carried by the HTLC but instead is encoded in
+		// the blob data.
+		if !bandwidthHints.isCustomHTLCPayment() &&
 			!edge.amtInRange(amt) {
 
 			log.Debugf("Amount %v not in range for edge %v",
@@ -275,8 +296,9 @@ func (u *edgeUnifier) getEdgeLocal(netAmtReceived lnwire.MilliSatoshi,
 			edge.policy.ChannelID, amt,
 		)
 		if !ok {
-			log.Debugf("Cannot get bandwidth for edge %v, use max "+
+			log.Warnf("Cannot get bandwidth for edge %v, use max "+
 				"instead", edge.policy.ChannelID)
+
 			bandwidth = lnwire.MaxMilliSatoshi
 		}
 
@@ -355,9 +377,7 @@ func (u *edgeUnifier) getEdgeNetwork(netAmtReceived lnwire.MilliSatoshi,
 		}
 
 		// For network channels, skip the disabled ones.
-		edgeFlags := edge.policy.ChannelFlags
-		isDisabled := edgeFlags&lnwire.ChanUpdateDisabled != 0
-		if isDisabled {
+		if edge.policy.IsDisabled {
 			log.Debugf("Skipped edge %v due to it being disabled",
 				edge.policy.ChannelID)
 			continue
@@ -366,20 +386,18 @@ func (u *edgeUnifier) getEdgeNetwork(netAmtReceived lnwire.MilliSatoshi,
 		// Track the maximal capacity for usable channels. If we don't
 		// know the capacity, we fall back to MaxHTLC.
 		capMsat := lnwire.NewMSatFromSatoshis(edge.capacity)
-		if capMsat == 0 && edge.policy.MessageFlags.HasMaxHtlc() {
+		if capMsat == 0 && edge.policy.HasMaxHTLC {
 			log.Tracef("No capacity available for channel %v, "+
 				"using MaxHtlcMsat (%v) as a fallback.",
 				edge.policy.ChannelID, edge.policy.MaxHTLC)
 
 			capMsat = edge.policy.MaxHTLC
 		}
-		maxCapMsat = lntypes.Max(capMsat, maxCapMsat)
+		maxCapMsat = max(capMsat, maxCapMsat)
 
 		// Track the maximum time lock of all channels that are
 		// candidate for non-strict forwarding at the routing node.
-		maxTimelock = lntypes.Max(
-			maxTimelock, edge.policy.TimeLockDelta,
-		)
+		maxTimelock = max(maxTimelock, edge.policy.TimeLockDelta)
 
 		outboundFee := int64(edge.policy.ComputeFee(amt))
 		fee := outboundFee + inboundFee
@@ -434,10 +452,10 @@ func (u *edgeUnifier) getEdgeNetwork(netAmtReceived lnwire.MilliSatoshi,
 
 // minAmt returns the minimum amount that can be forwarded on this connection.
 func (u *edgeUnifier) minAmt() lnwire.MilliSatoshi {
-	min := lnwire.MaxMilliSatoshi
+	minAmount := lnwire.MaxMilliSatoshi
 	for _, edge := range u.edges {
-		min = lntypes.Min(min, edge.policy.MinHTLC)
+		minAmount = min(minAmount, edge.policy.MinHTLC)
 	}
 
-	return min
+	return minAmount
 }
