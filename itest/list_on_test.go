@@ -456,6 +456,14 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testForwardInterceptorRestart,
 	},
 	{
+		Name:     "forward interceptor on chain settle after restart",
+		TestFunc: testForwardInterceptorOnChainSettleAfterRestart,
+	},
+	{
+		Name:     "forward interceptor on chain settle no restart",
+		TestFunc: testForwardInterceptorOnChainSettleNoRestart,
+	},
+	{
 		Name:     "delete forwarding history",
 		TestFunc: testDeleteForwardingHistory,
 	},
@@ -494,6 +502,10 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "sign output raw",
 		TestFunc: testSignOutputRaw,
+	},
+	{
+		Name:     "submit package",
+		TestFunc: testSubmitPackage,
 	},
 	{
 		Name:     "sign verify message",
@@ -618,6 +630,18 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "blinded payment htlc re-forward",
 		TestFunc: testBlindedPaymentHTLCReForward,
+	},
+	{
+		Name:     "blinded route next node id",
+		TestFunc: testBlindedRouteNextNodeID,
+	},
+	{
+		Name:     "blinded route next node id private channel",
+		TestFunc: testBlindedRouteNextNodeIDPrivateChannel,
+	},
+	{
+		Name:     "blinded route next node id restart",
+		TestFunc: testBlindedRouteNextNodeIDRestart,
 	},
 	{
 		Name:     "query blinded route",

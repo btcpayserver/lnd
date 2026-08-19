@@ -6,6 +6,7 @@ import (
 
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
@@ -44,15 +45,19 @@ type preimageBeacon struct {
 	subscribers   map[uint64]*preimageSubscriber
 
 	interceptor func(htlcswitch.InterceptedForward) error
+
+	cancelInterceptor func(models.CircuitKey) error
 }
 
 func newPreimageBeacon(wCache witnessCache,
-	interceptor func(htlcswitch.InterceptedForward) error) *preimageBeacon {
+	interceptor func(htlcswitch.InterceptedForward) error,
+	cancelInterceptor func(models.CircuitKey) error) *preimageBeacon {
 
 	return &preimageBeacon{
-		wCache:      wCache,
-		interceptor: interceptor,
-		subscribers: make(map[uint64]*preimageSubscriber),
+		wCache:            wCache,
+		interceptor:       interceptor,
+		cancelInterceptor: cancelInterceptor,
+		subscribers:       make(map[uint64]*preimageSubscriber),
 	}
 }
 
@@ -64,48 +69,73 @@ func (p *preimageBeacon) SubscribeUpdates(
 	nextHopOnionBlob []byte) (*contractcourt.WitnessSubscription, error) {
 
 	p.Lock()
-	defer p.Unlock()
-
 	clientID := p.clientCounter
 	client := &preimageSubscriber{
 		updateChan: make(chan lntypes.Preimage, 10),
 		quit:       make(chan struct{}),
 	}
 
-	p.subscribers[p.clientCounter] = client
+	p.subscribers[clientID] = client
 
 	p.clientCounter++
+	p.Unlock()
 
 	srvrLog.Debugf("Creating new witness beacon subscriber, id=%v",
-		p.clientCounter)
+		clientID)
+
+	inKey := models.CircuitKey{
+		ChanID: chanID,
+		HtlcID: htlc.HtlcIndex,
+	}
 
 	sub := &contractcourt.WitnessSubscription{
 		WitnessUpdates: client.updateChan,
 		CancelSubscription: func() {
 			p.Lock()
-			defer p.Unlock()
 
 			delete(p.subscribers, clientID)
 
 			close(client.quit)
+			p.Unlock()
+
+			err := p.cancelInterceptor(inKey)
+			if err != nil {
+				srvrLog.Errorf("Cannot remove on-chain "+
+					"intercept %v: %v", inKey, err)
+			}
 		},
 	}
 
+	// Report the forwarding next hop to the interceptor. A channel-ID next
+	// hop is reported directly; a node-ID next hop has no outgoing channel
+	// of its own, so outgoingChanID is hop.Exit and the requested node ID
+	// is exposed separately, exactly as the off-chain interceptor does.
+	// This is the requested next hop, not the channel that non-strict
+	// forwarding eventually selects, so we deliberately do not resolve it
+	// against the circuit map. The RPC boundary maps a node-ID hop to the
+	// NodeIDForwardSCID sentinel for the client.
+	//
 	// Notify the htlc interceptor. There may be a client connected
 	// and willing to supply a preimage.
 	packet := &htlcswitch.InterceptedPacket{
-		Hash:           htlc.RHash,
-		IncomingExpiry: htlc.RefundTimeout,
-		IncomingAmount: htlc.Amt,
-		IncomingCircuit: models.CircuitKey{
-			ChanID: chanID,
-			HtlcID: htlc.HtlcIndex,
-		},
-		OutgoingChanID:       payload.FwdInfo.NextHop,
-		OutgoingExpiry:       payload.FwdInfo.OutgoingCTLV,
+		Hash:            htlc.RHash,
+		IncomingExpiry:  htlc.RefundTimeout,
+		IncomingAmount:  htlc.Amt,
+		IncomingCircuit: inKey,
+		OutgoingChanID: payload.FwdInfo.NextHopChannel().UnwrapOr(
+			hop.Exit,
+		),
+		OutgoingNodeID:       payload.FwdInfo.NextHopNode(),
+		OutgoingExpiry:       payload.FwdInfo.OutgoingCLTV,
 		OutgoingAmount:       payload.FwdInfo.AmountToForward,
 		InOnionCustomRecords: payload.CustomRecords(),
 		InWireCustomRecords:  htlc.CustomRecords,
+		// Keep the on-chain intercept available to the
+		// interceptor until the HTLC expires on chain.
+		Deadline: fn.NewRight[
+			htlcswitch.OffChainAutoFailHeight,
+			htlcswitch.OnChainSettleDeadline,
+		](htlcswitch.OnChainSettleDeadline(htlc.RefundTimeout)),
 	}
 	copy(packet.OnionBlob[:], nextHopOnionBlob)
 
@@ -113,6 +143,8 @@ func (p *preimageBeacon) SubscribeUpdates(
 
 	err := p.interceptor(fwd)
 	if err != nil {
+		sub.CancelSubscription()
+
 		return nil, err
 	}
 

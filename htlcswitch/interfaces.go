@@ -381,6 +381,14 @@ type InterceptableHtlcForwarder interface {
 // and resolve it later or let the switch execute its default behavior.
 type ForwardInterceptor func(InterceptedPacket) error
 
+// NodeIDForwardSCID is the sentinel outgoing SCID reported to HTLC interceptor
+// clients (at the RPC boundary) for a next hop identified by node ID (BOLT 4
+// next_node_id) rather than by channel. All bits are set, an out-of-range value
+// that can never match a real or alias channel, so a client switching on a zero
+// SCID to detect the exit hop does not read the forward as a final receive. The
+// pubkey is in InterceptedPacket.OutgoingNodeID.
+const NodeIDForwardSCID uint64 = ^uint64(0)
+
 // InterceptedPacket contains the relevant information for the interceptor about
 // an HTLC.
 type InterceptedPacket struct {
@@ -388,8 +396,16 @@ type InterceptedPacket struct {
 	// packet.
 	IncomingCircuit models.CircuitKey
 
-	// OutgoingChanID is the destination channel for this packet.
+	// OutgoingChanID is the destination channel for this packet. For a
+	// node-ID next hop with no concrete channel known yet it is hop.Exit
+	// and OutgoingNodeID holds the pubkey; the RPC layer maps that to the
+	// NodeIDForwardSCID sentinel before reporting it to a client.
 	OutgoingChanID lnwire.ShortChannelID
+
+	// OutgoingNodeID is the next hop's compressed pubkey for a blinded
+	// route that identifies it by node ID (next_node_id). None in the
+	// common channel-ID case.
+	OutgoingNodeID fn.Option[[33]byte]
 
 	// Hash is the payment hash of the htlc.
 	Hash lntypes.Hash
@@ -419,9 +435,34 @@ type InterceptedPacket struct {
 	// were defined by the peer that forwarded this HTLC to us.
 	InWireCustomRecords lnwire.CustomRecords
 
-	// AutoFailHeight is the block height at which this intercept will be
-	// failed back automatically.
-	AutoFailHeight int32
+	// Deadline describes how long this intercepted HTLC remains actionable.
+	// Off-chain forwards are auto-failed at this height, while on-chain
+	// forwards can be settled until this height.
+	Deadline fn.Either[OffChainAutoFailHeight, OnChainSettleDeadline]
+}
+
+// OffChainAutoFailHeight is the block height at which an off-chain intercepted
+// HTLC will be failed back automatically to prevent the incoming channel from
+// force-closing.
+type OffChainAutoFailHeight int32
+
+// OnChainSettleDeadline is the block height until which an on-chain
+// intercepted HTLC can be settled before the timeout path becomes available.
+type OnChainSettleDeadline int32
+
+// AutoFailHeight returns the legacy RPC auto_fail_height projection for an
+// intercepted packet. For on-chain packets, the value is the settlement
+// deadline exposed through the existing RPC field for compatibility.
+func (p InterceptedPacket) AutoFailHeight() int32 {
+	return fn.ElimEither(
+		p.Deadline,
+		func(h OffChainAutoFailHeight) int32 {
+			return int32(h)
+		},
+		func(d OnChainSettleDeadline) int32 {
+			return int32(d)
+		},
+	)
 }
 
 // InterceptedForward is passed to the ForwardInterceptor for every forwarded

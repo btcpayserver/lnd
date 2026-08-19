@@ -88,7 +88,7 @@ func FuzzOnionPacket(f *testing.F) {
 func hopFromPayload(p *Payload) (*route.Hop, uint64) {
 	return &route.Hop{
 		AmtToForward:     p.FwdInfo.AmountToForward,
-		OutgoingTimeLock: p.FwdInfo.OutgoingCTLV,
+		OutgoingTimeLock: p.FwdInfo.OutgoingCLTV,
 		MPP:              p.MPP,
 		AMP:              p.AMP,
 		Metadata:         p.metadata,
@@ -96,7 +96,7 @@ func hopFromPayload(p *Payload) (*route.Hop, uint64) {
 		BlindingPoint:    p.blindingPoint,
 		CustomRecords:    p.customRecords,
 		TotalAmtMsat:     p.totalAmtMsat,
-	}, p.FwdInfo.NextHop.ToUint64()
+	}, p.FwdInfo.NextHop.UnwrapLeftOr(Exit).ToUint64()
 }
 
 // FuzzPayloadFinal fuzzes final hop payloads, providing the additional context

@@ -96,9 +96,20 @@ func (r *forwardInterceptor) onIntercept(
 		IncomingExpiry:          htlc.IncomingExpiry,
 		CustomRecords:           htlc.InOnionCustomRecords,
 		OnionBlob:               htlc.OnionBlob[:],
-		AutoFailHeight:          htlc.AutoFailHeight,
+		AutoFailHeight:          htlc.AutoFailHeight(),
 		InWireCustomRecords:     htlc.InWireCustomRecords,
 	}
+
+	// A node-ID forward has no requested outgoing channel. Expose the
+	// requested pubkey and report the reserved NodeIDForwardSCID sentinel
+	// rather than a zero SCID. Older un-upgraded protobuf clients do not
+	// know about outgoing_requested_node_id and would otherwise interpret
+	// a zero SCID as an exit hop.
+	htlc.OutgoingNodeID.WhenSome(func(nodeID [33]byte) {
+		interceptionRequest.OutgoingRequestedNodeId = nodeID[:]
+		interceptionRequest.OutgoingRequestedChanId =
+			htlcswitch.NodeIDForwardSCID
+	})
 
 	return r.stream.Send(interceptionRequest)
 }

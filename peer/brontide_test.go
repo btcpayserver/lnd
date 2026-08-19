@@ -179,6 +179,131 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 	notifier.ConfChan <- &chainntnfs.TxConfirmation{}
 }
 
+// TestPeerChannelClosureFlushDrivesNegotiation checks that a legacy cooperative
+// close holds off on fee negotiation until the link reports that the channel
+// has drained, and that the report is what carries the negotiation forward. The
+// link notices the flush on its own goroutine, so it hands the channel to the
+// channelManager rather than advancing the closer itself.
+func TestPeerChannelClosureFlushDrivesNegotiation(t *testing.T) {
+	t.Parallel()
+
+	harness, err := createTestPeerWithChannel(t, noUpdate)
+	require.NoError(t, err, "unable to create test channels")
+
+	var (
+		alicePeer       = harness.peer
+		bobChan         = harness.channel
+		mockSwitch      = harness.mockSwitch
+		broadcastTxChan = harness.publishTx
+		notifier        = harness.notifier
+	)
+
+	chanPoint := bobChan.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+	// The link holds on to the flush hook rather than running it inline, so
+	// we get to say when the channel looks drained.
+	mockLink := newDeferredFlushUpdateHandler(chanID)
+	mockSwitch.links = append(mockSwitch.links, mockLink)
+
+	dummyDeliveryScript := genScript(t, p2wshAddress)
+
+	// We send a shutdown request to Alice, and expect her own Shutdown in
+	// response.
+	alicePeer.chanCloseMsgs <- &closeMsg{
+		cid: chanID,
+		msg: lnwire.NewShutdown(chanID, dummyDeliveryScript),
+	}
+
+	var msg lnwire.Message
+	select {
+	case outMsg := <-alicePeer.outgoingQueue:
+		msg = outMsg.msg
+	case <-time.After(timeout):
+		t.Fatalf("did not receive shutdown message")
+	}
+
+	shutdownMsg, ok := msg.(*lnwire.Shutdown)
+	require.True(t, ok, "expected Shutdown message, got %T", msg)
+
+	respDeliveryScript := shutdownMsg.Address
+
+	// The channel hasn't drained yet, so Alice shouldn't have opened fee
+	// negotiation, even though she's the one that funded the channel.
+	select {
+	case outMsg := <-alicePeer.outgoingQueue:
+		t.Fatalf("negotiation started before the channel flushed: %T",
+			outMsg.msg)
+
+	case <-time.After(shortTimeout):
+	}
+
+	// A flush report for a channel we have no closer for should be dropped
+	// on the floor rather than start anything.
+	var unknownChanID lnwire.ChannelID
+	select {
+	case alicePeer.chanCloseFlushed <- unknownChanID:
+	case <-time.After(timeout):
+		t.Fatalf("channelManager not reading flush reports")
+	}
+
+	// Now we let the link report the flush, which is what should carry the
+	// negotiation into its fee phase.
+	select {
+	case hook := <-mockLink.flushHooks:
+		go hook()
+	case <-time.After(timeout):
+		t.Fatalf("no flush hook was registered")
+	}
+
+	select {
+	case outMsg := <-alicePeer.outgoingQueue:
+		msg = outMsg.msg
+	case <-time.After(timeout):
+		t.Fatalf("did not receive ClosingSigned message")
+	}
+
+	respClosingSigned, ok := msg.(*lnwire.ClosingSigned)
+	require.True(t, ok, "expected ClosingSigned message, got %T", msg)
+
+	// We accept the fee, and send a ClosingSigned with the same fee back so
+	// she knows we agreed.
+	aliceFee := respClosingSigned.FeeSatoshis
+	bobSig, _, _, err := bobChan.CreateCloseProposal(
+		aliceFee, dummyDeliveryScript, respDeliveryScript,
+	)
+	require.NoError(t, err, "error creating close proposal")
+
+	parsedSig, err := lnwire.NewSigFromSignature(bobSig)
+	require.NoError(t, err, "error parsing signature")
+
+	alicePeer.chanCloseMsgs <- &closeMsg{
+		cid: chanID,
+		msg: lnwire.NewClosingSigned(chanID, aliceFee, parsedSig),
+	}
+
+	// Alice should now see that we agreed on the fee, and broadcast the
+	// closing transaction.
+	select {
+	case <-broadcastTxChan:
+	case <-time.After(timeout):
+		t.Fatalf("closing tx not broadcast")
+	}
+
+	// Need to pull the remaining message off of Alice's outgoing queue.
+	select {
+	case outMsg := <-alicePeer.outgoingQueue:
+		msg = outMsg.msg
+	case <-time.After(timeout):
+		t.Fatalf("did not receive ClosingSigned message")
+	}
+	_, ok = msg.(*lnwire.ClosingSigned)
+	require.True(t, ok, "expected ClosingSigned message, got %T", msg)
+
+	// Alice should be waiting in a goroutine for a confirmation.
+	notifier.ConfChan <- &chainntnfs.TxConfirmation{}
+}
+
 // TestPeerChannelClosureAcceptFeeInitiator tests the shutdown initiator's
 // behavior if we can agree on the fee immediately.
 func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
@@ -1842,4 +1967,101 @@ func TestHasActiveChannels(t *testing.T) {
 
 	require.False(t, peer.hasActiveChannels())
 	require.Equal(t, int32(0), peer.numActiveChans.Load())
+}
+
+// TestRbfCoopCloseAllowed asserts that the per-channel RBF coop close
+// predicate excludes aux channels (channel types carrying a tapscript root)
+// even when both peers have negotiated the RBF coop close feature, while
+// permitting it for all other channel types.
+func TestRbfCoopCloseAllowed(t *testing.T) {
+	t.Parallel()
+
+	newPeer := func(local, remote *lnwire.RawFeatureVector) *Brontide {
+		return &Brontide{
+			cfg: Config{
+				Features: lnwire.NewFeatureVector(
+					local, lnwire.Features,
+				),
+			},
+			remoteFeatures: lnwire.NewFeatureVector(
+				remote, lnwire.Features,
+			),
+		}
+	}
+
+	var (
+		noBits = lnwire.NewRawFeatureVector()
+		rbfBit = lnwire.NewRawFeatureVector(
+			lnwire.RbfCoopCloseOptional,
+		)
+		stagingBit = lnwire.NewRawFeatureVector(
+			lnwire.RbfCoopCloseOptionalStaging,
+		)
+
+		overlayChan = channeldb.SimpleTaprootFeatureBit |
+			channeldb.TapscriptRootBit
+	)
+
+	tests := []struct {
+		name     string
+		peer     *Brontide
+		chanType channeldb.ChannelType
+		allowed  bool
+	}{
+		{
+			name:     "both signal, plain channel",
+			peer:     newPeer(rbfBit, rbfBit),
+			chanType: channeldb.SingleFunderTweaklessBit,
+			allowed:  true,
+		},
+		{
+			name:     "both signal staging, plain channel",
+			peer:     newPeer(stagingBit, stagingBit),
+			chanType: channeldb.SingleFunderTweaklessBit,
+			allowed:  true,
+		},
+		{
+			name:     "both signal, simple taproot channel",
+			peer:     newPeer(rbfBit, rbfBit),
+			chanType: channeldb.SimpleTaprootFeatureBit,
+			allowed:  true,
+		},
+		{
+			name:     "both signal, aux (overlay) channel",
+			peer:     newPeer(rbfBit, rbfBit),
+			chanType: overlayChan,
+			allowed:  false,
+		},
+		{
+			name:     "both signal staging, aux (overlay) channel",
+			peer:     newPeer(stagingBit, stagingBit),
+			chanType: overlayChan,
+			allowed:  false,
+		},
+		{
+			name:     "only local signals, plain channel",
+			peer:     newPeer(rbfBit, noBits),
+			chanType: channeldb.SingleFunderTweaklessBit,
+			allowed:  false,
+		},
+		{
+			name:     "neither signals, aux (overlay) channel",
+			peer:     newPeer(noBits, noBits),
+			chanType: overlayChan,
+			allowed:  false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(
+				t, test.allowed,
+				test.peer.rbfCoopCloseAllowed(
+					test.chanType,
+				),
+			)
+		})
+	}
 }

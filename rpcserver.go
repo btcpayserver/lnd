@@ -3000,13 +3000,27 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 			rpcsLog.Infof("Bypassing Switch to do fee bump "+
 				"for ChannelPoint(%v)", chanPoint)
 
-			closeUpdates, err := r.server.AttemptRBFCloseUpdate(
-				updateStream.Context(), *chanPoint, feeRate,
-				deliveryScript,
+			// To perform this RBF bump, we'll send a bump message
+			// to the RBF close actor. We propagate the stream
+			// context so that cancellation of the RPC client also
+			// tears down the observer goroutine.
+			ctx := updateStream.Context()
+			rbfBumpMsg := peer.NewRbfBumpCloseMsg(
+				ctx, *chanPoint, feeRate, deliveryScript,
 			)
+			rbfActorKey := peer.NewRbfCloserPeerServiceKey(
+				*chanPoint,
+			)
+			rbfRouter := peer.RbfChanCloserRouter(
+				r.server.actorSystem, rbfActorKey,
+			)
+
+			closeUpdates, err := rbfRouter.Ask(
+				ctx, rbfBumpMsg,
+			).Await(ctx).Unpack()
 			if err != nil {
-				return fmt.Errorf("unable to do RBF close "+
-					"update: %w", err)
+				return fmt.Errorf("unable to ask for RBF "+
+					"close: %w", err)
 			}
 
 			updateChan = closeUpdates.UpdateChan
@@ -7487,14 +7501,10 @@ func (r *rpcServer) UpdateChannelPolicy(ctx context.Context,
 
 	// We'll also ensure that the user isn't setting a CLTV delta that
 	// won't give outgoing HTLCs enough time to fully resolve if needed.
-	if req.TimeLockDelta < minTimeLockDelta {
-		return nil, fmt.Errorf("time lock delta of %v is too small, "+
-			"minimum supported is %v", req.TimeLockDelta,
-			minTimeLockDelta)
-	} else if req.TimeLockDelta > uint32(MaxTimeLockDelta) {
-		return nil, fmt.Errorf("time lock delta of %v is too big, "+
-			"maximum supported is %v", req.TimeLockDelta,
-			MaxTimeLockDelta)
+	if err := validateChannelPolicyTimeLockDelta(
+		req.TimeLockDelta, r.cfg.MaxOutgoingCltvExpiry,
+	); err != nil {
+		return nil, err
 	}
 
 	// By default, positive inbound fees are rejected.
