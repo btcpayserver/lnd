@@ -1,0 +1,161 @@
+# Release Notes
+- [Bug Fixes](#bug-fixes)
+- [New Features](#new-features)
+    - [Functional Enhancements](#functional-enhancements)
+    - [RPC Additions](#rpc-additions)
+    - [lncli Additions](#lncli-additions)
+- [Improvements](#improvements)
+    - [Functional Updates](#functional-updates)
+    - [RPC Updates](#rpc-updates)
+    - [lncli Updates](#lncli-updates)
+    - [Breaking Changes](#breaking-changes)
+    - [Performance Improvements](#performance-improvements)
+    - [Deprecations](#deprecations)
+- [Technical and Architectural Updates](#technical-and-architectural-updates)
+    - [BOLT Spec Updates](#bolt-spec-updates)
+    - [Testing](#testing)
+    - [Database](#database)
+    - [Code Health](#code-health)
+    - [Tooling and Documentation](#tooling-and-documentation)
+- [Contributors (Alphabetical Order)](#contributors-alphabetical-order)
+
+# Bug Fixes
+
+* [Fixed a bug](https://github.com/lightningnetwork/lnd/pull/10782)
+  that could be encountered during co-op closes whereby
+  `ChanStatusCoopBroadcasted` was set before a close transaction
+  actually existed. As a side effect, channels in shutdown
+  negotiation now remain in `ListChannels` (as inactive) until
+  the close transaction is actually broadcast, and
+  `WaitingCloseChannel.ClosingTx` is never empty.
+
+* Peer connections [now rate limit inbound ping replies and bound outgoing
+  message queue growth](https://github.com/lightningnetwork/lnd/pull/11131),
+  preventing peer-controlled resource exhaustion.
+
+* Channel updates carrying [inbound fees now sign the same bytes that are
+  broadcast](https://github.com/lightningnetwork/lnd/pull/11131), preventing
+  remote signature failures. Forwarded updates also preserve unknown signed
+  TLV extensions.
+
+* Channel funding attempts [now return
+  cleanly](https://github.com/lightningnetwork/lnd/pull/11035) when their
+  pending wallet reservation is no longer present.
+
+* Zero-block [`query_channel_range` and `reply_channel_range`
+  messages](https://github.com/lightningnetwork/lnd/pull/11035) now retain their
+  first block height when calculating a defensive range boundary, and dense
+  first blocks no longer produce zero-block reply prefixes.
+
+* [`GetTransactions`
+  pagination](https://github.com/lightningnetwork/lnd/pull/11075) now handles
+  overflowing offset and limit combinations without reaching a slice-bounds
+  panic.
+
+* [Fixed an issue](https://github.com/lightningnetwork/lnd/pull/10869) where an
+  incoming HTLC resolver could treat a foreign commitment spend as its own
+  success transaction and offer a phantom input to the sweeper.
+
+* Native SQL invoice migration [now correctly associates legacy AMP invoice
+  HTLCs](https://github.com/lightningnetwork/lnd/pull/11106) with their AMP
+  sub-invoices. Previously, the HTLC rows were inserted without those
+  associations, causing verification to fail and the migration transaction to
+  roll back.
+
+* [Fixed a lock order inversion](https://github.com/lightningnetwork/lnd/pull/11008)
+  between `PsbtFundingVerify` and `handleFundingCancelRequest` in the wallet.
+  With PSBT or batch funding the two could deadlock the wallet's single
+  `requestHandler` goroutine, which permanently disabled all channel funding for
+  the whole node: no new channel could be opened, and channels whose funding
+  transaction confirmed stayed in the `channelReadySent` opening state forever,
+  never added to the graph and never announced. Only a restart recovered.
+
+* [Fixed coop close fee baseline for channels with auxiliary close outputs](https://github.com/lightningnetwork/lnd/pull/10969)
+  by including extra outputs in initial fee estimation, preventing underpriced
+  taproot/custom channel cooperative closes from failing mempool acceptance.
+
+* [Fixed an issue](https://github.com/lightningnetwork/lnd/pull/11140) where the
+  incoming side of a forwarded dust HTLC could remain stuck.
+
+* [Fixed a panic](https://github.com/lightningnetwork/lnd/pull/11122) in the
+  REST WebSocket proxy, where a `Sec-Websocket-Protocol` header carrying an
+  allowed field name without the `+` delimiter caused an index out of range
+  while the header was being forwarded to the backend. The header is now parsed
+  as the comma separated list of sub protocols it is, so a bare protocol name
+  can also no longer pick up the value of an unrelated sub protocol in the same
+  list.
+
+# New Features
+
+## Functional Enhancements
+
+## RPC Additions
+
+* A new [`walletrpc.XCreateAccount`](https://github.com/lightningnetwork/lnd/pull/11065)
+  RPC creates a named wallet account whose keys are derived from the wallet's
+  master key. Unlike `ImportAccount`, which registers a watch-only account from
+  an extended public key, the resulting account can sign for its own outputs, so
+  a single wallet can be partitioned into isolated pockets of funds: coin
+  selection, change, balance and address derivation can all be scoped to an
+  account by name.
+
+  The RPC is **experimental**, which the `X` prefix marks: it may change or be
+  removed without the usual deprecation period. It is additionally gated on
+  release builds, where a caller must set `i_know_what_i_am_doing`, following
+  the same pattern as `AbandonChannel`. A seed-only restore does not rediscover
+  funds held in an account created this way, because the recovery scan only
+  rederives addresses for the default account, and reconstructing one by hand
+  requires reproducing its key scope, its account index and the addresses it
+  had issued. Both gates come off once recovery handles these accounts.
+
+## lncli Additions
+
+* A new [`wallet accounts create`](https://github.com/lightningnetwork/lnd/pull/11065)
+  command creates a wallet-owned named account via the new `XCreateAccount`
+  RPC.
+
+# Improvements
+
+## Functional Updates
+
+* The REST WebSocket proxy now [bounds the size of incoming
+  messages](https://github.com/lightningnetwork/lnd/pull/11122) using
+  `MaxWsMsgSize`, the limit that was already applied to the responses it writes
+  back out. Oversized frames are rejected from their header rather than read in
+  full.
+
+## RPC Updates
+
+## lncli Updates
+
+## Breaking Changes
+
+## Performance Improvements
+
+## Deprecations
+
+### ⚠️ **Warning:** Deprecated fields in `lnrpc.Hop` will be removed in release version **0.22**
+
+### ⚠️ **Warning:** The deprecated fee rate option `--sat_per_byte` will be removed in release version **0.22**
+
+# Technical and Architectural Updates
+
+## BOLT Spec Updates
+
+## Testing
+
+## Database
+
+## Code Health
+
+## Tooling and Documentation
+
+# Contributors (Alphabetical Order)
+
+* Boris Nagaev
+* Elle Mouton
+* Gijs van Dam
+* Jared Tobin
+* LNBiG
+* Yong Yu
+* Ziggie

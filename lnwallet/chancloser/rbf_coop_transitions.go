@@ -604,18 +604,6 @@ func (c *ChannelFlushing) ProcessEvent(event ProtocolEvent, env *Environment,
 		chancloserLog.Infof("ChannelPoint(%v): channel flushed! "+
 			"proceeding with co-op close", env.ChanPoint)
 
-		// Now that the channel has been flushed, we'll mark on disk
-		// that we're approaching the point of no return where we'll
-		// send a new signature to the remote party.
-		//
-		// TODO(roasbeef): doesn't actually matter if initiator here?
-		if msg.FreshFlush {
-			err := env.ChanObserver.MarkCoopBroadcasted(nil, true)
-			if err != nil {
-				return nil, err
-			}
-		}
-
 		// If an ideal fee rate was specified, then we'll use that,
 		// otherwise we'll fall back to the default value given in the
 		// env.
@@ -625,7 +613,7 @@ func (c *ChannelFlushing) ProcessEvent(event ProtocolEvent, env *Environment,
 		// we'd propose.
 		localTxOut, remoteTxOut := closeTerms.DeriveCloseTxOuts()
 		absoluteFee := env.FeeEstimator.EstimateFee(
-			env.ChanType, localTxOut, remoteTxOut,
+			env.ChanType, localTxOut, remoteTxOut, nil,
 			idealFeeRate.FeePerKWeight(),
 		)
 
@@ -1147,7 +1135,7 @@ func (l *LocalCloseStart) ProcessEvent(event ProtocolEvent, env *Environment,
 		// First, we'll figure out the absolute fee rate we should pay
 		localTxOut, remoteTxOut := l.DeriveCloseTxOuts()
 		absoluteFee := env.FeeEstimator.EstimateFee(
-			env.ChanType, localTxOut, remoteTxOut,
+			env.ChanType, localTxOut, remoteTxOut, nil,
 			msg.TargetFeeRate.FeePerKWeight(),
 		)
 
