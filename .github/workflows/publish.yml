@@ -1,0 +1,71 @@
+name: publish
+
+# Publishing only happens for tags matching "basedon-*", e.g. basedon-v0.21.3-beta.
+# The Docker image tag is the git tag with the "basedon-" prefix stripped.
+on:
+  push:
+    tags:
+      - "basedon-*"
+
+jobs:
+  # publish jobs require DOCKERHUB_USER and DOCKERHUB_TOKEN repository secrets
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: linuxamd64.Dockerfile
+            platform: linux/amd64
+            suffix: amd64
+          - dockerfile: linuxarm32v7.Dockerfile
+            platform: linux/arm/v7
+            suffix: arm32v7
+          - dockerfile: linuxarm64v8.Dockerfile
+            platform: linux/arm64
+            suffix: arm64v8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.suffix }}
+        run: |
+          LATEST_TAG=${GITHUB_REF_NAME#basedon-}
+          docker buildx build --pull --platform ${{ matrix.platform }} \
+            -f ${{ matrix.dockerfile }} \
+            -t btcpayserver/lnd:$LATEST_TAG-${{ matrix.suffix }} \
+            --push .
+
+  multiarch:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # imagetools create assembles the manifest list from the per-arch tags;
+      # platform annotations come from the build metadata, no annotate needed
+      - name: Create and push multiarch manifest
+        run: |
+          LATEST_TAG=${GITHUB_REF_NAME#basedon-}
+          docker buildx imagetools create -t btcpayserver/lnd:$LATEST_TAG \
+            btcpayserver/lnd:$LATEST_TAG-amd64 \
+            btcpayserver/lnd:$LATEST_TAG-arm32v7 \
+            btcpayserver/lnd:$LATEST_TAG-arm64v8

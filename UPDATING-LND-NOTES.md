@@ -14,7 +14,7 @@ and gotchas that actually make a release go green. Replace `X.Y.Z` with the new 
 - [ ] Fix versions in the 3 Dockerfiles (Go base image, Loop) - **see gotchas below**
 - [ ] Local test build (amd64 + at least one arm) and smoke-test the binaries
 - [ ] Tag **`basedon-vX.Y.Z-beta`** and push it - **the tag is the release trigger, not the branch**
-- [ ] Watch CircleCI -> confirm `btcpayserver/lnd:vX.Y.Z-beta` multiarch image on Docker Hub
+- [ ] Watch GitHub Actions `publish` run -> confirm `btcpayserver/lnd:vX.Y.Z-beta` multiarch image on Docker Hub
 - [ ] Downstream PRs: BTCPayServer.Lightning -> btcpayserver -> btcpayserver-docker
 - [ ] Update `master` (merge to preserve refs + `Update README.md` versions list)
 
@@ -30,6 +30,11 @@ upstream tag, then adjust version numbers. (10 files, ~590 insertions.)
 If a **feature PR** was merged onto the previous version branch (e.g. the macaroon-rotation
 change in `docker-entrypoint.sh`, PR #11), carry it forward too - fold it into the overlay
 commit so it isn't silently dropped in the next version.
+
+Note the overlay as of v0.21.2 still contains `.circleci/config.yml` - publishing moved to
+GitHub Actions in the v0.21.3 cycle, so ALSO cherry-pick the transition commit
+"Switch image publishing from CircleCI to GitHub Actions" (removes `.circleci/`, adds
+`.github/workflows/publish.yml`). For v0.21.4+, fold both into a refreshed overlay.
 
 ## 2. Go base image must satisfy `go.mod` (this WILL bite)
 
@@ -92,9 +97,10 @@ docker run --rm --entrypoint loop local-lnd:test --version   # loop A.B.C-beta
 
 ## 6. The tag is the release - the branch push does nothing
 
-CircleCI only fires on tags matching `/basedon-.+/` (see `.circleci/config.yml`); it strips
-the 8-char `basedon-` prefix to form the Docker tag. So pushing the **branch** builds nothing;
-you must push the **tag**:
+The `publish` GitHub Actions workflow only fires on tags matching `basedon-*` (see
+`.github/workflows/publish.yml`, added in the v0.21.3 cycle when we moved off CircleCI);
+it strips the `basedon-` prefix to form the Docker tag. So pushing the **branch** builds
+nothing; you must push the **tag**:
 ```bash
 git tag -a basedon-vX.Y.Z-beta -m "BtcPayServer LND vX.Y.Z-beta (Loop vA.B.C-beta, Go <ver>)" <branch-tip>
 git push origin basedon-vX.Y.Z-beta
@@ -102,17 +108,20 @@ git push origin basedon-vX.Y.Z-beta
 Docker tag ends up as `vX.Y.Z-beta` (no suffix). A `-N` suffix (e.g. `v0.19.3-beta-1`) is only
 used when re-cutting an image for the same upstream version.
 
-Monitor (public, no auth) or just use the CircleCI web UI:
-```
-https://circleci.com/api/v2/project/gh/btcpayserver/lnd/pipeline
-https://circleci.com/api/v2/pipeline/<id>/workflow
-https://circleci.com/api/v2/workflow/<id>/job
-```
+The workflow needs the `DOCKERHUB_USER` and `DOCKERHUB_TOKEN` repo secrets (use a Docker Hub
+access token, not the account password). The three per-arch buildx jobs push
+`vX.Y.Z-beta-amd64` / `-arm32v7` / `-arm64v8`, then the `multiarch` job assembles the
+manifest list with `docker buildx imagetools create` - platform annotations come from the
+build metadata, no manual `manifest annotate` needed.
+
+Monitor: the repo's Actions tab, or `gh run list -R btcpayserver/lnd` / `gh run watch`.
+A tag force-move (re-point + `git push -f`) does re-trigger a fresh run; if a run failed for
+infra reasons you can also just `gh run rerun <id> --failed` on the existing run.
+
 Confirm the published multiarch image (amd64 + arm/v7 + arm64):
 ```
 https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
 ```
-A tag force-move (re-point + `git push -f`) does re-trigger a fresh pipeline.
 
 ## 7. Downstream repos - exact files
 

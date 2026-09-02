@@ -59,9 +59,9 @@ See [UPDATING-LND-NOTES.md](UPDATING-LND-NOTES.md) for the practical checklist a
    b) Checkout a new branch for that commit, usually in the format of `lnd/v0.18.3-beta`.  
    c) Cherry-pick the `Adding BtcPayServer related files and resources` commit. [Example commit](https://github.com/btcpayserver/lnd/commit/ae4bb33c6a3db8b7cc01d18fdf46e600ead9bed4).  
    d) Tag it with the `basedon-v*` prefix name and push it. For v0.18.1, the tag name was `basedon-v0.18.3-beta`.
-      i. Before you push the tag to CircleCI to build and publish image to Docker Hub, you can test if building the image works locally.
+      i. Before you push the tag to GitHub Actions to build and publish the image to Docker Hub, you can test if building the image works locally.
       ii. You can do this for linuxamd64 for example by using command `docker build --pull -t local-lnd:test_version -f linuxamd64.Dockerfile .`
-   e) The build process will start (it [matches on tag format](.circleci/config.yml#L11)). Here is [an example CircleCI build](https://app.circleci.com/pipelines/github/btcpayserver/lnd/202/workflows/b90b5888-c0b8-4207-860e-a63ce21077af).  
+   e) The build process will start (the workflow [matches on tag format](.github/workflows/publish.yml) and requires the `DOCKERHUB_USER`/`DOCKERHUB_TOKEN` repo secrets). Watch the run under the repo's [Actions tab](https://github.com/btcpayserver/lnd/actions).  
    f) The resulting image will be published to Docker Hub. Example [Docker Hub image for v0.18.3](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-513ddd55a5af44a14e27110ee14cb28f1c7a69205bcaa2fba4e66275c1f725e5?context=repo).
 
    Occasionally, there are problems with:
