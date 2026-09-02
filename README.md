@@ -51,6 +51,8 @@ Each version is marked with appropriate `basedon-vX.X.X-beta` tags. We are using
 
 ## Updating LND version in BTCPay Server
 
+See [UPDATING-LND-NOTES.md](UPDATING-LND-NOTES.md) for the practical checklist and known gotchas (Docker base images, arm builders, downstream PR mechanics).
+
 1. **Update https://github.com/btcpayserver/lnd**
 
    a) Go to https://github.com/lightningnetwork/lnd/releases and find the commit on which we should add our resources.  
