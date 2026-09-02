@@ -45,7 +45,10 @@ will **not** download the newer toolchain - the build hard-fails with
 - `linuxamd64.Dockerfile`  -> `FROM golang:<ver>-alpine`
 - `linuxarm32v7.Dockerfile` / `linuxarm64v8.Dockerfile` -> `FROM golang:<ver>-bookworm`
 
-(v0.21.x needed `go 1.25.10` -> we used `golang:1.26.3`.)
+Safest: match upstream's own `GO_VERSION` in the `Makefile` for that tag. Cherry-picking the
+overlay onto a tag where upstream bumped it may auto-merge instead of conflict - always
+diff-check `Dockerfile`/`Makefile` after the cherry-pick.
+(History: v0.21.1/0.21.2 upstream Go 1.26.3; v0.21.3 upstream Go 1.26.6, we follow suit.)
 
 ## 3. Arm builders: bullseye is dead, and `bookworm` dropped the `qemu` metapackage
 
@@ -173,7 +176,30 @@ https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
 - Rough order: build+publish image -> BTCPayServer.Lightning -> btcpayserver -> btcpayserver-docker
   -> master update. Each downstream step references the artifact from the previous one.
 
-## 10. Safety reference: macaroon rotation (`LND_MACAROON_ROTATION_ID`)
+## 10. Wallet password handling in `docker-initunlocklnd.sh`
+
+Since v0.21.3 (btcpayserver/lnd#13) there is no shared `hellorockstar` default:
+- **New wallets** get a random per-instance password, written to `walletunlock.json`
+  next to `wallet.db` - the same file BTCPay's seed-backup view reads.
+- **Existing wallets** whose unlock file still says `hellorockstar` (or empty) are
+  migrated on startup: `changepassword` on the still-**locked** wallet rotates +
+  unlocks in one call, and only then is the file rewritten. The `hellorockstar\n`
+  line-feed variant falls through to a second `changepassword` attempt.
+
+Gotchas that bit during implementation:
+- **WalletUnlocker dies on unlock.** `changepassword` only exists while the wallet is
+  locked; after a successful `unlockwallet` the service is gone and any rotate call
+  fails with "wallet already unlocked". Migration must run INSTEAD of unlock.
+- **Success is not always `{}`.** With macaroons enabled, `initwallet` and
+  `changepassword` return `{"admin_macaroon":"..."}`. Checking success by exact `== {}`
+  silently misdetects these as failures (and can strand the wallet if you retry with a
+  "wrong current password" instinct). Match `{}` OR `*admin_macaroon*`.
+- `unlockwallet` success IS `{}` - the pre-0.21.3 script treated anything without
+  "invalid" as failure, so every restart logged "Wallet unlocking failed" and exited
+  before the Loop-start section. Fixed in #13.
+- Test setups need `no-rest-tls=1` in `LND_EXTRA_ARGS` or the script's HTTP calls get 400s.
+
+## 11. Safety reference: macaroon rotation (`LND_MACAROON_ROTATION_ID`)
 
 Deleting `macaroons.db` + the `*.macaroon` files forces lnd to mint a new root key and
 re-bake macaroons on unlock. It **cannot** cause fund loss (funds = seed / `wallet.db` /
