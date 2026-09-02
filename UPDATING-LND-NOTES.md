@@ -108,7 +108,7 @@ git push origin basedon-vX.Y.Z-beta
 Docker tag ends up as `vX.Y.Z-beta` (no suffix). A `-N` suffix (e.g. `v0.19.3-beta-1`) is only
 used when re-cutting an image for the same upstream version.
 
-The workflow needs the `DOCKERHUB_USER` and `DOCKERHUB_TOKEN` repo secrets (use a Docker Hub
+The workflow needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repo secrets (use a Docker Hub
 access token, not the account password). The three per-arch buildx jobs push
 `vX.Y.Z-beta-amd64` / `-arm32v7` / `-arm64v8`, then the `multiarch` job assembles the
 manifest list with `docker buildx imagetools create` - platform annotations come from the
