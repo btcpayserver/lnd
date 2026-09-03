@@ -5,6 +5,9 @@ This repository is used to build LND Docker container images that are distribute
 Docker images are published to https://hub.docker.com/r/btcpayserver/lnd/
 
 Versions:
+ - [0.21.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta/images/sha256-348fcb4b52b03008b42f0b53ea84211456cf712cd1a9a7963634c904a7e2879a?context=repo)
+    - Includes 0.33.3-beta Loop
+    - Wallets are migrated off the shared default password to a per-instance random password
  - [0.21.2-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.2-beta/images/sha256-809977c805455196dc6f9334ac4ee666002cc244eb5b58224a0d6c2d167f0afc?context=repo)
     - Includes 0.33.3-beta Loop
  - [0.21.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.1-beta/images/sha256-cac93abe645c6bf4bca2c9c7118bd089976c1d6c08045f922775a31864165a6c?context=repo)
