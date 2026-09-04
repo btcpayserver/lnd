@@ -5,6 +5,8 @@ This repository is used to build LND Docker container images that are distribute
 Docker images are published to https://hub.docker.com/r/btcpayserver/lnd/
 
 Versions:
+ - [0.21.3-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta-1/images/sha256-3ed36ae52c85385f40785aa94bfc6c55343a99aea7b297c66638445a3c4a722f?context=repo)
+    - Adds RPCUSER_FILE support for file-based Bitcoin RPC passwords (btcpayserver/lnd#14)
  - [0.21.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta/images/sha256-348fcb4b52b03008b42f0b53ea84211456cf712cd1a9a7963634c904a7e2879a?context=repo)
     - Includes 0.33.3-beta Loop
     - Wallets are migrated off the shared default password to a per-instance random password
