@@ -38,6 +38,8 @@ from `lnd/v0.21.3-beta`:
    `.circleci/`, adds `.github/workflows/publish.yml`)
 2. `abca9f952` - Pin arm builder stages to `BUILDPLATFORM` (arm cross-compile stays
    native-speed under buildx; without it buildx emulates the whole Go compile)
+3. `391889da0` - Support file-based Bitcoin RPC password (PR #14, `RPCUSER_FILE` in
+   `docker-entrypoint.sh`; shipped as image `v0.21.3-beta-1`)
 Plus fold in the PR #13 password-migration commit (`2703ca31a`,
 `docker-initunlocklnd.sh`) into the overlay. For v0.21.4+, fold ALL of this into one
 refreshed overlay commit.
