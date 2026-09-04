@@ -1,9 +1,9 @@
 # Updating LND - Practical Notes (supplement)
 
 Supplements the **"Updating LND version in BTCPay Server"** section in the repo README.
-That section lists the 5 high-level steps; this file captures the non-obvious details
+That section lists the high-level steps; this file captures the non-obvious details
 and gotchas that actually make a release go green. Replace `X.Y.Z` with the new version
-(e.g. `0.21.1`) throughout.
+(e.g. `0.21.3`) throughout.
 
 ---
 
@@ -31,10 +31,16 @@ If a **feature PR** was merged onto the previous version branch (e.g. the macaro
 change in `docker-entrypoint.sh`, PR #11), carry it forward too - fold it into the overlay
 commit so it isn't silently dropped in the next version.
 
-Note the overlay as of v0.21.2 still contains `.circleci/config.yml` - publishing moved to
-GitHub Actions in the v0.21.3 cycle, so ALSO cherry-pick the transition commit
-"Switch image publishing from CircleCI to GitHub Actions" (removes `.circleci/`, adds
-`.github/workflows/publish.yml`). For v0.21.4+, fold both into a refreshed overlay.
+**Cherry-pick order for the NEXT version (post-0.21.3).** The v0.21.2-era overlay still
+ships `.circleci/config.yml`, so on top of the overlay you need the two v0.21.3 follow-ups
+from `lnd/v0.21.3-beta`:
+1. `14221cf95` - Switch image publishing from CircleCI to GitHub Actions (removes
+   `.circleci/`, adds `.github/workflows/publish.yml`)
+2. `abca9f952` - Pin arm builder stages to `BUILDPLATFORM` (arm cross-compile stays
+   native-speed under buildx; without it buildx emulates the whole Go compile)
+Plus fold in the PR #13 password-migration commit (`2703ca31a`,
+`docker-initunlocklnd.sh`) into the overlay. For v0.21.4+, fold ALL of this into one
+refreshed overlay commit.
 
 ## 2. Go base image must satisfy `go.mod` (this WILL bite)
 
@@ -87,13 +93,19 @@ Two linked traps that broke the v0.21.0 arm CI jobs:
 ```bash
 # amd64
 docker build --pull -t local-lnd:test -f linuxamd64.Dockerfile .
-# arm64 (register emulation first)
+# arm64 (register emulation first; the builder stage is pinned to BUILDPLATFORM
+# since v0.21.3, so only the final-stage RUN steps run under QEMU - fast)
 docker run --privileged --rm tonistiigi/binfmt --install arm64,arm
-docker build --pull -t local-lnd:test-arm64 -f linuxarm64v8.Dockerfile .
+docker buildx build --platform linux/arm64 --pull -t local-lnd:test-arm64 -f linuxarm64v8.Dockerfile --load .
 # smoke test - versions must match what you set
 docker run --rm --entrypoint lnd  local-lnd:test --version   # lnd  X.Y.Z-beta ...-fresh-btcpay
 docker run --rm --entrypoint loop local-lnd:test --version   # loop A.B.C-beta
 ```
+
+Full end-to-end verification of the unlock/password logic (fresh wallet, hellorockstar
+migration, line-feed variant) needs a bitcoind-regtest + lnd compose pair - copy the
+`bitcoind` + `lnd` services from BTCPayServer.Lightning `tests/docker-compose.yml` and
+set `no-rest-tls=1`. v0.21.3 went through exactly that locally before tagging.
 
 ## 6. The tag is the release - the branch push does nothing
 
