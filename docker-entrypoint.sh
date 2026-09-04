@@ -70,6 +70,12 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
         echo "The chain is fully synched"
     fi
 
+    if [[ "${RPCUSER_FILE}" ]]; then
+        echo "Waiting $RPCUSER_FILE to be created..."
+        while [ ! -f "$RPCUSER_FILE" ]; do sleep 1; done
+        printf 'bitcoind.rpcpass=%s\n' "$(< "$RPCUSER_FILE")" >> "$LND_DATA/lnd.conf"
+    fi
+
     if [[ "${LND_HIDDENSERVICE_HOSTNAME_FILE}" ]]; then
         echo "Waiting $LND_HIDDENSERVICE_HOSTNAME_FILE to be created by tor..."
         while [ ! -f "$LND_HIDDENSERVICE_HOSTNAME_FILE" ]; do sleep 1; done
