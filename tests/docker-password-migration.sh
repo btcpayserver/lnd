@@ -54,7 +54,7 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for SCENARIO in legacy newline stored-newline password-only rotation-only custom-newline interrupted-before interrupted-after missing-store; do
+for SCENARIO in legacy newline stored-newline password-only rotation-only custom-newline interrupted-before interrupted-after missing-store missing-readonly interrupted-missing-store split-store corrupt-json; do
     echo "Testing $SCENARIO"
     LEGACY=hellorockstar
     STORED=hellorockstar
@@ -62,7 +62,7 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     case "$SCENARIO" in
         newline) LEGACY=$'hellorockstar\n' ;;
         stored-newline) LEGACY=$'hellorockstar\n'; STORED=$LEGACY ;;
-        password-only) ROTATION= ;;
+        password-only|split-store) ROTATION= ;;
         rotation-only) LEGACY=existing-custom-password; STORED=$LEGACY ;;
         custom-newline) LEGACY=$'existing-custom-password\n'; STORED=existing-custom-password ;;
     esac
@@ -84,9 +84,15 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     BINARY=$(docker exec "$LND" sha256sum /bin/lnd)
     jq -cn --argjson seed "$SEED" --arg scenario "$SCENARIO" --arg pw "$STORED" \
         '{wallet_password:$pw,cipher_seed_mnemonic:$seed,unrelated:{keep:true}} +
-        (if $scenario | startswith("interrupted-") then {wallet_password_pending:"saved-before-the-request"} else {} end)' \
+        (if ($scenario | startswith("interrupted-")) or $scenario == "split-store" then {wallet_password_pending:"saved-before-the-request"} else {} end)' \
         | docker exec -i "$LND" sh -c "cat > $WALLET"
-    if [[ "$SCENARIO" == interrupted-after ]]; then
+    if [[ "$SCENARIO" == split-store ]]; then
+        docker stop "$LND" >/dev/null
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
+            'cp /data/data/chain/bitcoin/regtest/macaroons.db /data/old-store'
+        docker start "$LND" >/dev/null
+    fi
+    if [[ "$SCENARIO" == interrupted-after || "$SCENARIO" == interrupted-missing-store || "$SCENARIO" == split-store ]]; then
         # The RPC succeeded but the caller did not commit its saved JSON file.
         docker restart "$LND" >/dev/null
         wait_for curl -sf "$URL/v1/state"
@@ -98,35 +104,65 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     fi
     docker stop "$LND" >/dev/null
     docker rm "$LND" >/dev/null
-    if [[ "$SCENARIO" == missing-store ]]; then
-        # Reproduce the original partial commit with an already absent store.
+    if [[ "$SCENARIO" == *missing-store ]]; then
         docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" \
             -c 'rm -f /data/data/chain/bitcoin/regtest/macaroons.db'
+    elif [[ "$SCENARIO" == missing-readonly ]]; then
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c 'rm /data/readonly.macaroon'
+    elif [[ "$SCENARIO" == split-store ]]; then
+        # Reproduce wallet=NEW/store=OLD with real databases, all tokens present.
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
+            'mv /data/old-store /data/data/chain/bitcoin/regtest/macaroons.db'
+    elif [[ "$SCENARIO" == corrupt-json ]]; then
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
+            'printf "{" > /data/data/chain/bitcoin/regtest/walletunlock.json
+             sha256sum /data/*.macaroon /data/data/chain/bitcoin/regtest/macaroons.db > /data/auth.sha256'
     fi
 
-    # Docker's default restart policy is "no". Each upgrade must finish in
-    # this process, without a crash/restart being part of the migration.
+    # No restart policy: healthy upgrades finish in one startup. Repair boots
+    # unlock first and explicitly request a restart to finish the saved change.
     docker run -d --name "$LND" --network "$NAME" --network-alias lnd \
         -v "$VOLUME:/data" -v "$ROOT/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
         -v "$ROOT/docker-initunlocklnd.sh:/docker-initunlocklnd.sh:ro" \
         -e LND_CHAIN=btc -e LND_ENVIRONMENT=regtest -e "LND_EXTRA_ARGS=$CONFIG" \
         -e LND_REST_LISTEN_HOST=http://lnd:8080 -e "LND_MACAROON_ROTATION_ID=$ROTATION" "$IMAGE" >/dev/null
     URL=http://$(address):8080
-    if [[ "$SCENARIO" == missing-store ]]; then
-        failed() { docker logs "$LND" 2>&1 | grep -q 'migration is not complete'; }
+    if [[ "$SCENARIO" == corrupt-json ]]; then
+        invalid() { docker logs "$LND" 2>&1 | grep -q 'LND remains available for manual unlock'; }
+        wait_for invalid
+        [[ $(curl -sf "$URL/v1/state" | jq -r .state) == LOCKED ]]
+        [[ $(saved) == '{' ]]
+        docker exec "$LND" sha256sum -c /data/auth.sha256
+        docker exec "$LND" test ! -f /data/.macaroon-rotated-test
+        docker rm -fv "$LND" >/dev/null
+        docker volume rm "$VOLUME" >/dev/null
+        continue
+    fi
+    if [[ "$SCENARIO" == split-store ]]; then
+        failed() { docker logs "$LND" 2>&1 | grep -q 'never delete a live database'; }
         wait_for failed
         saved | jq -e '.wallet_password == "hellorockstar" and
-            (.wallet_password_pending | length == 44) and .unrelated.keep' >/dev/null
-        docker exec "$LND" test ! -f /data/.macaroon-rotated-test
-        docker logs "$LND" 2>&1 | grep -q 'default root key not found'
-        # Explicit operator recovery, not automatic repair: use the preserved
-        # candidate and recreate authentication data after stopping LND.
-        RECOVERED=$(saved | jq '.wallet_password = .wallet_password_pending | del(.wallet_password_pending)')
+            .wallet_password_pending == "saved-before-the-request"' >/dev/null
+        [[ $(curl -sf "$URL/v1/state" | jq -r .state) == LOCKED ]]
+        # Operator follows the logged remedy only after stopping LND.
         docker stop "$LND" >/dev/null
-        docker run --rm -i -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
-            'cat > /data/data/chain/bitcoin/regtest/walletunlock.json
-             rm -f /data/data/chain/bitcoin/regtest/macaroons.db /data/admin.macaroon /data/readonly.macaroon /data/invoice.macaroon' <<< "$RECOVERED"
+        docker run --rm -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c \
+            'rm /data/data/chain/bitcoin/regtest/macaroons.db /data/*.macaroon'
         docker start "$LND" >/dev/null
+        URL=http://$(address):8080
+    fi
+    if [[ "$SCENARIO" == *missing-store || "$SCENARIO" == missing-readonly || "$SCENARIO" == split-store ]]; then
+        repaired() { docker logs "$LND" 2>&1 | grep -q 'Restart the LND container once'; }
+        wait_for repaired
+        wait_for info
+        EXPECTED=$LEGACY
+        if [[ "$SCENARIO" == interrupted-missing-store || "$SCENARIO" == split-store ]]; then EXPECTED=saved-before-the-request; fi
+        saved | jq -e --arg pw "$EXPECTED" '.wallet_password == $pw and
+            (.wallet_password_pending | length >= 8) and .unrelated.keep' >/dev/null
+        for TOKEN in "$OLD_MACAROON" "$CUSTOM_MACAROON"; do
+            [[ $(curl -s -o /dev/null -w '%{http_code}' -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo") != 200 ]]
+        done
+        docker restart "$LND" >/dev/null
         URL=http://$(address):8080
     fi
     wait_for ready
@@ -137,7 +173,7 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     [[ $(docker exec "$LND" sha256sum /bin/lnd) == "$BINARY" ]]
     for TOKEN in "$OLD_MACAROON" "$CUSTOM_MACAROON"; do
         CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo")
-        if [[ "$ROTATION" ]]; then [[ "$CODE" != 200 ]]; else [[ "$CODE" == 200 ]]; fi
+        if [[ "$ROTATION" || "$SCENARIO" == split-store ]]; then [[ "$CODE" != 200 ]]; else [[ "$CODE" == 200 ]]; fi
     done
     if [[ "$STORED" == hellorockstar* ]]; then
         HISTORY=$(docker exec "$LND" cat "$WALLET.password-history")
@@ -148,14 +184,14 @@ for SCENARIO in legacy newline stored-newline password-only rotation-only custom
     else
         [[ $(saved | jq -r .wallet_password) == "$STORED" ]]
     fi
-    if [[ "$SCENARIO" == interrupted-* ]]; then
+    if [[ "$SCENARIO" == interrupted-* || "$SCENARIO" == split-store ]]; then
         [[ $(saved | jq -r .wallet_password) == saved-before-the-request ]]
     fi
     if [[ "$ROTATION" ]]; then docker exec "$LND" test -f /data/.macaroon-rotated-test; fi
     for FILE in admin readonly invoice; do docker exec "$LND" test -s "/data/$FILE.macaroon"; done
     [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]
     [[ $(docker inspect "$LND" | jq -r '.[0].RestartCount') == 0 ]]
-    if [[ "$SCENARIO" != missing-store ]] && docker logs "$LND" 2>&1 | grep -q 'default root key not found'; then exit 1; fi
+    if docker logs "$LND" 2>&1 | grep -q 'default root key not found'; then exit 1; fi
     docker restart "$LND" >/dev/null
     wait_for info
     [[ $(saved) == "$SAVED" ]]

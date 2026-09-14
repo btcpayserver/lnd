@@ -11,6 +11,7 @@ save_json_file() {
     else
         jq -nc "$@" > "$temporary"
     fi
+    jq -es 'length == 1 and (.[0] | type == "object" or type == "array")' "$temporary" >/dev/null
     sync
     mv -f "$temporary" "$file"
     sync
@@ -61,6 +62,10 @@ fi
 
 WALLET_FILE="$LND_WALLET_DIR/wallet.db"
 LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
+if [[ -f "$LNDUNLOCK_FILE" ]] && ! jq -es 'length == 1 and (.[0] | type == "object")' "$LNDUNLOCK_FILE" >/dev/null; then
+    echo "[initunlocklnd] Invalid $LNDUNLOCK_FILE; restore valid JSON before automatic startup. LND remains available for manual unlock"
+    exit 1
+fi
 if [ -f "$WALLET_FILE" ]; then
     if [ ! -f "$LNDUNLOCK_FILE" ]; then
         echo "[initunlocklnd] WARNING: UNLOCK FILE DOESN'T EXIST! MIGRATE LEGACY INSTALLATION TO NEW VERSION ASAP"
@@ -116,13 +121,18 @@ if [ -f "$WALLET_FILE" ]; then
             # Retrying from the candidate also finishes a rotation whose
             # response was lost. Only a wrong wallet password permits fallback.
             for CURRENT_PASSWORD in "${PASSWORDS[@]}"; do
+                ENDPOINT=changepassword
+                REQUEST="{\"current_password\":\"$CURRENT_PASSWORD\",\"new_password\":\"$NEWPASS_BASE64\",\"new_macaroon_root_key\":${LND_PASSWORD_ROTATE_MACAROONS:-false}}"
+                if [[ "${LND_PASSWORD_REPAIR_AUTH:-false}" == true ]]; then
+                    ENDPOINT=unlockwallet
+                    REQUEST="{\"wallet_password\":\"$CURRENT_PASSWORD\"}"
+                fi
                 if ! rotate_response=$(curl -sS --max-time 120 --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                    -d "{\"current_password\":\"$CURRENT_PASSWORD\",\"new_password\":\"$NEWPASS_BASE64\",\"new_macaroon_root_key\":${LND_PASSWORD_ROTATE_MACAROONS:-false}}" \
-                    "$LND_REST_LISTEN_HOST/v1/changepassword"); then
+                    -d "$REQUEST" "$LND_REST_LISTEN_HOST/v1/$ENDPOINT"); then
                     echo "[initunlocklnd] Request outcome unknown; passwords are preserved in $LNDUNLOCK_FILE"
                     exit 1
                 fi
-                if ! jq -e '.message == "invalid passphrase for master public key"' >/dev/null <<< "$rotate_response"; then
+                if ! jq -e '(.message // "") | contains("invalid passphrase for master public key")' >/dev/null <<< "$rotate_response"; then
                     break
                 fi
             done
@@ -130,15 +140,22 @@ if [ -f "$WALLET_FILE" ]; then
             response=""
             if jq -e 'type == "object" and (. == {} or
                 (has("code") | not) and (.admin_macaroon | type == "string"))' >/dev/null <<< "$rotate_response"; then
-                save_json_file "$LNDUNLOCK_FILE" --arg pw "$NEWPASS" '.wallet_password = $pw | del(.wallet_password_pending)'
+                if [[ "${LND_PASSWORD_REPAIR_AUTH:-false}" == true ]]; then
+                    save_json_file "$LNDUNLOCK_FILE" --arg pw "$CURRENT_PASSWORD" '.wallet_password = ($pw | @base64d)'
+                    echo "[initunlocklnd] Authentication files repaired and wallet unlocked. Restart the LND container once to finish the saved password migration"
+                else
+                    save_json_file "$LNDUNLOCK_FILE" --arg pw "$NEWPASS" '.wallet_password = $pw | del(.wallet_password_pending)'
+                    echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
+                fi
                 if [[ "${LND_PASSWORD_ROTATE_MACAROONS:-false}" == true ]]; then
                     touch "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
                 fi
-                echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
                 response="{}"
             else
                 echo "[initunlocklnd] WARNING: migration off the default password failed, lnd returned: $rotate_response"
                 echo "[initunlocklnd] Passwords are preserved in $LNDUNLOCK_FILE; migration is not complete"
+                echo "[initunlocklnd] For a confirmed macaroon-store error: stop LND, back up its data outside $LND_DATA, and move aside only macaroons.db and *.macaroon files"
+                echo "[initunlocklnd] Keep wallet.db, channel databases, $LNDUNLOCK_FILE and $PASSWORD_HISTORY. Start LND again and follow the repair message; never delete a live database"
                 exit 1
             fi
         else
@@ -150,7 +167,7 @@ if [ -f "$WALLET_FILE" ]; then
         else
             # Older files can omit a trailing newline from a custom password.
             # Unlock with that variant; changing it is unnecessary.
-            if jq -e '.message == "invalid passphrase for master public key"' >/dev/null <<< "$response"; then
+            if jq -e '(.message // "") | contains("invalid passphrase for master public key")' >/dev/null <<< "$response"; then
                 WALLETPASS_BASE64_CURRENT=$(printf '%s\n' "$WALLETPASS" | base64 | tr -d '\n')
                 response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
                     -d '{ "wallet_password":"'$WALLETPASS_BASE64_CURRENT'" }' "$LND_REST_LISTEN_HOST/v1/unlockwallet")
@@ -166,25 +183,22 @@ if [ -f "$WALLET_FILE" ]; then
         fi
     fi
 else
-    echo "[initunlocklnd] Wallet file doesn't exist. Initializing LND instance with new autogenerated password and seed"
+    echo "[initunlocklnd] Wallet file doesn't exist. Initializing LND using saved password and seed"
 
-    # generate seed mnemonic
-    GENSEED_RESP=$(curl -s --cacert "$CA_CERT" -X GET -H $MACAROON_HEADER $LND_REST_LISTEN_HOST/v1/genseed)
-    CIPHER_ARRAY_EXTRACTED=$(echo $GENSEED_RESP | jq -c -r '.cipher_seed_mnemonic')
+    # Reuse a saved initialization request if an earlier startup was interrupted.
+    if [[ ! -f "$LNDUNLOCK_FILE" ]]; then
+        GENSEED_RESP=$(curl -s --cacert "$CA_CERT" -X GET -H "$MACAROON_HEADER" "$LND_REST_LISTEN_HOST/v1/genseed")
+        CIPHER_ARRAY_EXTRACTED=$(jq -ce '.cipher_seed_mnemonic | select(type == "array" and length == 24)' <<< "$GENSEED_RESP")
+        WALLETPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+        mkdir -p "$LND_WALLET_DIR"
+        save_json_file "$LNDUNLOCK_FILE" --arg pw "$WALLETPASS" --argjson seed "$CIPHER_ARRAY_EXTRACTED" \
+            '{wallet_password:$pw,cipher_seed_mnemonic:$seed}'
+    fi
 
-    # random per-instance password, stored in cleartext in the unlock file next
-    # to wallet.db (the file that BTCPay's seed backup view exposes)
-    WALLETPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-
-    # save all the the data to unlock file we'll use for future unlocks
-    RESULTJSON='{"wallet_password":"'$WALLETPASS'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
-    mkdir -p $LND_WALLET_DIR
-    echo $RESULTJSON > $LNDUNLOCK_FILE
-
-    # previous versions will have a default wallet password including a line feed at the end "hellorockstar\n"
-    # line feed hex code 0x0A.
-    WALLETPASS_BASE64=$(echo $WALLETPASS | tr -d '\n\r' | base64)
-    INITWALLET_REQ='{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
+    # Encode directly from JSON so an existing password's newline is preserved.
+    INITWALLET_REQ=$(jq -ce 'select((.wallet_password | type == "string" and length >= 8) and
+        (.cipher_seed_mnemonic | type == "array" and length == 24)) |
+        {wallet_password:(.wallet_password | @base64),cipher_seed_mnemonic}' "$LNDUNLOCK_FILE")
 
     # execute initwallet call
     curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet

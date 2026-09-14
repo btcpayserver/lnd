@@ -97,25 +97,50 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     # and write the marker on success. Otherwise clear authentication data
     # before LND starts, so it recreates the keys and tokens on normal unlock.
     export LND_PASSWORD_ROTATE_MACAROONS=false
+    export LND_PASSWORD_REPAIR_AUTH=false
     PASSWORD_MIGRATION=false
     if [[ -f "$LNDUNLOCK_FILE" ]]; then
-        PASSWORD_MIGRATION=$(jq -r '(.wallet_password // "" | rtrimstr("\n")) as $pw |
-            has("wallet_password_pending") or $pw == "" or $pw == "hellorockstar"' "$LNDUNLOCK_FILE")
+        if ! PASSWORD_MIGRATION=$(jq -rs '
+            if length != 1 or (.[0] | type) != "object" then error("invalid unlock file") else .[0] end |
+            (.wallet_password // "" | rtrimstr("\n")) as $pw |
+            has("wallet_password_pending") or $pw == "" or $pw == "hellorockstar"' "$LNDUNLOCK_FILE"); then
+            echo "[lnd_unlock_entrypoint] Invalid $LNDUNLOCK_FILE; preserving authentication files and starting LND locked for repair"
+            PASSWORD_MIGRATION=invalid
+        fi
     fi
+    ROTATE_FILES=false
+    ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
     if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then
-        ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
         if [[ ! -f "$ROTATION_MARKER" ]]; then
             if [[ -f "$WALLET_FILE" && "$PASSWORD_MIGRATION" == true ]]; then
                 export LND_PASSWORD_ROTATE_MACAROONS=true
-            else
-                echo "[lnd_unlock_entrypoint] Rotating macaroons ($LND_MACAROON_ROTATION_ID), ALL existing macaroons are being invalidated"
-                # -exec rm rather than -delete, busybox find on alpine may not have it
-                find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
-                    -print -exec rm -f {} \;
-                touch "$ROTATION_MARKER"
-                echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
+            elif [[ "$PASSWORD_MIGRATION" != invalid ]]; then
+                ROTATE_FILES=true
             fi
         fi
+    fi
+
+    if [[ -f "$WALLET_FILE" && "$PASSWORD_MIGRATION" == true ]]; then
+        # A fresh store cannot change passwords. Missing macaroon files also
+        # make native rotation fail. Repair via plain unlock on this boot.
+        if [[ ! -s "${WALLET_FILE/wallet.db/macaroons.db}" ]]; then
+            export LND_PASSWORD_REPAIR_AUTH=true
+        fi
+        if [[ "$LND_PASSWORD_ROTATE_MACAROONS" == true ]]; then
+            for NAME in admin readonly invoice; do
+                MACAROON_PATH=$(sed -n "s/^[[:space:]]*${NAME}macaroonpath[[:space:]]*=[[:space:]]*//p" "$LND_DATA/lnd.conf" | tail -n 1)
+                MACAROON_PATH=${MACAROON_PATH:-${WALLET_FILE/wallet.db/$NAME.macaroon}}
+                if [[ ! -s "$MACAROON_PATH" ]]; then export LND_PASSWORD_REPAIR_AUTH=true; fi
+            done
+        fi
+    fi
+    if [[ "$ROTATE_FILES" == true || "$LND_PASSWORD_REPAIR_AUTH" == true ]]; then
+        echo "[lnd_unlock_entrypoint] Rotating macaroons ($LND_MACAROON_ROTATION_ID), ALL existing macaroons are being invalidated"
+        # Always before LND opens the database, never delete a live store.
+        find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
+            -print -exec rm -f {} \;
+        if [[ "$LND_PASSWORD_REPAIR_AUTH" != true ]]; then touch "$ROTATION_MARKER"; fi
+        echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
     fi
 
     # hit up the auto initializer and unlocker on separate process to do it's work
