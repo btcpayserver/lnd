@@ -1,8 +1,7 @@
 #!/bin/bash
 # Disposable regtest integration tests using the released, unmodified LND binary.
 # Run: bash docker-startup-tests.sh (Docker, curl and jq required).
-# Historical newline cases are unsupported compatibility probes (expected to fail):
-# TEST_SCENARIOS='newline stored-newline custom-newline custom-stored-newline rotation-newline rotation-custom-newline' bash docker-startup-tests.sh
+# Failure cases verify preserved credentials and no completed rotation marker.
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 IMAGE=btcpayserver/lnd:v0.21.3-beta-1
@@ -45,9 +44,14 @@ peer_info() {
 }
 ready() {
     auth getinfo >/dev/null || return 1
-    [[ "$SCENARIO" == fresh ]] || docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Migrated wallet'
+    [[ "$SCENARIO" == fresh ]] || docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
 }
-failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|password change failed|parse error'; }
+failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|Password change or macaroon rotation failed|parse error'; }
+token_valid() { curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" >/dev/null; }
+token_revoked() {
+    curl -s --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" |
+        jq -e '.code != null and (.message | contains("signature mismatch"))' >/dev/null
+}
 offline() { docker run --rm -i -v "$VOLUME:/data" --entrypoint sh "$IMAGE" -c "$1"; }
 saved() { docker exec "$LND" cat "$WALLET"; }
 replacement() { docker exec "$LND" cat "$WALLET.newpassword"; }
@@ -68,6 +72,10 @@ echo launch >> /data/launches
 exec /bin/lnd "$@"
 SH
 chmod +x "$WORK/count-lnd"
+# lncli must not configure the daemon or start the initializer.
+docker run --rm --read-only -e LND_DATA=/entrypoint-cli-check \
+    -v "$ROOT/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
+    --entrypoint /docker-entrypoint.sh "$IMAGE" lncli --version >/dev/null
 docker network create --internal "$NAME" >/dev/null
 docker run -d --name "$BTC" --network "$NAME" --network-alias bitcoin \
     --entrypoint bitcoind btcpayserver/bitcoin:31.1 -regtest -server \
@@ -91,22 +99,20 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom pending-before pending-after rotation rotation-custom rotation-pending rotation-split-store missing-store-old missing-store-new missing-readonly split-store unknown invalid-json fresh}; do
+for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom custom-spaces pending-before pending-after rotation rotation-custom rotation-custom-spaces rotation-pending rotation-pending-after rotation-missing-readonly rotation-missing-store missing-readonly split-store unknown invalid-json newline stored-newline rotation-newline rotation-stored-newline fresh}; do
     echo "Testing $SCENARIO"
     ROTATION=
-    RESET_EXPECTED=false
+    ROTATE_EXPECTED=false
     export ACTUAL=hellorockstar STORED=hellorockstar SCENARIO
     case "$SCENARIO" in
         newline|rotation-newline) ACTUAL=$'hellorockstar\n' ;;
-        stored-newline) ACTUAL=$'hellorockstar\n'; STORED=$ACTUAL ;;
+        stored-newline|rotation-stored-newline) ACTUAL=$'hellorockstar\n'; STORED=$ACTUAL ;;
         custom|rotation-custom) ACTUAL=existing-custom-password; STORED=$ACTUAL ;;
-        custom-newline|rotation-custom-newline) ACTUAL=$'existing-custom-password\n'; STORED=existing-custom-password ;;
-        custom-stored-newline) ACTUAL=$'existing-custom-password\n'; STORED=$ACTUAL ;;
+        custom-spaces|rotation-custom-spaces) ACTUAL='custom password with * spaces'; STORED=$ACTUAL ;;
         unknown) ACTUAL=unsaved-wallet-password ;;
     esac
     case "$SCENARIO" in
-        rotation*) ROTATION=test; RESET_EXPECTED=true ;;
-        missing-store-*) RESET_EXPECTED=true ;;
+        rotation*) ROTATION=test; ROTATE_EXPECTED=true ;;
     esac
     docker volume create "$VOLUME" >/dev/null
     printf '%s\n' "$CONFIG" | offline 'cat > /data/lnd.conf'
@@ -161,14 +167,14 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             elif env.SCENARIO == "omitted" then del(.wallet_password) else . end' |
             docker exec -i "$LND" sh -c "cat > $WALLET"
         case "$SCENARIO" in
-            pending-*|missing-store-new|*split-store|rotation-pending)
+            pending-*|split-store|rotation-pending*)
                 printf '%s\n' saved-before-request | docker exec -i "$LND" sh -c "cat > $WALLET.newpassword" ;;
         esac
         docker stop "$LND" >/dev/null
-        if [[ "$SCENARIO" == *split-store ]]; then
+        if [[ "$SCENARIO" == split-store ]]; then
             offline 'cp /data/data/chain/bitcoin/regtest/macaroons.db /data/old-store'
         fi
-        if [[ "$SCENARIO" == pending-after || "$SCENARIO" == missing-store-new || "$SCENARIO" == *split-store ]]; then
+        if [[ "$SCENARIO" == pending-after || "$SCENARIO" == rotation-pending-after || "$SCENARIO" == split-store ]]; then
             docker start "$LND" >/dev/null
             wait_for curl -sf "$URL/v1/state"
             jq -nc '{current_password:(env.ACTUAL | @base64),new_password:("saved-before-request" | @base64)}' |
@@ -179,9 +185,9 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
         fi
         docker rm "$LND" >/dev/null
         case "$SCENARIO" in
-            missing-store-*) offline 'rm /data/data/chain/bitcoin/regtest/macaroons.db' ;;
-            missing-readonly) offline 'rm /data/readonly.macaroon' ;;
-            *split-store) offline 'mv /data/old-store /data/data/chain/bitcoin/regtest/macaroons.db' ;;
+            rotation-missing-store) offline 'rm /data/data/chain/bitcoin/regtest/macaroons.db' ;;
+            *missing-readonly) offline 'rm /data/readonly.macaroon' ;;
+            split-store) offline 'mv /data/old-store /data/data/chain/bitcoin/regtest/macaroons.db' ;;
             invalid-json) offline 'printf "{" > /data/data/chain/bitcoin/regtest/walletunlock.json' ;;
         esac
         offline "sha256sum $WALLET" > "$WORK/before"
@@ -191,20 +197,22 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
 
     upgrade
     case "$SCENARIO" in
-        invalid-json)
+        invalid-json|unknown|split-store|rotation-missing-readonly|rotation-missing-store)
             wait_for failed
             [[ $(count) == 1 ]]
             offline "sha256sum $WALLET" > "$WORK/after"
             diff -u "$WORK/before" "$WORK/after"
-            [[ $(curl -sf "$URL/v1/state" | jq -r .state) == LOCKED ]] ;;
-        unknown|split-store)
-            wait_for failed
-            [[ $(count) == 1 ]]
+            docker exec "$LND" test ! -e /data/.macaroon-rotated-test
             if [[ "$SCENARIO" == unknown ]]; then
                 docker logs "$LND" 2>&1 | grep -q 'invalid passphrase for master public key'
-            else
-                docker logs "$LND" 2>&1 | grep -q 'macaroon store error'
+            fi
+            if [[ "$SCENARIO" == unknown || "$SCENARIO" == rotation-missing-* ]]; then
+                replacement | grep -Eq '^[A-Za-z0-9+/]{43}=$'
+            elif [[ "$SCENARIO" == split-store ]]; then
                 [[ $(replacement) == saved-before-request ]]
+            fi
+            if [[ "$SCENARIO" == rotation-missing-readonly ]]; then
+                docker logs "$LND" 2>&1 | grep -q 'could not remove macaroon file'
             fi
             [[ $(curl -sf "$URL/v1/state" | jq -r .state) == LOCKED ]]
             [[ $(docker exec "$LND" sha256sum /bin/lnd) == "$BINARY" ]] ;;
@@ -215,31 +223,27 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             # The implementation removes its temporary replacement after success.
             docker exec "$LND" test ! -e "$WALLET.newpassword"
             FINAL=$(saved | jq -r '.wallet_password | @base64')
-            [[ "$ROTATION" != test ]] || docker exec "$LND" test -f /data/.macaroon-rotated-test
-            if [[ "$RESET_EXPECTED" == true ]]; then
-                [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
-                ! docker logs "$LND" 2>&1 | grep -q 'Migrated wallet'
-            elif [[ "$SCENARIO" == pending-* ]]; then
+            if [[ "$ROTATE_EXPECTED" == true ]]; then
+                docker exec "$LND" test -f /data/.macaroon-rotated-test
+            fi
+            if [[ "$SCENARIO" == *pending* ]]; then
                 saved | jq -e '.wallet_password == "saved-before-request"' >/dev/null
-            elif [[ "$SCENARIO" != custom* ]]; then
+            elif [[ "$SCENARIO" == *custom* ]]; then
+                [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
+            else
                 saved | jq -e '.wallet_password | length == 44' >/dev/null
             fi
             if [[ "$SCENARIO" != fresh ]]; then
                 [[ $(auth getinfo | jq -r .identity_pubkey) == "$IDENTITY" ]]
                 saved | jq -e '.unrelated.keep' >/dev/null
                 [[ $(saved | jq -c .cipher_seed_mnemonic) == "$(jq -c .cipher_seed_mnemonic <<< "$SEED")" ]]
-                if [[ "$SCENARIO" == custom* ]]; then
-                    [[ "$FINAL" == $(printf %s "$ACTUAL" | base64 | tr -d '\n') ]]
-                fi
             fi
             if [[ "$SCENARIO" != fresh ]]; then
                 for TOKEN in "$OLD_MACAROON" "$CUSTOM_MACAROON"; do
-                    if [[ "$RESET_EXPECTED" == false ]]; then
-                        curl -sf -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo" >/dev/null
+                    if [[ "$ROTATE_EXPECTED" == false ]]; then
+                        token_valid "$TOKEN"
                     else
-                        curl -s --max-time 5 -H "Grpc-Metadata-macaroon:$TOKEN" "$URL/v1/getinfo" |
-                            jq -e '.code != null and (.message | contains("signature mismatch") or
-                                endswith("root key with id 7 doesn\u0027t exist"))' >/dev/null
+                        token_revoked "$TOKEN"
                     fi
                 done
             fi
@@ -254,16 +258,10 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             upgrade
             wait_for ready
             [[ $(count) == 2 ]]
-            # A completed reset may migrate the password on this later start.
-            # It must preserve the tokens generated by the reset startup.
+            # Both operations finish on the first start; the next start preserves credentials.
             SECOND=$(saved | jq -r '.wallet_password | @base64')
-            if [[ "$RESET_EXPECTED" == true && ( "$ACTUAL" == hellorockstar || "$ACTUAL" == $'hellorockstar\n' ) ]]; then
-                [[ "$SECOND" != "$FINAL" ]]
-                saved | jq -e '.wallet_password | length == 44' >/dev/null
-            else
-                [[ "$SECOND" == "$FINAL" ]]
-            fi
-            curl -sf -H "Grpc-Metadata-macaroon:$BEFORE_MACAROON" "$URL/v1/getinfo" >/dev/null ;;
+            [[ "$SECOND" == "$FINAL" ]]
+            token_valid "$BEFORE_MACAROON" ;;
     esac
     [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]
     [[ $(docker inspect "$LND" | jq -r '.[0].RestartCount') == 0 ]]
