@@ -100,6 +100,7 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     # baked ones included, so all of them are cleared rather than left behind
     # as tokens that no longer work. Runs before lnd starts, so nothing is
     # holding the files open. Bump LND_MACAROON_ROTATION_ID to rotate again.
+    export LND_MACAROONS_RESET=false
     if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then
         ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
         if [ ! -f "$ROTATION_MARKER" ]; then
@@ -109,7 +110,17 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
                 -print -exec rm -f {} \;
             touch "$ROTATION_MARKER"
             echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
+            # tells the unlocker not to change the password on this start: lnd must
+            # recreate the store first, changepassword needs it in place
+            export LND_MACAROONS_RESET=true
         fi
+    fi
+    # A missing or empty macaroons.db (a rotation that never finished) cannot take
+    # a password change either: drop the dead token files and only unlock, so lnd
+    # recreates everything.
+    if [[ -f "$WALLET_FILE" && ! -s "${WALLET_FILE/wallet.db/macaroons.db}" ]]; then
+        find "$LND_DATA" -type f -name '*.macaroon' -print -exec rm -f {} \;
+        export LND_MACAROONS_RESET=true
     fi
 
     # hit up the auto initializer and unlocker on separate process to do it's work
