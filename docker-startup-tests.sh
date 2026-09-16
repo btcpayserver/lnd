@@ -1,7 +1,7 @@
 #!/bin/bash
 # Disposable regtest integration tests using the released, unmodified LND binary.
 # Run: bash docker-startup-tests.sh (Docker, curl and jq required).
-# Historical newline cases remain opt-in regressions while compatibility is discussed:
+# Historical newline cases are unsupported compatibility probes (expected to fail):
 # TEST_SCENARIOS='newline stored-newline custom-newline custom-stored-newline rotation-newline rotation-custom-newline' bash docker-startup-tests.sh
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)

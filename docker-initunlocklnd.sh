@@ -98,6 +98,7 @@ if [ -f "$WALLET_FILE" ]; then
                 exit 1
             fi
         elif [[ "$NEWPASS" || "$WALLETPASS" == "hellorockstar" ]]; then
+            # Historical hellorockstar\n passwords are unsupported; the wallet stays locked.
             # 2. Legacy shared default password (or an unconfirmed change): move to a
             #    random one. lnd re-encrypts wallet.db BEFORE it touches macaroons.db, so
             #    the new password is saved to a file first and only moved into
