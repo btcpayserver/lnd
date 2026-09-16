@@ -146,7 +146,10 @@ else
     INITWALLET_REQ='{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
 
     # execute initwallet call
-    curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet
+    curl -fsS --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet
+    if [[ "$LND_MACAROON_ROTATION_ID" ]]; then
+        touch "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
+    fi
 fi
 
 # LND unlocked, now run Loop

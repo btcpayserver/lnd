@@ -101,6 +101,9 @@ if [[ "$1" == "lnd" ]]; then
     ln -sfn "$LND_BTCD" /root/.btcd
 
     exec "$@"
+elif [[ "$1" == "lncli" ]]; then
+    ln -sfn "$LND_DATA" /root/.lnd
+    exec "$@"
 else
 	exec "$@"
 fi

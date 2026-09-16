@@ -44,7 +44,7 @@ peer_info() {
 }
 ready() {
     auth getinfo >/dev/null || return 1
-    [[ "$SCENARIO" == fresh ]] || docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
+    [[ "$SCENARIO" == fresh* ]] || docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
 }
 failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|Password change or macaroon rotation failed|parse error'; }
 token_valid() { curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" >/dev/null; }
@@ -72,10 +72,6 @@ echo launch >> /data/launches
 exec /bin/lnd "$@"
 SH
 chmod +x "$WORK/count-lnd"
-# lncli must not configure the daemon or start the initializer.
-docker run --rm --read-only -e LND_DATA=/entrypoint-cli-check \
-    -v "$ROOT/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
-    --entrypoint /docker-entrypoint.sh "$IMAGE" lncli --version >/dev/null
 docker network create --internal "$NAME" >/dev/null
 docker run -d --name "$BTC" --network "$NAME" --network-alias bitcoin \
     --entrypoint bitcoind btcpayserver/bitcoin:31.1 -regtest -server \
@@ -99,7 +95,7 @@ adminmacaroonpath=/data/admin.macaroon
 readonlymacaroonpath=/data/readonly.macaroon
 invoicemacaroonpath=/data/invoice.macaroon'
 
-for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom custom-spaces pending-before pending-after rotation rotation-custom rotation-custom-spaces rotation-pending rotation-pending-after rotation-missing-readonly rotation-missing-store missing-readonly split-store unknown invalid-json newline stored-newline rotation-newline rotation-stored-newline fresh}; do
+for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom custom-spaces pending-before pending-after rotation rotation-custom rotation-custom-spaces rotation-pending rotation-pending-after rotation-missing-readonly rotation-missing-store missing-readonly split-store unknown invalid-json newline stored-newline rotation-newline rotation-stored-newline fresh fresh-rotation custom-dir}; do
     echo "Testing $SCENARIO"
     ROTATION=
     ROTATE_EXPECTED=false
@@ -107,16 +103,17 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
     case "$SCENARIO" in
         newline|rotation-newline) ACTUAL=$'hellorockstar\n' ;;
         stored-newline|rotation-stored-newline) ACTUAL=$'hellorockstar\n'; STORED=$ACTUAL ;;
-        custom|rotation-custom) ACTUAL=existing-custom-password; STORED=$ACTUAL ;;
+        custom|custom-dir|rotation-custom) ACTUAL=existing-custom-password; STORED=$ACTUAL ;;
         custom-spaces|rotation-custom-spaces) ACTUAL='custom password with * spaces'; STORED=$ACTUAL ;;
         unknown) ACTUAL=unsaved-wallet-password ;;
     esac
     case "$SCENARIO" in
         rotation*) ROTATION=test; ROTATE_EXPECTED=true ;;
+        fresh-rotation) ROTATION=test ;;
     esac
     docker volume create "$VOLUME" >/dev/null
     printf '%s\n' "$CONFIG" | offline 'cat > /data/lnd.conf'
-    if [[ "$SCENARIO" != fresh ]]; then
+    if [[ "$SCENARIO" != fresh* ]]; then
         # Fixture setup is separate from the counted upgrade.
         docker run -d --name "$LND" --network "$NAME" --network-alias lnd \
             -v "$VOLUME:/data" --entrypoint /bin/lnd "$IMAGE" --lnddir=/data >/dev/null
@@ -223,7 +220,7 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             # The implementation removes its temporary replacement after success.
             docker exec "$LND" test ! -e "$WALLET.newpassword"
             FINAL=$(saved | jq -r '.wallet_password | @base64')
-            if [[ "$ROTATE_EXPECTED" == true ]]; then
+            if [[ "$ROTATION" ]]; then
                 docker exec "$LND" test -f /data/.macaroon-rotated-test
             fi
             if [[ "$SCENARIO" == *pending* ]]; then
@@ -233,12 +230,12 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
             else
                 saved | jq -e '.wallet_password | length == 44' >/dev/null
             fi
-            if [[ "$SCENARIO" != fresh ]]; then
+            if [[ "$SCENARIO" != fresh* ]]; then
                 [[ $(auth getinfo | jq -r .identity_pubkey) == "$IDENTITY" ]]
                 saved | jq -e '.unrelated.keep' >/dev/null
                 [[ $(saved | jq -c .cipher_seed_mnemonic) == "$(jq -c .cipher_seed_mnemonic <<< "$SEED")" ]]
             fi
-            if [[ "$SCENARIO" != fresh ]]; then
+            if [[ "$SCENARIO" != fresh* ]]; then
                 for TOKEN in "$OLD_MACAROON" "$CUSTOM_MACAROON"; do
                     if [[ "$ROTATE_EXPECTED" == false ]]; then
                         token_valid "$TOKEN"
@@ -246,6 +243,20 @@ for SCENARIO in ${TEST_SCENARIOS:-legacy empty null omitted password-only custom
                         token_revoked "$TOKEN"
                     fi
                 done
+            fi
+            if [[ "$SCENARIO" == custom-dir ]]; then
+                # Real RPC access needs the custom TLS path; explicit --lnddir still wins.
+                for CLI_DATA in /custom /unused; do
+                    CLI_ARGS=()
+                    [[ "$CLI_DATA" == /custom ]] || CLI_ARGS+=(--lnddir=/custom)
+                    CLI_INFO=$(docker run --rm --network "container:$LND" \
+                        -v "$VOLUME:/custom:ro" -v "$ROOT/docker-entrypoint.sh:/docker-entrypoint.sh:ro" \
+                        -e "LND_DATA=$CLI_DATA" -e LND_MACAROON_ROTATION_ID=cli-only \
+                        --entrypoint /docker-entrypoint.sh "$IMAGE" lncli "${CLI_ARGS[@]}" \
+                        --network=regtest --macaroonpath=/custom/admin.macaroon getinfo)
+                    [[ $(jq -r .identity_pubkey <<< "$CLI_INFO") == "$IDENTITY" ]]
+                done
+                docker exec "$LND" test ! -e /data/.macaroon-rotated-cli-only
             fi
             if [[ "$SCENARIO" == password-only || "$SCENARIO" == rotation ]]; then
                 [[ $(channels) == "$CHANNELS" ]]
