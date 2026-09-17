@@ -88,6 +88,10 @@ if [[ "$1" == "lnd" ]]; then
     WALLET_FILE="$LND_DATA/data/chain/$NETWORK/$ENV/wallet.db"
     LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
     if [ -f "$WALLET_FILE" -a  ! -f "$LNDUNLOCK_FILE" ]; then
+        if [[ "$LND_MACAROON_ROTATION_ID" && ! -f "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID" ]]; then
+            echo "[lnd_unlock_entrypoint] Cannot rotate macaroons: this legacy wallet has no walletunlock.json. Startup stopped; manual migration required." >&2
+            exit 1
+        fi
         echo "[lnd_unlock_entrypoint] WARNING: UNLOCK FILE DOESN'T EXIST! MIGRATE LEGACY INSTALLATION TO NEW VERSION ASAP"
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
     fi

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Real LND regtest: saved password x existing marker, requesting rotation V2.
 # Password: legacy (no walletunlock.json), hellorockstar, or custom.
-# Marker: none, V1, or V2. Only V2 must preserve the old macaroon roots.
+# Marker: none, V1, or V2. Pending rotation must revoke old roots or refuse startup.
 # Run all: bash docker-macaroon-password-rotation-tests.sh (Docker, curl, jq).
 # Run one: bash docker-macaroon-password-rotation-tests.sh matrix-default-V1
-# Legacy rotation failures are real failures, not skipped or expected successes.
+# Missing unlock files refuse pending rotation before LND starts.
 set -Eeuo pipefail
 SCENARIOS=()
 for PASSWORD in legacy default custom; do
@@ -12,7 +12,7 @@ for PASSWORD in legacy default custom; do
         SCENARIOS+=("matrix-$PASSWORD-$MARKER")
     done
 done
-SCENARIOS+=(fresh-rotation
+SCENARIOS+=(fresh-rotation legacy-no-rotation
     empty null omitted rotation-empty rotation-null rotation-omitted
     password-only custom-spaces pending-before pending-after
     rotation rotation-custom-spaces rotation-pending rotation-pending-after
@@ -87,6 +87,7 @@ ready() {
         docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocked|Wallet password changed|Macaroons rotated'
 }
 failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|Password change or macaroon rotation failed|parse error'; }
+refused() { docker inspect "$LND" | jq -e '.[0].State | .Status == "exited" and .ExitCode == 1'; }
 token_valid() { curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" >/dev/null; }
 token_revoked() {
     curl -s --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" |
@@ -143,6 +144,7 @@ PASSWORD_KIND=default
 OLD_MARKER=none
 export ACTUAL=hellorockstar STORED=hellorockstar SCENARIO
 case "$SCENARIO" in
+    legacy-no-rotation) PASSWORD_KIND=legacy ;;
     matrix-*)
         IFS=- read -r _ PASSWORD_KIND OLD_MARKER <<< "$SCENARIO"
         if [[ "$PASSWORD_KIND" == custom ]]; then
@@ -246,6 +248,8 @@ if [[ "$SCENARIO" != fresh* ]]; then
     esac
     if [[ "$PASSWORD_KIND" != legacy ]]; then
         offline "sha256sum $WALLET" > "$WORK/before"
+    else
+        offline 'sha256sum /data/data/chain/bitcoin/regtest/*.db /data/*.macaroon' > "$WORK/before"
     fi
     if [[ "$OLD_MARKER" != none ]]; then
         offline "touch /data/.macaroon-rotated-$OLD_MARKER"
@@ -256,6 +260,14 @@ fi
 
 upgrade
 case "$SCENARIO" in
+    matrix-legacy-none|matrix-legacy-V1)
+        wait_for refused
+        docker logs "$LND" 2>&1 | grep -F 'Startup stopped; manual migration required.'
+        [[ $(count) == 0 ]]
+        offline 'test ! -e /data/.macaroon-rotated-V2'
+        offline "test ! -e $WALLET"
+        offline 'sha256sum /data/data/chain/bitcoin/regtest/*.db /data/*.macaroon' > "$WORK/after"
+        diff -u "$WORK/before" "$WORK/after" ;;
     invalid-json|unknown|split-store|rotation-missing-readonly|rotation-missing-store)
         wait_for failed
         [[ $(count) == 1 ]]
