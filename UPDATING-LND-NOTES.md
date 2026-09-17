@@ -40,9 +40,10 @@ from `lnd/v0.21.3-beta`:
    native-speed under buildx; without it buildx emulates the whole Go compile)
 3. `391889da0` - Support file-based Bitcoin RPC password (PR #14, `RPCUSER_FILE` in
    `docker-entrypoint.sh`; shipped as image `v0.21.3-beta-1`)
-Plus fold in the PR #13 password-migration commit (`2703ca31a`,
-`docker-initunlocklnd.sh`) into the overlay. For v0.21.4+, fold ALL of this into one
-refreshed overlay commit.
+Carry forward the current startup scripts and regression suite from PR #17 as well;
+the older PR #13 password-migration implementation has been superseded. Preserve
+`btcpay/test-startup-tests.sh` and `.github/workflows/btcpay-tests.yml`. For v0.21.4+,
+fold these changes into the refreshed overlay rather than restoring older scripts.
 
 ## 2. Go base image must satisfy `go.mod` (this WILL bite)
 
@@ -104,10 +105,25 @@ docker run --rm --entrypoint lnd  local-lnd:test --version   # lnd  X.Y.Z-beta .
 docker run --rm --entrypoint loop local-lnd:test --version   # loop A.B.C-beta
 ```
 
-Full end-to-end verification of the unlock/password logic (fresh wallet, hellorockstar
-migration, line-feed variant) needs a bitcoind-regtest + lnd compose pair - copy the
-`bitcoind` + `lnd` services from BTCPayServer.Lightning `tests/docker-compose.yml` and
-set `no-rest-tls=1`. v0.21.3 went through exactly that locally before tagging.
+Run the startup regression suite on a Linux Docker host with curl and jq:
+```bash
+bash btcpay/test-startup-tests.sh
+bash btcpay/test-startup-tests.sh --list
+# Or run one case:
+bash btcpay/test-startup-tests.sh matrix-default-V1
+```
+The single file covers 37 cases, including password/marker combinations, fresh
+wallets, interrupted password changes, historical newlines, funded channels and
+explicit failures. It starts disposable regtest containers and cleans them up.
+Its `IMAGE` variable selects the released LND binary; it mounts the checkout's two
+startup scripts. This verifies the scripts but does not replace building and
+checking the newly published image.
+
+The `BTCPay startup tests` workflow runs the suite in seven groups on PRs and master
+pushes. Keep its scenario lists aligned with `--list`. In this fork, inherited LND
+workflows are disabled through repository settings; `publish` remains enabled.
+If no run appears, check that repository Actions is enabled. Stop the old CircleCI
+project separately: deleting its config does not disconnect that integration.
 
 ## 6. The tag is the release - the branch push does nothing
 
@@ -129,8 +145,9 @@ manifest list with `docker buildx imagetools create` - platform annotations come
 build metadata, no manual `manifest annotate` needed.
 
 Monitor: the repo's Actions tab, or `gh run list -R btcpayserver/lnd` / `gh run watch`.
-A tag force-move (re-point + `git push -f`) does re-trigger a fresh run; if a run failed for
-infra reasons you can also just `gh run rerun <id> --failed` on the existing run.
+If a run failed for infrastructure reasons, rerun its failed jobs on the same commit
+(`gh run rerun <id> --failed`). Use a new tag for changed source; do not move a published
+release tag or reuse an image version for different contents.
 
 Confirm the published multiarch image (amd64 + arm/v7 + arm64):
 ```
@@ -141,12 +158,18 @@ https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
 
 **BTCPayServer.Lightning** (branch `feat/lnd-X.Y.Z`, PR title `Bumping LND to X.Y.Z-beta`)
 - `tests/docker-compose.yml` - 2 lnd service `image:` lines
-- Merge once `build_and_test` is green (its integration tests actually run the image).
+- The `CI` workflow's `test` job runs Docker Compose integration tests against the image.
 
 **btcpayserver** (branch `feat/lnd-vX.Y.Z-beta`)
 - 4 files, 8 refs total (`merchant_lnd` + `customer_lnd` in each):
   `BTCPayServer.Tests/docker-compose.yml`, `docker-compose.altcoins.yml`,
   `docker-compose.mutinynet.yml`, `docker-compose.testnet.yml`
+- Link the Lightning PR and the published image/tag in the PR description.
+
+For a test image, keep the full suffix (for example `v0.21.3-beta-2-test-del`) in
+every reference and identify it as a test candidate in both PRs. Open the PRs after
+publication succeeds so their tests can pull the image. Opening test PRs does not
+require merging them or updating the production Docker deployment.
 
 **btcpayserver-docker** (branch `feat/lnd-vX.Y.Z-beta`, open as **draft**, tag @NicolasDorier + @Pavlenex)
 - A single find/replace of the old tag `vOLD` -> `vX.Y.Z-beta` across 4 files does everything,
@@ -198,21 +221,29 @@ https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
   tagging so the first published image includes it - otherwise you need a `-1` re-tag.
 - Rough order: build+publish image -> BTCPayServer.Lightning -> btcpayserver -> btcpayserver-docker
   -> master update. Each downstream step references the artifact from the previous one.
+- A test candidate can tag an explicitly selected PR commit directly, without merging
+  it. Keep that tag fixed even if a later documentation commit is added to the PR.
+  Downstream test PRs can remain drafts while the candidate is reviewed.
 
 ## 10. Wallet password handling in `docker-initunlocklnd.sh`
 
-Since v0.21.3 (btcpayserver/lnd#13) there is no shared `hellorockstar` default:
+The current scripts in PR #17 handle passwords as follows:
 - **New wallets** get a random per-instance password, written to `walletunlock.json`
   next to `wallet.db` - the same file BTCPay's seed-backup view reads.
-- **Existing wallets** whose unlock file still says `hellorockstar` (or empty) are
-  migrated on startup: `changepassword` on the still-**locked** wallet rotates +
-  unlocks in one call, and only then is the file rewritten. The `hellorockstar\n`
-  line-feed variant falls through to a second `changepassword` attempt.
+- **Default passwords** (`hellorockstar`, or an empty/null/missing password field)
+  migrate to a random password. Save it in `walletunlock.json.newpassword` BEFORE
+  `changepassword`: LND changes wallet encryption before updating the macaroon store.
+  Only after success is the JSON password updated and the temporary file removed.
+- **Pending changes** try the saved replacement first, then the stored password.
+  Only LND's wrong-wallet-password response permits another candidate. If the saved
+  password is `hellorockstar`, the historical `hellorockstar\n` variant is also tried.
+- **Custom passwords** stay unchanged unless a pending replacement already exists.
+  An ordinary startup just unlocks with the saved password.
 
 Gotchas that bit during implementation:
-- **WalletUnlocker dies on unlock.** `changepassword` only exists while the wallet is
-  locked; after a successful `unlockwallet` the service is gone and any rotate call
-  fails with "wallet already unlocked". Migration must run INSTEAD of unlock.
+- **ChangePassword also unlocks.** Password changes and native root rotation run
+  while the wallet is locked, instead of first calling `unlockwallet`. A default
+  password change and requested root rotation finish in the same startup.
 - **Success is not always `{}`.** With macaroons enabled, `initwallet` and
   `changepassword` return `{"admin_macaroon":"..."}`. Checking success by exact `== {}`
   silently misdetects these as failures (and can strand the wallet if you retry with a
@@ -224,9 +255,42 @@ Gotchas that bit during implementation:
 
 ## 11. Safety reference: macaroon rotation (`LND_MACAROON_ROTATION_ID`)
 
-Deleting `macaroons.db` + the `*.macaroon` files forces lnd to mint a new root key and
-re-bake macaroons on unlock. It **cannot** cause fund loss (funds = seed / `wallet.db` /
-channel state, none of which are touched) - the only consequence is that API clients
-(mobile, RTL, custom-baked macaroons) must **re-pair**. The BTCPayServer<->LND link recovers
-automatically because it reads the regenerated macaroon from the shared volume. True across
-all upgrade-from versions (0.18.0+); macaroon paths have been stable.
+PR #17 uses LND's `changepassword` RPC with `new_macaroon_root_key=true`; the startup
+scripts no longer delete the macaroon database. A custom wallet password is passed
+unchanged, while a default/pending password change is combined with the rotation.
+
+An existing `.macaroon-rotated-<ID>` marker skips rotation for that ID. On success,
+the confirmed password is saved before the marker is created. A fresh wallet records
+the requested ID after successful initialization, avoiding rotation on its next start.
+
+Old tokens become invalid. LND recreates its admin, readonly and invoice macaroon
+files; clients using copied tokens must re-pair, and custom macaroons must be reissued.
+BTCPay uses the shared admin macaroon file. The regression suite checks token
+revocation/preservation, node identity, funded channels and backup points; it does
+not establish a live deployment's safety or replace its backups.
+
+A requested rotation can fail on missing macaroon files or an inconsistent store.
+These errors and unknown passwords require manual recovery. Preserve
+`walletunlock.json` and any `.newpassword` file: failure can occur
+after LND changes wallet encryption. An existing legacy wallet with no unlock file
+is refused before LND starts if the requested rotation ID has no completion marker.
+Legacy startup with no requested ID or a completed ID remains supported.
+
+## 2026-09-16
+
+### PR #17 test candidate: v0.21.3-beta-2-test-del
+
+- Image: `btcpayserver/lnd:v0.21.3-beta-2-test-del`, **linux/amd64 only**.
+- [Git tag](https://github.com/btcpayserver/lnd/tree/basedon-v0.21.3-beta-2-test-del):
+  `basedon-v0.21.3-beta-2-test-del`, fixed at `df0ac2b3c1590fbda819a69754b6cb848e70c4e0`.
+- Image index digest: `sha256:e749c9b16677ece57f31335ce79194b68e122d730f201155eff543c6d2db7181`.
+- Draft downstream PRs: [Lightning #196](https://github.com/btcpayserver/BTCPayServer.Lightning/pull/196)
+  and [BTCPayServer #7580](https://github.com/btcpayserver/btcpayserver/pull/7580).
+
+The [normal publisher](https://github.com/btcpayserver/lnd/actions/runs/35178486562)
+built amd64, but both ARM builds failed twice on Debian Bullseye package-download
+404s. The [test manifest publisher](https://github.com/btcpayserver/lnd/actions/runs/35179868943)
+copied the successful amd64 artifact by digest to the requested test tag, preserving
+the exact source commit. Its one-time workflow is now disabled. No ARM image was
+substituted and no existing tag was moved. ARM runtime packaging needs a separate
+fix and a new source/tag before a normal multiarch release.

@@ -1,0 +1,49 @@
+name: BTCPay startup tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btcpay-startup-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  startup:
+    name: Startup (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: rotation-matrix
+            scenarios: matrix-legacy-none matrix-legacy-V1 matrix-legacy-V2 matrix-default-none matrix-default-V1 matrix-default-V2 matrix-custom-none matrix-custom-V1 matrix-custom-V2
+          - group: passwords
+            scenarios: empty null omitted rotation-empty rotation-null rotation-omitted custom-spaces rotation-custom-spaces
+          - group: historical-default
+            scenarios: newline stored-newline rotation-newline rotation-stored-newline
+          - group: pending
+            scenarios: pending-before pending-after rotation-pending rotation-pending-after
+          - group: failures
+            scenarios: missing-readonly rotation-missing-readonly rotation-missing-store split-store unknown invalid-json
+          - group: funded-channels
+            scenarios: password-only rotation
+          - group: general-startup
+            scenarios: fresh fresh-rotation legacy-no-rotation custom-dir
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check shell syntax
+        run: |
+          for script in docker-entrypoint.sh docker-initunlocklnd.sh btcpay/test-startup-tests.sh; do
+            bash -n "$script"
+          done
+      - name: Test startup with released LND
+        env:
+          TEST_SCENARIOS: ${{ matrix.scenarios }}
+        run: bash btcpay/test-startup-tests.sh

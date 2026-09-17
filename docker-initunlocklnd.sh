@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+umask 077
 
 echo "[initunlocklnd] Waiting 2 seconds for lnd..."
 sleep 2
@@ -53,88 +54,75 @@ if [ -f "$WALLET_FILE" ]; then
         echo "[initunlocklnd] Wallet and Unlock files are present... parsing wallet password and unlocking lnd"
 
         # parse wallet password from unlock file
-        WALLETPASS=$(jq -c -r '.wallet_password' $LNDUNLOCK_FILE)
+        WALLETPASS=$(jq -c -r '.wallet_password' "$LNDUNLOCK_FILE")
         # Nicolas deleted default password in some wallet unlock files, so we initializing default if password is empty
         if [ "$WALLETPASS" == "" ] || [ "$WALLETPASS" == "null" ]; then
             WALLETPASS="hellorockstar"
         fi
-        # Corrected password (removing newlines before encoding).
-        # previous versions will have a default wallet password including a line feed at the end "hellorockstar\n"
-        # line feed hex code 0x0A. So we first try the password without the line feed if it fails we try it with
-        # the older version.
-        WALLETPASS_BASE64=$(echo $WALLETPASS | tr -d '\n\r' | base64)
-
-        # Wallets still on the legacy shared default password ("hellorockstar",
-        # or an empty file field falling back to it) are migrated to a random
-        # per-instance password. changepassword on a locked wallet changes +
-        # unlocks, and it only exists while locked, so migration must happen
-        # INSTEAD of a plain unlock, not after it. The file is only rewritten
-        # AFTER changepassword succeeds, so a failed migration never strands
-        # the wallet: next start just retries. The mnemonic (or the "Seed
-        # removed" placeholder) is preserved as-is.
-        MIGRATE_DEFAULT=0
-        if [[ "$WALLETPASS" == "hellorockstar" ]]; then
-            MIGRATE_DEFAULT=1
+        # base64 of the stored password for the REST calls
+        WALLETPASS_BASE64=$(printf %s "$WALLETPASS" | base64 | tr -d '\n')
+        # a password change that was started but never confirmed leaves its new password here
+        NEWPASS_FILE="$LNDUNLOCK_FILE.newpassword"
+        NEWPASS=$(cat "$NEWPASS_FILE" 2>/dev/null || true)
+        ROTATION_MARKER="$LND_DATA/.macaroon-rotated-${LND_MACAROON_ROTATION_ID}"
+        ROTATE=false
+        if [[ "$LND_MACAROON_ROTATION_ID" && ! -f "$ROTATION_MARKER" ]]; then
+            ROTATE=true
         fi
 
-        if [[ $MIGRATE_DEFAULT == 1 ]]; then
-            NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-            NEWPASS_BASE64=$(echo $NEWPASS | tr -d '\n\r' | base64)
-            # line feed hex code 0x0A: oldest installs have the default
-            # password including a trailing line feed, so if the corrected
-            # one fails we retry the rotation from that variant
-            WALLETPASS_BASE64_CURRENT=$(echo $WALLETPASS | base64)
+        post() {
+            curl -sS --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$2" "$LND_REST_LISTEN_HOST/v1/$1" \
+                || { echo "[initunlocklnd] Request to lnd failed, outcome unknown; nothing was changed in $LNDUNLOCK_FILE" >&2; exit 1; }
+        }
+        # the one lnd error that means "try the next password"; anything else stops us
+        wrong_password() { [[ "$1" == *"invalid passphrase for master public key"* ]]; }
+        # write the confirmed working password into walletunlock.json
+        save_password() {
+            jq -c --arg pw "$1" '.wallet_password = $pw' "$LNDUNLOCK_FILE" > "$LNDUNLOCK_FILE.tmp" && mv "$LNDUNLOCK_FILE.tmp" "$LNDUNLOCK_FILE"
+        }
 
-            # Note: a successful changepassword returns {} when macaroons are
-            # disabled, or {"admin_macaroon":"..."} when they are enabled
-            rotate_response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                -d '{ "current_password":"'$WALLETPASS_BASE64'", "new_password":"'$NEWPASS_BASE64'" }' \
-                $LND_REST_LISTEN_HOST/v1/changepassword)
-            if [[ "$rotate_response" != "{}" && "$rotate_response" != *'"admin_macaroon"'* ]]; then
-                rotate_response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                    -d '{ "current_password":"'$WALLETPASS_BASE64_CURRENT'", "new_password":"'$NEWPASS_BASE64'" }' \
-                    $LND_REST_LISTEN_HOST/v1/changepassword)
+        if [[ "$ROTATE" == true || "$NEWPASS" || "$WALLETPASS" == "hellorockstar" ]]; then
+            if [[ -z "$NEWPASS" && "$WALLETPASS" == hellorockstar ]]; then
+                # Save first: lnd changes wallet.db before updating macaroons.db.
+                NEWPASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+                printf '%s\n' "$NEWPASS" > "$NEWPASS_FILE"
             fi
-
-            response=""
-            if [[ "$rotate_response" == "{}" || "$rotate_response" == *'"admin_macaroon"'* ]]; then
-                jq -c --arg pw "$NEWPASS" '.wallet_password = $pw' "$LNDUNLOCK_FILE" > "$LNDUNLOCK_FILE.tmp" \
-                    && mv "$LNDUNLOCK_FILE.tmp" "$LNDUNLOCK_FILE"
-                echo "[initunlocklnd] Migrated wallet off the default password; the new random password is in $LNDUNLOCK_FILE"
-                response="{}"
+            # Keep custom passwords; combine a pending/default password change with rotation.
+            NEWPASS_BASE64=$(printf %s "${NEWPASS:-$WALLETPASS}" | base64 | tr -d '\n')
+            # Both operations unlock on success. Only a wrong wallet password permits another try.
+            # The last candidate handles historical hellorockstar\n passwords.
+            for CANDIDATE in "$NEWPASS_BASE64" "$WALLETPASS_BASE64" "$([[ "$WALLETPASS" == hellorockstar ]] && printf 'hellorockstar\n' | base64)"; do
+                [[ "$CANDIDATE" ]] || continue
+                response=$(post changepassword '{ "current_password":"'$CANDIDATE'", "new_password":"'$NEWPASS_BASE64'", "new_macaroon_root_key":'$ROTATE' }')
+                if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then break; fi
+                wrong_password "$response" || break
+            done
+            if [[ "$response" == "{}" || "$response" == *'"admin_macaroon"'* ]]; then
+                if [[ "$NEWPASS" ]]; then
+                    save_password "$NEWPASS"
+                    rm -f "$NEWPASS_FILE"
+                    echo "[initunlocklnd] Wallet password changed and wallet unlocked; saved in $LNDUNLOCK_FILE"
+                fi
+                if [[ "$ROTATE" == true ]]; then
+                    touch "$ROTATION_MARKER"
+                    echo "[initunlocklnd] Macaroons rotated; wallet unlocked. Re-pair clients and reissue custom macaroons."
+                fi
             else
-                echo "[initunlocklnd] WARNING: migration off the default password failed, lnd returned: $rotate_response"
-                echo "[initunlocklnd] Wallet is still locked, migration will be retried on next start"
+                echo "[initunlocklnd] Password change or macaroon rotation failed: $response"
+                echo "[initunlocklnd] Saved credentials were kept. Missing macaroon files or an inconsistent store require manual recovery."
                 exit 1
             fi
         else
-        response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-            -d '{ "wallet_password":"'$WALLETPASS_BASE64'" }' $LND_REST_LISTEN_HOST/v1/unlockwallet)
-
-        if [[ "$response" == "{}" ]]; then
-            echo "[initunlocklnd] Wallet unlocked"
-        else
-            # If it fails, try the original password with linefeed
-            WALLETPASS_BASE64_CURRENT=$(echo $WALLETPASS | base64)
-
-            # Now we change the password so that the line feed is removed.
-            # The correct password is already written to the unlock file so we don't need
-            # to change that. Moreover the changepassword call will change + unlock the wallet
-            # there is no need to call unlockwallet after this call.
-            change_password_response=$(curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" \
-                -d '{ "current_password":"'$WALLETPASS_BASE64_CURRENT'", "new_password":"'$WALLETPASS_BASE64'" }' \
-                $LND_REST_LISTEN_HOST/v1/changepassword)
-
-            if [[ "$change_password_response" == "{}" || "$change_password_response" == *'"admin_macaroon"'* ]]; then
-                # make sure the log end with a newline.
-                echo -n "[initunlocklnd] Changed wallet password removing the \"line feed\" character at the end. "
-                echo "The password can be found in $LNDUNLOCK_FILE"
+            # Normal start: unlock with the saved password.
+            response=$(post unlockwallet '{ "wallet_password":"'$WALLETPASS_BASE64'" }')
+            if [[ "$response" == "{}" ]]; then
+                echo "[initunlocklnd] Wallet unlocked"
             else
-                echo "[initunlocklnd] Wallet unlocking failed, unlockwallet returned: $response ; changepassword returned: $change_password_response"
+                echo "[initunlocklnd] Wallet unlocking failed, lnd returned: $response"
                 exit 1
             fi
         fi
-        fi
+
     fi
 else
     echo "[initunlocklnd] Wallet file doesn't exist. Initializing LND instance with new autogenerated password and seed"
@@ -158,7 +146,10 @@ else
     INITWALLET_REQ='{"wallet_password":"'$WALLETPASS_BASE64'", "cipher_seed_mnemonic":'$CIPHER_ARRAY_EXTRACTED'}'
 
     # execute initwallet call
-    curl -s --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet
+    curl -fsS --cacert "$CA_CERT" -X POST -H "$MACAROON_HEADER" -d "$INITWALLET_REQ" $LND_REST_LISTEN_HOST/v1/initwallet
+    if [[ "$LND_MACAROON_ROTATION_ID" ]]; then
+        touch "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
+    fi
 fi
 
 # LND unlocked, now run Loop

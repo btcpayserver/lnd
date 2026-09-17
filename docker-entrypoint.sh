@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
+if [[ "$1" == "lnd" ]]; then
 	mkdir -p "$LND_DATA"
 
     # removing noseedbackup=1 flag, adding it below if needed for legacy
@@ -88,28 +88,12 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     WALLET_FILE="$LND_DATA/data/chain/$NETWORK/$ENV/wallet.db"
     LNDUNLOCK_FILE=${WALLET_FILE/wallet.db/walletunlock.json}
     if [ -f "$WALLET_FILE" -a  ! -f "$LNDUNLOCK_FILE" ]; then
+        if [[ "$LND_MACAROON_ROTATION_ID" && ! -f "$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID" ]]; then
+            echo "[lnd_unlock_entrypoint] Cannot rotate macaroons: this legacy wallet has no walletunlock.json. Startup stopped; manual migration required." >&2
+            exit 1
+        fi
         echo "[lnd_unlock_entrypoint] WARNING: UNLOCK FILE DOESN'T EXIST! MIGRATE LEGACY INSTALLATION TO NEW VERSION ASAP"
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
-    fi
-
-    # One-time macaroon rotation, for revoking macaroons that leaked. Deleting
-    # the macaroon files is not enough on its own: lnd re-bakes equivalent
-    # tokens from the same root key, so macaroons.db has to go too. lnd then
-    # creates a new root key and regenerates its own macaroons on unlock.
-    # Every macaroon on the volume is dead once that root key is gone, hand
-    # baked ones included, so all of them are cleared rather than left behind
-    # as tokens that no longer work. Runs before lnd starts, so nothing is
-    # holding the files open. Bump LND_MACAROON_ROTATION_ID to rotate again.
-    if [[ "${LND_MACAROON_ROTATION_ID}" ]]; then
-        ROTATION_MARKER="$LND_DATA/.macaroon-rotated-$LND_MACAROON_ROTATION_ID"
-        if [ ! -f "$ROTATION_MARKER" ]; then
-            echo "[lnd_unlock_entrypoint] Rotating macaroons ($LND_MACAROON_ROTATION_ID), ALL existing macaroons are being invalidated"
-            # -exec rm rather than -delete, busybox find on alpine may not have it
-            find "$LND_DATA" -type f \( -name '*.macaroon' -o -name 'macaroons.db' \) \
-                -print -exec rm -f {} \;
-            touch "$ROTATION_MARKER"
-            echo "[lnd_unlock_entrypoint] Macaroons removed, lnd will regenerate them. Every client must be re-paired"
-        fi
     fi
 
     # hit up the auto initializer and unlocker on separate process to do it's work
@@ -120,6 +104,9 @@ if [[ "$1" == "lnd" || "$1" == "lncli" ]]; then
     ln -sfn "$LND_LITECOIND" /root/.litecoin
     ln -sfn "$LND_BTCD" /root/.btcd
 
+    exec "$@"
+elif [[ "$1" == "lncli" ]]; then
+    ln -sfn "$LND_DATA" /root/.lnd
     exec "$@"
 else
 	exec "$@"
