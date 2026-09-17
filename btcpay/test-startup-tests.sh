@@ -1,24 +1,43 @@
 #!/bin/bash
-# Real LND regtest: saved password x existing marker, requesting rotation V2.
-# Password: legacy (no walletunlock.json), hellorockstar, or custom.
-# Marker: none, V1, or V2. Pending rotation must revoke old roots or refuse startup.
-# Run all: bash docker-macaroon-password-rotation-tests.sh (Docker, curl, jq).
-# Run one: bash docker-macaroon-password-rotation-tests.sh matrix-default-V1
-# Missing unlock files refuse pending rotation before LND starts.
+# Real LND startup tests on regtest (requires Docker, curl, jq).
+# Run all: bash btcpay/test-startup-tests.sh
+# Run one: bash btcpay/test-startup-tests.sh matrix-default-V1
 set -Eeuo pipefail
+
+# Password and macaroon rotation: legacy (no unlock file), default, or custom password
+# x marker none/V1/V2, requesting V2. Pending rotation must revoke roots or stop startup.
 SCENARIOS=()
 for PASSWORD in legacy default custom; do
     for MARKER in none V1 V2; do
         SCENARIOS+=("matrix-$PASSWORD-$MARKER")
     done
 done
-SCENARIOS+=(fresh-rotation legacy-no-rotation
-    empty null omitted rotation-empty rotation-null rotation-omitted
-    password-only custom-spaces pending-before pending-after
-    rotation rotation-custom-spaces rotation-pending rotation-pending-after
-    rotation-missing-readonly rotation-missing-store missing-readonly
-    split-store unknown invalid-json newline stored-newline
-    rotation-newline rotation-stored-newline fresh custom-dir)
+
+# Password migration: missing password fields use the default, with and without
+# macaroon rotation. Custom passwords, including spaces, must remain unchanged.
+SCENARIOS+=(empty null omitted rotation-empty rotation-null rotation-omitted
+    custom-spaces rotation-custom-spaces)
+
+# Password and macaroon rotation: resume a saved password change interrupted before
+# or after LND accepted it, and verify the next startup preserves the credentials.
+SCENARIOS+=(pending-before pending-after rotation-pending rotation-pending-after)
+
+# Password and macaroon rotation: migrate historical default passwords that include
+# a trailing newline, whether or not the saved password includes that newline.
+SCENARIOS+=(newline stored-newline rotation-newline rotation-stored-newline)
+
+# Password and macaroon rotation: preserve funded channels and their backup points
+# during a password change alone or a combined password and root-key change.
+SCENARIOS+=(password-only rotation)
+
+# Failure handling: invalid credentials/JSON and missing or inconsistent macaroon
+# stores must not falsely complete a change. Password-only migration can recreate a missing file.
+SCENARIOS+=(missing-readonly rotation-missing-readonly rotation-missing-store
+    split-store unknown invalid-json)
+
+# General startup: fresh wallets, legacy startup without requested rotation, and
+# custom lncli paths. Fresh rotation IDs must be recorded without rotating on restart.
+SCENARIOS+=(fresh fresh-rotation legacy-no-rotation custom-dir)
 if [[ "${1:-}" == --list ]]; then
     printf '%s\n' "${SCENARIOS[@]}"
     exit 0
@@ -42,7 +61,7 @@ if [[ $# != 1 || " ${SCENARIOS[*]} " != *" $1 "* ]]; then
     echo "Unknown scenario: $*. Use --list for available cases." >&2
     exit 2
 fi
-ROOT=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 IMAGE=btcpayserver/lnd:v0.21.3-beta-1
 NAME=btcpay-startup-$$
 BTC=$NAME-bitcoin
