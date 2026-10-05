@@ -107,6 +107,13 @@ ready() {
 }
 failed() { docker logs "$LND" 2>&1 | grep -Eq 'Wallet unlocking failed|Password change or macaroon rotation failed|parse error'; }
 refused() { docker inspect "$LND" | jq -e '.[0].State | .Status == "exited" and .ExitCode == 1'; }
+initializer_reaped() {
+    docker exec "$LND" sh -c '
+        for status in /proc/[0-9]*/status; do
+            if grep -q "^Name:.*docker-initunlo" "$status"; then exit 1; fi
+        done
+    '
+}
 token_valid() { curl -sf --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" >/dev/null; }
 token_revoked() {
     curl -s --max-time 5 -H "Grpc-Metadata-macaroon:$1" "$URL/v1/getinfo" |
@@ -373,6 +380,9 @@ case "$SCENARIO" in
         fi
         token_valid "$BEFORE_MACAROON" ;;
 esac
+if [[ $(docker inspect "$LND" | jq -r '.[0].State.Running') == true ]]; then
+    wait_for initializer_reaped
+fi
 [[ $(docker inspect "$LND" | jq -r '.[0].HostConfig.RestartPolicy.Name') == no ]]
 [[ $(docker inspect "$LND" | jq -r '.[0].RestartCount') == 0 ]]
 docker rm -fv "$LND" >/dev/null
