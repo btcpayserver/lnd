@@ -96,15 +96,31 @@ if [[ "$1" == "lnd" ]]; then
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
     fi
 
-    # hit up the auto initializer and unlocker on separate process to do it's work
-    ./docker-initunlocklnd.sh $NETWORK $ENV &
-
     ln -sfn "$LND_DATA" /root/.lnd
     ln -sfn "$LND_BITCOIND" /root/.bitcoin
     ln -sfn "$LND_LITECOIND" /root/.litecoin
     ln -sfn "$LND_BTCD" /root/.btcd
 
-    exec "$@"
+    # Keep this shell as the direct parent so the initializer is reaped when it
+    # exits. tini forwards signals to both children through their process group.
+    ./docker-initunlocklnd.sh "$NETWORK" "$ENV" &
+    INIT_PID=$!
+    "$@" &
+    LND_PID=$!
+
+    WAIT_STATUS=0
+    wait -n -p FINISHED_PID "$INIT_PID" "$LND_PID" || WAIT_STATUS=$?
+    if [[ "$FINISHED_PID" == "$INIT_PID" ]]; then
+        if wait "$LND_PID"; then
+            exit 0
+        else
+            exit $?
+        fi
+    fi
+
+    kill "$INIT_PID" 2>/dev/null || true
+    wait "$INIT_PID" 2>/dev/null || true
+    exit "$WAIT_STATUS"
 elif [[ "$1" == "lncli" ]]; then
     ln -sfn "$LND_DATA" /root/.lnd
     exec "$@"
