@@ -62,7 +62,8 @@ will **not** download the newer toolchain - the build hard-fails with
 Safest: match upstream's own `GO_VERSION` in the `Makefile` for that tag. Cherry-picking the
 overlay onto a tag where upstream bumped it may auto-merge instead of conflict - always
 diff-check `Dockerfile`/`Makefile` after the cherry-pick.
-(History: v0.21.1/0.21.2 upstream Go 1.26.3; v0.21.3 upstream Go 1.26.6, we follow suit.)
+(History: v0.21.1/0.21.2 upstream Go 1.26.3; v0.21.3 upstream Go 1.26.6; v0.21.5-beta.rc1 upstream
+Go 1.27.3 (go.mod needs 1.26.10), we follow suit.)
 
 ## 3. Arm builders: bullseye is dead, and `bookworm` dropped the `qemu` metapackage
 
