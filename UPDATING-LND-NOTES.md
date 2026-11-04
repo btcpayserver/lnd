@@ -1,296 +1,204 @@
-# Updating LND - Practical Notes (supplement)
+# Updating LND in BTCPay Server
 
-Supplements the **"Updating LND version in BTCPay Server"** section in the repo README.
-That section lists the high-level steps; this file captures the non-obvious details
-and gotchas that actually make a release go green. Replace `X.Y.Z` with the new version
-(e.g. `0.21.3`) throughout.
+This is the release procedure for `btcpayserver/lnd`. Use the full upstream
+version, including `-beta` and any `.rcN`, throughout. The sequence is source
+and local build -> published-image verification and startup tests -> library
+and core integration PRs -> Docker deployment PR -> authorized master update.
+Publishing, merging and changing a live server are separate actions; stay within
+the operator's request.
 
----
+For Core Lightning, use its [update skill](https://github.com/btcpayserver/lightning/blob/btcpaymaster/.agents/skills/update-btcpay-cln/SKILL.md).
+CLN rewrites `btcpaymaster` linearly; LND uses version branches and a consolidated
+BTCPay overlay. The downstream integration gates are shared, but LND's wallet
+and macaroon startup tests are LND-specific.
 
-## 0. TL;DR checklist
+## 1. Prepare the version branch and overlay
 
-- [ ] `btcpayserver/lnd`: branch `lnd/vX.Y.Z-beta` off the upstream `vX.Y.Z-beta` tag
-- [ ] Cherry-pick the single consolidated **`Adding BtcPayServer related files and resources`** commit
-- [ ] Fix versions in the 3 Dockerfiles (Go base image, Loop) - **see gotchas below**
-- [ ] Local test build (amd64 + at least one arm) and smoke-test the binaries
-- [ ] Tag **`basedon-vX.Y.Z-beta`** and push it - **the tag is the release trigger, not the branch**
-- [ ] Watch GitHub Actions `publish` run -> confirm `btcpayserver/lnd:vX.Y.Z-beta` multiarch image on Docker Hub
-- [ ] Downstream PRs: BTCPayServer.Lightning -> btcpayserver -> btcpayserver-docker
-- [ ] Update `master` (merge to preserve refs + `Update README.md` versions list)
+Fetch and verify the selected upstream `lightningnetwork/lnd` tag's peeled SHA
+and release notes. Start `lnd/v<version>` there in a clean worktree. Compare the
+previous upstream tag with the last shipped `basedon-*` tag to identify the
+**complete current BTCPay overlay**, including subsequent fixes. Do not replay
+an old list of commit IDs: publishing, ARM packaging and startup fixes have
+already been folded into newer overlays.
 
----
+Apply that reviewed diff as one `Adding BtcPayServer related files and resources`
+commit. Preserve the upstream README on version branches. Carry forward the
+three `linux*.Dockerfile` files, startup scripts, regression suite, publish/test
+workflows, build tags and `-fresh-btcpay` commit suffix. Preserve the latest
+release guide too, including documentation updates on master since the previous
+tag. Review conflicts and the resulting upstream-to-branch diff; do not silently
+copy unrelated upstream changes into the overlay.
 
-## 1. The overlay is now ONE consolidated commit
+## 2. Match the Go toolchain
 
-`Adding BtcPayServer related files and resources` now already includes everything that
-used to be separate follow-ups: the `kvdb_sqlite` build tag, the Go base-image bump, and
-the Loop bump. So for a new version you only cherry-pick **that one commit** onto the new
-upstream tag, then adjust version numbers. (10 files, ~590 insertions.)
+Inspect `go.mod` and upstream's Makefile `GO_VERSION`. All three builder images
+must satisfy the module's Go requirement; matching upstream's toolchain is the
+usual choice. Confirm those image tags exist. `GOTOOLCHAIN=local` prevents an
+older builder from downloading the required toolchain automatically.
 
-If a **feature PR** was merged onto the previous version branch (e.g. the macaroon-rotation
-change in `docker-entrypoint.sh`, PR #11), carry it forward too - fold it into the overlay
-commit so it isn't silently dropped in the next version.
+Use the appropriate Alpine amd64 and Debian ARM variants. Check all Dockerfiles
+after applying the overlay even when Git reports no conflict.
 
-**Cherry-pick order for the NEXT version (post-0.21.3).** The v0.21.2-era overlay still
-ships `.circleci/config.yml`, so on top of the overlay you need the two v0.21.3 follow-ups
-from `lnd/v0.21.3-beta`:
-1. `14221cf95` - Switch image publishing from CircleCI to GitHub Actions (removes
-   `.circleci/`, adds `.github/workflows/publish.yml`)
-2. `abca9f952` - Pin arm builder stages to `BUILDPLATFORM` (arm cross-compile stays
-   native-speed under buildx; without it buildx emulates the whole Go compile)
-3. `391889da0` - Support file-based Bitcoin RPC password (PR #14, `RPCUSER_FILE` in
-   `docker-entrypoint.sh`; shipped as image `v0.21.3-beta-1`)
-Carry forward the current startup scripts and regression suite from PR #17 as well;
-the older PR #13 password-migration implementation has been superseded. Preserve
-`btcpay/test-startup-tests.sh` and `.github/workflows/btcpay-tests.yml`. For v0.21.4+,
-fold these changes into the refreshed overlay rather than restoring older scripts.
+## 3. Preserve ARM packaging
 
-## 2. Go base image must satisfy `go.mod` (this WILL bite)
+The ARM builder stages use `--platform=$BUILDPLATFORM` and Go cross-compilation.
+Keep the supported Debian builder/runtime variants (currently Bookworm) and
+`qemu-user-static qemu-user binfmt-support`; the removed `qemu` metapackage is
+not needed. Preserve the matching static QEMU binary copied into each runtime.
+Do not restore the obsolete Bullseye images from an old overlay.
 
-Check the new version's requirement:
-```bash
-grep -E '^(go|toolchain) ' go.mod    # e.g. "go 1.25.10"
-```
-The `golang:` base image in the Dockerfiles must be **>= that Go version**. It is not
-auto-handled: the official `golang` images pin `GOTOOLCHAIN=local`, so an older image
-will **not** download the newer toolchain - the build hard-fails with
-`go.mod requires go >= X (running go Y; GOTOOLCHAIN=local)`.
+## 4. Keep bundled versions and build tags consistent
 
-- `linuxamd64.Dockerfile`  -> `FROM golang:<ver>-alpine`
-- `linuxarm32v7.Dockerfile` / `linuxarm64v8.Dockerfile` -> `FROM golang:<ver>-bookworm`
+Keep Loop at its previous version unless deliberately updating it. If changing
+Loop, verify the upstream release and LND compatibility, update its source tag
+in all three Dockerfiles, check `loop --version`, and update master's version
+entry when that master update is authorized. Preserve `kvdb_sqlite` and the
+existing RPC build tags in every `make install` command.
 
-Safest: match upstream's own `GO_VERSION` in the `Makefile` for that tag. Cherry-picking the
-overlay onto a tag where upstream bumped it may auto-merge instead of conflict - always
-diff-check `Dockerfile`/`Makefile` after the cherry-pick.
-(History: v0.21.1/0.21.2 upstream Go 1.26.3; v0.21.3 upstream Go 1.26.6, we follow suit.)
+## 5. Build before publishing
 
-## 3. Arm builders: bullseye is dead, and `bookworm` dropped the `qemu` metapackage
-
-Two linked traps that broke the v0.21.0 arm CI jobs:
-
-1. **No `golang:<new>-bullseye` exists** (bullseye stopped at Go 1.24.x). Newer Go arm
-   builders must use **`-bookworm`**.
-2. **Debian bookworm removed the transitional `qemu` metapackage.** The arm apt line must be:
-   ```dockerfile
-   && apt-get install -qq --no-install-recommends qemu-user-static qemu-user binfmt-support
-   ```
-   i.e. **drop `qemu`** (kept it -> `E: Package 'qemu' has no installation candidate`).
-   The build only needs `qemu-user-static` anyway - it provides `qemu-arm-static` /
-   `qemu-aarch64-static`, which get `COPY`d into the final arm image. Full-system qemu was
-   never used (the builder cross-compiles via `GOARCH`, no emulation).
-
-## 4. Version knobs to bump in all 3 Dockerfiles
-
-- **Loop** (bundled in the same image, built from source in each Dockerfile): bumping is
-  *occasional/optional* - carry the previous version forward unless you deliberately update it.
-  If you do: check latest at https://github.com/lightninglabs/loop/releases, sanity-check it's
-  compatible with the new lnd version, then set the branch in **all 3** Dockerfiles:
-  `RUN git clone --depth 1 --branch vA.B.C-beta https://github.com/lightninglabs/loop.git ...`
-  Whenever you change it, also update the `loop --version` smoke test (Section 5) and the
-  `- Includes <LOOP_VERSION> Loop` line in the master README (Section 8).
-  (History: v0.19.1 -> Loop 0.29.0, v0.19.3 -> 0.31.2, v0.21.x -> 0.33.3.)
-- **kvdb_sqlite**: keep it in `make install tags="... routerrpc watchtowerrpc kvdb_sqlite"`
-
-## 5. Local test build before tagging
+Build and smoke-test amd64 locally:
 
 ```bash
-# amd64
 docker build --pull -t local-lnd:test -f linuxamd64.Dockerfile .
-# arm64 (register emulation first; the builder stage is pinned to BUILDPLATFORM
-# since v0.21.3, so only the final-stage RUN steps run under QEMU - fast)
-docker run --privileged --rm tonistiigi/binfmt --install arm64,arm
-docker buildx build --platform linux/arm64 --pull -t local-lnd:test-arm64 -f linuxarm64v8.Dockerfile --load .
-# smoke test - versions must match what you set
-docker run --rm --entrypoint lnd  local-lnd:test --version   # lnd  X.Y.Z-beta ...-fresh-btcpay
-docker run --rm --entrypoint loop local-lnd:test --version   # loop A.B.C-beta
+docker run --rm --network none --entrypoint lnd local-lnd:test --version
+docker run --rm --network none --entrypoint loop local-lnd:test --version
 ```
 
-Run the startup regression suite on a Linux Docker host with curl and jq:
-```bash
-bash btcpay/test-startup-tests.sh
-bash btcpay/test-startup-tests.sh --list
-# Or run one case:
-bash btcpay/test-startup-tests.sh matrix-default-V1
-```
-The single file covers 37 cases, including password/marker combinations, fresh
-wallets, interrupted password changes, historical newlines, funded channels and
-explicit failures. It starts disposable regtest containers and cleans them up.
-Its `IMAGE` variable selects the released LND binary; it mounts the checkout's two
-startup scripts. This verifies the scripts but does not replace building and
-checking the newly published image.
+Check version and source identity, not just successful startup. Exercise an ARM
+build on a suitable native/emulated builder when available; do not install
+host-wide binfmt handlers on a shared machine as an incidental release step.
+The publication workflow must still build all three platforms successfully.
 
-The `BTCPay startup tests` workflow runs the suite in seven groups on PRs and master
-pushes. Keep its scenario lists aligned with `--list`. In this fork, inherited LND
-workflows are disabled through repository settings; `publish` remains enabled.
-If no run appears, check that repository Actions is enabled. Stop the old CircleCI
-project separately: deleting its config does not disconnect that integration.
+## 6. Publish, verify and run startup tests on the new image
 
-## 6. The tag is the release - the branch push does nothing
+The [publish workflow](.github/workflows/publish.yml) runs on `basedon-*` tag
+pushes, not version-branch pushes. Its image tag is the Git tag without
+`basedon-`. First publication is `basedon-v<version>` with **no `-1`**; additional
+BTCPay revisions use `-1`, `-2`, etc.
 
-The `publish` GitHub Actions workflow only fires on tags matching `basedon-*` (see
-`.github/workflows/publish.yml`, added in the v0.21.3 cycle when we moved off CircleCI);
-it strips the `basedon-` prefix to form the Docker tag. So pushing the **branch** builds
-nothing; you must push the **tag**:
-```bash
-git tag -a basedon-vX.Y.Z-beta -m "BtcPayServer LND vX.Y.Z-beta (Loop vA.B.C-beta, Go <ver>)" <branch-tip>
-git push origin basedon-vX.Y.Z-beta
-```
-Docker tag ends up as `vX.Y.Z-beta` (no suffix). A `-N` suffix (e.g. `v0.19.3-beta-1`) is only
-used when re-cutting an image for the same upstream version.
+Push the reviewed branch, verify its remote SHA, and create an annotated tag at
+that exact tip after checking both remote Git refs and Docker Hub for collisions.
+Publishing needs the repository's Docker Hub credentials. Watch the matching
+run and verify its source SHA. Retry infrastructure failures on the same source;
+changed source requires a new revision. Never move a published tag or reuse an
+image version for different contents. A canceled run may have published partial
+artifacts, so inspect the registry before recovery.
 
-The workflow needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repo secrets (use a Docker Hub
-access token, not the account password). The three per-arch buildx jobs push
-`vX.Y.Z-beta-amd64` / `-arm32v7` / `-arm64v8`, then the `multiarch` job assembles the
-manifest list with `docker buildx imagetools create` - platform annotations come from the
-build metadata, no manual `manifest annotate` needed.
+The workflow builds amd64, arm32v7 and arm64v8 tags, then assembles the index.
+Before the first downstream PR:
 
-Monitor: the repo's Actions tab, or `gh run list -R btcpayserver/lnd` / `gh run watch`.
-If a run failed for infrastructure reasons, rerun its failed jobs on the same commit
-(`gh run rerun <id> --failed`). Use a new tag for changed source; do not move a published
-release tag or reuse an image version for different contents.
+1. Require successful publication and an index containing `linux/amd64`,
+   `linux/arm/v7` and `linux/arm64`. Record the index and platform digests.
+2. Pull each platform and check its actual `/bin/lnd` binary: architecture,
+   version, and embedded Git commit identity against the selected tag/build,
+   including BTCPay's `-fresh-btcpay` suffix. Execute the native-platform binary;
+   distinguish static ARM inspection from execution. RC and final binaries can
+   print the same version; check the source identity, and Loop if it changed.
+3. Run the complete [startup suite](btcpay/test-startup-tests.sh) against the
+   **new published image**. The script's `IMAGE` assignment currently selects
+   an older release and overrides an environment variable of the same name.
+   A normal green workflow can therefore test the scripts against an old binary.
+   Create a temporary branch from the release source, change only that assignment
+   to the exact new tag, and dispatch [BTCPay startup tests](.github/workflows/btcpay-tests.yml)
+   on that branch. Require every matrix group to pass, verify the pulled image
+   in logs, save the commit/run evidence, then delete only the temporary branch.
 
-Confirm the published multiarch image (amd64 + arm/v7 + arm64):
-```
-https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
-```
+The suite mounts the checkout's startup scripts into disposable regtest
+containers. Keep those scripts identical to the release source; the suite does
+not replace checking the scripts packaged in the image. `--list` enumerates
+scenarios (currently 37 across seven CI groups); keep the workflow's lists in
+sync with it. Coverage includes password/marker combinations, fresh wallets,
+interrupted changes, historical newlines, funded channels and expected failures.
+If no run appears, check the workflow's enabled state and trigger configuration.
 
 ## 7. Downstream repos - exact files
 
-**BTCPayServer.Lightning** (branch `feat/lnd-X.Y.Z`, PR title `Bumping LND to X.Y.Z-beta`)
-- `tests/docker-compose.yml` - 2 lnd service `image:` lines
-- The `CI` workflow's `test` job runs Docker Compose integration tests against the image.
+Read each repository's current agent instructions and workflows. Open test-image
+PRs only after publication verification and new-image startup tests pass. Keep
+any RC/test/revision suffix in every image reference and identify test candidates
+as such in the PRs.
 
-**btcpayserver** (branch `feat/lnd-vX.Y.Z-beta`)
-- 4 files, 8 refs total (`merchant_lnd` + `customer_lnd` in each):
-  `BTCPayServer.Tests/docker-compose.yml`, `docker-compose.altcoins.yml`,
-  `docker-compose.mutinynet.yml`, `docker-compose.testnet.yml`
-- Link the Lightning PR and the published image/tag in the PR description.
+| Repository | Compose files | LND services |
+| --- | --- | --- |
+| `BTCPayServer.Lightning` | `tests/docker-compose.yml` | both LND services |
+| `btcpayserver` | `BTCPayServer.Tests/docker-compose.yml`, `docker-compose.altcoins.yml`, `docker-compose.mutinynet.yml`, `docker-compose.testnet.yml` | `merchant_lnd`, `customer_lnd` in each |
 
-For a test image, keep the full suffix (for example `v0.21.3-beta-2-test-del`) in
-every reference and identify it as a test candidate in both PRs. Open the PRs after
-publication succeeds so their tests can pull the image. Opening test PRs does not
-require merging them or updating the production Docker deployment.
+Open the library PR, then the core PR linking it and the published image.
+Require both integration jobs to pass on their **current PR heads**, inspect
+logs for the intended image and executed LND tests, and record commit, tag/digest
+and run links. Core CI uses the altcoins Compose file for regtest; updating the
+other files does not exercise their separate environments. Follow core's test
+instructions, including `PLAYWRIGHT_HEADLESS=true` locally. Investigate failures
+before advancing; old-image green CI does not validate the new release.
 
-**btcpayserver-docker** (branch `feat/lnd-vX.Y.Z-beta`, open as **draft**, tag @NicolasDorier + @Pavlenex)
-- A single find/replace of the old tag `vOLD` -> `vX.Y.Z-beta` across 4 files does everything,
-  because the `basedon-vOLD` URLs contain the tag as a substring:
-  - `docker-compose-generator/docker-fragments/bitcoin-lnd.yml`  <- **this is the one that ships to users**
-  - `contrib/build-all-images.sh`
-  - `contrib/DockerFileBuildHelper/build-all.sh`
-  - `README.md` (the `btcpayserver/lnd` components-table row)
-- This repo has no CI on the PR; the release maintainers validate on their servers.
+After both suites pass, update
+`docker-compose-generator/docker-fragments/bitcoin-lnd.yml` in
+`btcpayserver-docker`. Its [AGENTS.md](https://github.com/btcpayserver/btcpayserver-docker/blob/master/AGENTS.md)
+is authoritative for regenerating `contrib/build-all-images.sh` and
+`docs/supported-images.md`; do not manually replace versions in generated files.
+Follow that repository's PR skill, open a draft, and link both test PRs. Its
+[CI](https://github.com/btcpayserver/btcpayserver-docker/blob/master/.github/workflows/ci.yml)
+includes generator, documentation and installation checks. The destructive
+installation script belongs on disposable CI runners, not a development host.
+
+Validate an appropriate LND-backed upgrade, including wallet auto-unlock,
+identity/channel preservation, connectivity and invoice/payment flows. State
+what was actually exercised: no channels means payments were not tested.
+Use disposable infrastructure unless the operator authorized an existing server
+update. CI and a version command do not establish a live deployment's safety.
+Ask release maintainers to review; merge only when authorized.
 
 ## 8. Updating `master` on btcpayserver/lnd
 
-Goal: master's tree = the newest tagged version's tree, **references preserved**, and the
-btcpayserver README (versions list) restored as a separate commit. The version branches carry
-the **upstream lnd README**, so a plain merge would clobber master's README - that's why the
-README is always its own follow-up commit.
+When authorized, preserve version history while updating master's release tree.
+Start from current remote master and record its SHA. Preserve master's BTCPay
+README/version list, this guide and current repository instructions before
+changing the tree. Version branches carry the upstream README.
 
-```bash
-git checkout master && git merge --ff-only origin/master
+Record skipped version branches with `git merge -s ours --no-ff` as needed.
+For the selected newest version, make a merge commit whose release source tree
+matches that version (`git merge -s ours --no-ff --no-commit`, then
+`git read-tree -u --reset <version-branch>`). Restore the current master-only
+documentation and add the new README version entry as a separate commit.
+Review the final tree and ancestry against both parents before pushing; do not
+restore an obsolete guide from the release tag or force-rewrite master.
 
-# preserve refs for any versions that were skipped on master (no tree change):
-git merge -s ours --no-ff -m "Merge lnd/vA-beta into master (preserve references)" lnd/vA-beta
-# ... repeat for each missing version ...
+Each README version entry links the **amd64 platform digest**, not the index:
 
-# make master's tree equal the newest version, still recording the merge (preserve ref):
-git merge -s ours --no-ff --no-commit lnd/vX.Y.Z-beta
-git read-tree -u --reset lnd/vX.Y.Z-beta
-git commit -m "Merge lnd/vX.Y.Z-beta into master"
-
-# restore btcpayserver README (with the new version entry) as its own commit:
-#   edit README.md versions list, then:
-git commit -m "Update README.md"
-```
-
-### README "Versions:" entry format
-Each entry links the **amd64 image digest** (not the manifest-list digest):
-```
- - [X.Y.Z-beta](https://hub.docker.com/layers/btcpayserver/lnd/vX.Y.Z-beta/images/sha256-<AMD64_DIGEST>?context=repo)
+```text
+ - [<version>](https://hub.docker.com/layers/btcpayserver/lnd/v<version>/images/sha256-<AMD64_DIGEST>?context=repo)
     - Includes <LOOP_VERSION> Loop
 ```
-Get `<AMD64_DIGEST>` (hex, no `sha256:`) from the `images[]` entry with `architecture == amd64`:
-```
-https://hub.docker.com/v2/repositories/btcpayserver/lnd/tags/vX.Y.Z-beta
-```
 
-## 9. Sequencing notes
+Obtain the digest from the published index or Docker Hub's `images[]` entry for
+amd64. The README link, image provenance and version branch must agree.
 
-- If a feature PR targets the version branch (e.g. macaroon rotation), **merge it before**
-  tagging so the first published image includes it - otherwise you need a `-1` re-tag.
-- Rough order: build+publish image -> BTCPayServer.Lightning -> btcpayserver -> btcpayserver-docker
-  -> master update. Each downstream step references the artifact from the previous one.
-- A test candidate can tag an explicitly selected PR commit directly, without merging
-  it. Keep that tag fixed even if a later documentation commit is added to the PR.
-  Downstream test PRs can remain drafts while the candidate is reviewed.
+## Startup invariants to preserve
 
-## 10. Wallet password handling in `docker-initunlocklnd.sh`
+These are release-review checks; the authoritative behavior is in
+[docker-initunlocklnd.sh](docker-initunlocklnd.sh),
+[docker-entrypoint.sh](docker-entrypoint.sh) and the regression suite.
 
-The current scripts in PR #17 handle passwords as follows:
-- **New wallets** get a random per-instance password, written to `walletunlock.json`
-  next to `wallet.db` - the same file BTCPay's seed-backup view reads.
-- **Default passwords** (`hellorockstar`, or an empty/null/missing password field)
-  migrate to a random password. Save it in `walletunlock.json.newpassword` BEFORE
-  `changepassword`: LND changes wallet encryption before updating the macaroon store.
-  Only after success is the JSON password updated and the temporary file removed.
-- **Pending changes** try the saved replacement first, then the stored password.
-  Only LND's wrong-wallet-password response permits another candidate. If the saved
-  password is `hellorockstar`, the historical `hellorockstar\n` variant is also tried.
-- **Custom passwords** stay unchanged unless a pending replacement already exists.
-  An ordinary startup just unlocks with the saved password.
+- Fresh/default-password wallets receive a random per-instance password stored
+  in `walletunlock.json`. Custom passwords remain unchanged unless a pending
+  replacement exists. Default includes empty, null, missing and historical
+  `hellorockstar` forms, including the supported newline variant.
+- Save a replacement in `walletunlock.json.newpassword` **before** changing it.
+  On interrupted changes, try the saved replacement first, then stored password;
+  only a wrong-wallet-password response permits another candidate. Preserve both
+  files on failure: wallet encryption may already have changed.
+- `changepassword` also unlocks. Combine a requested native macaroon-root rotation
+  with the password change while locked; do not delete the macaroon database.
+  A successful change/init may return an `admin_macaroon`, not just `{}`.
+- Record `.macaroon-rotated-<ID>` only after success and saving the confirmed
+  password. A completed ID skips rotation; fresh initialization records its ID
+  without causing rotation on the next startup.
+- Rotation invalidates old tokens. LND regenerates its standard macaroon files;
+  copied/custom credentials need re-pairing/reissue. Unknown passwords, missing
+  files or inconsistent stores require recovery, not a false completion marker.
+  Legacy wallets without an unlock file must refuse a new rotation request,
+  while no-request or already-completed-marker startup remains supported.
 
-Gotchas that bit during implementation:
-- **ChangePassword also unlocks.** Password changes and native root rotation run
-  while the wallet is locked, instead of first calling `unlockwallet`. A default
-  password change and requested root rotation finish in the same startup.
-- **Success is not always `{}`.** With macaroons enabled, `initwallet` and
-  `changepassword` return `{"admin_macaroon":"..."}`. Checking success by exact `== {}`
-  silently misdetects these as failures (and can strand the wallet if you retry with a
-  "wrong current password" instinct). Match `{}` OR `*admin_macaroon*`.
-- `unlockwallet` success IS `{}` - the pre-0.21.3 script treated anything without
-  "invalid" as failure, so every restart logged "Wallet unlocking failed" and exited
-  before the Loop-start section. Fixed in #13.
-- Test setups need `no-rest-tls=1` in `LND_EXTRA_ARGS` or the script's HTTP calls get 400s.
-
-## 11. Safety reference: macaroon rotation (`LND_MACAROON_ROTATION_ID`)
-
-PR #17 uses LND's `changepassword` RPC with `new_macaroon_root_key=true`; the startup
-scripts no longer delete the macaroon database. A custom wallet password is passed
-unchanged, while a default/pending password change is combined with the rotation.
-
-An existing `.macaroon-rotated-<ID>` marker skips rotation for that ID. On success,
-the confirmed password is saved before the marker is created. A fresh wallet records
-the requested ID after successful initialization, avoiding rotation on its next start.
-
-Old tokens become invalid. LND recreates its admin, readonly and invoice macaroon
-files; clients using copied tokens must re-pair, and custom macaroons must be reissued.
-BTCPay uses the shared admin macaroon file. The regression suite checks token
-revocation/preservation, node identity, funded channels and backup points; it does
-not establish a live deployment's safety or replace its backups.
-
-A requested rotation can fail on missing macaroon files or an inconsistent store.
-These errors and unknown passwords require manual recovery. Preserve
-`walletunlock.json` and any `.newpassword` file: failure can occur
-after LND changes wallet encryption. An existing legacy wallet with no unlock file
-is refused before LND starts if the requested rotation ID has no completion marker.
-Legacy startup with no requested ID or a completed ID remains supported.
-
-## 2026-09-16
-
-### PR #17 test candidate: v0.21.3-beta-2-test-del
-
-- Image: `btcpayserver/lnd:v0.21.3-beta-2-test-del`, **linux/amd64 only**.
-- [Git tag](https://github.com/btcpayserver/lnd/tree/basedon-v0.21.3-beta-2-test-del):
-  `basedon-v0.21.3-beta-2-test-del`, fixed at `df0ac2b3c1590fbda819a69754b6cb848e70c4e0`.
-- Image index digest: `sha256:e749c9b16677ece57f31335ce79194b68e122d730f201155eff543c6d2db7181`.
-- Draft downstream PRs: [Lightning #196](https://github.com/btcpayserver/BTCPayServer.Lightning/pull/196)
-  and [BTCPayServer #7580](https://github.com/btcpayserver/btcpayserver/pull/7580).
-
-The [normal publisher](https://github.com/btcpayserver/lnd/actions/runs/35178486562)
-built amd64, but both ARM builds failed twice on Debian Bullseye package-download
-404s. The [test manifest publisher](https://github.com/btcpayserver/lnd/actions/runs/35179868943)
-copied the successful amd64 artifact by digest to the requested test tag, preserving
-the exact source commit. Its one-time workflow is now disabled. No ARM image was
-substituted and no existing tag was moved. ARM runtime packaging needs a separate
-fix and a new source/tag before a normal multiarch release.
+The suite checks token revocation/preservation, identities, funded channels and
+backup points. It does not replace operator backups or prove every upgrade path.
