@@ -96,8 +96,9 @@ if [[ "$1" == "lnd" ]]; then
         echo "noseedbackup=1" >> "$LND_DATA/lnd.conf"
     fi
 
-    # hit up the auto initializer and unlocker on separate process to do it's work
-    ./docker-initunlocklnd.sh $NETWORK $ENV &
+    # Orphan the helper to PID 1 (tini), which reaps it when it exits.
+    # Without the subshell it would remain a child of LND after exec below.
+    ( ./docker-initunlocklnd.sh "$NETWORK" "$ENV" & )
 
     ln -sfn "$LND_DATA" /root/.lnd
     ln -sfn "$LND_BITCOIND" /root/.bitcoin
