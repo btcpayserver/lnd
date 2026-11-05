@@ -288,8 +288,8 @@ type InitFundingMsg struct {
 	PendingChanID PendingChanID
 
 	// ChannelType allows the caller to use an explicit channel type for the
-	// funding negotiation. This type will only be observed if BOTH sides
-	// support explicit channel type negotiation.
+	// funding negotiation. If unset, a default is selected from the
+	// features supported by both peers.
 	ChannelType *lnwire.ChannelType
 
 	// Memo is any arbitrary information we wish to store locally about the
@@ -536,7 +536,9 @@ type Config struct {
 	EnableUpfrontShutdown bool
 
 	// MaxAnchorsCommitFeeRate is the max commitment fee rate we'll use as
-	// the initiator for channels of the anchor type.
+	// the initiator for channels of the anchor type. A value below
+	// chainfee.FeePerKwFloor acts as the floor, as we never propose a
+	// commitment fee rate below it.
 	MaxAnchorsCommitFeeRate chainfee.SatPerKWeight
 
 	// DeleteAliasEdge allows the Manager to delete an alias channel edge
@@ -1544,6 +1546,31 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		return
 	}
 
+	// Enforce BOLT-02: The funder MUST set the channel_type in
+	// open_channel. Reject if it's omitted.
+	if msg.ChannelType == nil {
+		f.failFundingFlow(peer, cid, lnwire.ErrChanTypeRequired)
+
+		return
+	}
+
+	// Reject a commitment fee rate below the floor that the channel state
+	// machine enforces for every later commitment. We can't raise the rate
+	// ourselves, as both sides need to construct the same commitment
+	// transactions. The floor applies to every commitment type, and the
+	// channel acceptor can't change the rate, so we check it before
+	// consulting the acceptor.
+	commitFeePerKw := chainfee.SatPerKWeight(msg.FeePerKiloWeight)
+	if commitFeePerKw < chainfee.FeePerKwFloor {
+		f.failFundingFlow(
+			peer, cid, lnwallet.ErrCommitFeeRateTooLow(
+				commitFeePerKw, chainfee.FeePerKwFloor,
+			),
+		)
+
+		return
+	}
+
 	// Send the OpenChannel request to the ChannelAcceptor to determine
 	// whether this node will accept the channel.
 	chanReq := &chanacceptor.ChannelAcceptRequest{
@@ -1571,10 +1598,9 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	// funds to the channel ourselves.
 	//
 	// Before we init the channel, we'll also check to see what commitment
-	// format we can use with this peer. This is dependent on *both* us and
-	// the remote peer are signaling the proper feature bit if we're using
-	// implicit negotiation, and simply the channel type sent over if we're
-	// using explicit negotiation.
+	// format we can use with this peer. This is dependent on the channel
+	// type sent by the funder and the feature bits both peers are
+	// signaling.
 	chanType, commitType, err := negotiateCommitmentType(
 		msg.ChannelType, peer.LocalFeatures(), peer.RemoteFeatures(),
 	)
@@ -1594,52 +1620,45 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		scidFeatureVal = true
 	}
 
-	var (
-		zeroConf bool
-		scid     bool
-	)
+	// Since we always negotiate an explicit channel type now, chanType is
+	// guaranteed to be non-nil.
+	//
+	// Check if the channel type includes the zero-conf or scid-alias bits.
+	featureVec := lnwire.RawFeatureVector(*chanType)
+	zeroConf := featureVec.IsSet(lnwire.ZeroConfRequired)
+	scid := featureVec.IsSet(lnwire.ScidAliasRequired)
 
-	// Only echo back a channel type in AcceptChannel if we actually used
-	// explicit negotiation above.
-	if chanType != nil {
-		// Check if the channel type includes the zero-conf or
-		// scid-alias bits.
-		featureVec := lnwire.RawFeatureVector(*chanType)
-		zeroConf = featureVec.IsSet(lnwire.ZeroConfRequired)
-		scid = featureVec.IsSet(lnwire.ScidAliasRequired)
+	// If the zero-conf channel type was negotiated, ensure that the
+	// acceptor allows it.
+	if zeroConf && !acceptorResp.ZeroConf {
+		// Fail the funding flow.
+		flowErr := fmt.Errorf("channel acceptor blocked zero-conf " +
+			"channel negotiation")
+		log.Errorf("Cancelling funding flow for %v based on channel "+
+			"acceptor response: %v", cid, flowErr)
+		f.failFundingFlow(peer, cid, flowErr)
 
-		// If the zero-conf channel type was negotiated, ensure that
-		// the acceptor allows it.
-		if zeroConf && !acceptorResp.ZeroConf {
+		return
+	}
+
+	// If the zero-conf channel type wasn't negotiated and the fundee still
+	// wants a zero-conf channel, perform more checks. Require that both
+	// sides have the scid-alias feature bit set. We don't require anchors
+	// here - this is for compatibility with LDK.
+	if !zeroConf && acceptorResp.ZeroConf {
+		if !scidFeatureVal {
 			// Fail the funding flow.
-			flowErr := fmt.Errorf("channel acceptor blocked " +
-				"zero-conf channel negotiation")
-			log.Errorf("Cancelling funding flow for %v based on "+
-				"channel acceptor response: %v", cid, flowErr)
+			flowErr := fmt.Errorf("scid-alias feature must be " +
+				"negotiated for zero-conf")
+			log.Errorf("Cancelling funding flow for zero-conf "+
+				"channel %v: %v", cid,
+				flowErr)
 			f.failFundingFlow(peer, cid, flowErr)
 			return
 		}
 
-		// If the zero-conf channel type wasn't negotiated and the
-		// fundee still wants a zero-conf channel, perform more checks.
-		// Require that both sides have the scid-alias feature bit set.
-		// We don't require anchors here - this is for compatibility
-		// with LDK.
-		if !zeroConf && acceptorResp.ZeroConf {
-			if !scidFeatureVal {
-				// Fail the funding flow.
-				flowErr := fmt.Errorf("scid-alias feature " +
-					"must be negotiated for zero-conf")
-				log.Errorf("Cancelling funding flow for "+
-					"zero-conf channel %v: %v", cid,
-					flowErr)
-				f.failFundingFlow(peer, cid, flowErr)
-				return
-			}
-
-			// Set zeroConf to true to enable the zero-conf flow.
-			zeroConf = true
-		}
+		// Set zeroConf to true to enable the zero-conf flow.
+		zeroConf = true
 	}
 
 	public := msg.ChannelFlags&lnwire.FFAnnounceChannel != 0
@@ -1690,7 +1709,7 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		NodeAddr:         peer.Address(),
 		LocalFundingAmt:  0,
 		RemoteFundingAmt: amt,
-		CommitFeePerKw:   chainfee.SatPerKWeight(msg.FeePerKiloWeight),
+		CommitFeePerKw:   commitFeePerKw,
 		FundingFeePerKw:  0,
 		PushMSat:         msg.PushAmount,
 		Flags:            msg.ChannelFlags,
@@ -1708,6 +1727,19 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		f.failFundingFlow(peer, cid, err)
 		return
 	}
+
+	// Until the reservation is added to activeReservations below, this
+	// function owns it and releases it when returning early.
+	reservationTracked := false
+	defer func() {
+		if reservationTracked {
+			return
+		}
+
+		if err := reservation.Cancel(); err != nil {
+			log.Errorf("Unable to cancel reservation: %v", err)
+		}
+	}()
 
 	log.Debugf("Initialized channel reservation: zeroConf=%v, psbt=%v, "+
 		"cannedShim=%v", reservation.IsZeroConf(),
@@ -1895,6 +1927,7 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 		peer:              peer,
 	}
 	f.activeReservations[peerIDKey][msg.PendingChannelID] = resCtx
+	reservationTracked = true
 	f.resMtx.Unlock()
 
 	// Update the timestamp once the fundingOpenMsg has been handled.
@@ -2040,65 +2073,42 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 	// Create the channel identifier.
 	cid := newChanIdentifier(msg.PendingChannelID)
 
-	// Perform some basic validation of any custom TLV records included.
-	//
+	// Channel type in our reservation should never be nil since we always
+	// negotiate the channel type explicitly and fall back to the default
+	// only when the RPC caller does not request one.
+	if resCtx.channelType == nil {
+		err := errors.New("channel type not set by funder")
+		f.failFundingFlow(peer, cid, err)
+		return
+	}
+
+	// We'll want to quickly check that the ChannelType echoed by the
+	// channel request recipient matches what we proposed.
 	// TODO: Return errors as funding.Error to give context to remote peer?
-	if resCtx.channelType != nil {
-		// We'll want to quickly check that the ChannelType echoed by
-		// the channel request recipient matches what we proposed.
-		if msg.ChannelType == nil {
-			err := errors.New("explicit channel type not echoed " +
-				"back")
+	if msg.ChannelType == nil {
+		err := errors.New("explicit channel type not echoed back")
+		f.failFundingFlow(peer, cid, err)
+		return
+	}
+	proposedFeatures := lnwire.RawFeatureVector(*resCtx.channelType)
+	ackedFeatures := lnwire.RawFeatureVector(*msg.ChannelType)
+	if !proposedFeatures.Equals(&ackedFeatures) {
+		err := errors.New("channel type mismatch")
+		f.failFundingFlow(peer, cid, err)
+		return
+	}
+
+	// We'll want to do the same with the LeaseExpiry if one should be set.
+	if resCtx.reservation.LeaseExpiry() != 0 {
+		if msg.LeaseExpiry == nil {
+			err := errors.New("lease expiry not echoed back")
 			f.failFundingFlow(peer, cid, err)
 			return
 		}
-		proposedFeatures := lnwire.RawFeatureVector(*resCtx.channelType)
-		ackedFeatures := lnwire.RawFeatureVector(*msg.ChannelType)
-		if !proposedFeatures.Equals(&ackedFeatures) {
-			err := errors.New("channel type mismatch")
-			f.failFundingFlow(peer, cid, err)
-			return
-		}
+		if uint32(*msg.LeaseExpiry) !=
+			resCtx.reservation.LeaseExpiry() {
 
-		// We'll want to do the same with the LeaseExpiry if one should
-		// be set.
-		if resCtx.reservation.LeaseExpiry() != 0 {
-			if msg.LeaseExpiry == nil {
-				err := errors.New("lease expiry not echoed " +
-					"back")
-				f.failFundingFlow(peer, cid, err)
-				return
-			}
-			if uint32(*msg.LeaseExpiry) !=
-				resCtx.reservation.LeaseExpiry() {
-
-				err := errors.New("lease expiry mismatch")
-				f.failFundingFlow(peer, cid, err)
-				return
-			}
-		}
-	} else if msg.ChannelType != nil {
-		// The spec isn't too clear about whether it's okay to set the
-		// channel type in the accept_channel response if we didn't
-		// explicitly set it in the open_channel message. For now, we
-		// check that it's the same type we'd have arrived through
-		// implicit negotiation. If it's another type, we fail the flow.
-		_, implicitCommitType := implicitNegotiateCommitmentType(
-			peer.LocalFeatures(), peer.RemoteFeatures(),
-		)
-
-		_, negotiatedCommitType, err := negotiateCommitmentType(
-			msg.ChannelType, peer.LocalFeatures(),
-			peer.RemoteFeatures(),
-		)
-		if err != nil {
-			err := errors.New("received unexpected channel type")
-			f.failFundingFlow(peer, cid, err)
-			return
-		}
-
-		if implicitCommitType != negotiatedCommitType {
-			err := errors.New("negotiated unexpected channel type")
+			err := errors.New("lease expiry mismatch")
 			f.failFundingFlow(peer, cid, err)
 			return
 		}
@@ -2340,19 +2350,9 @@ func (f *Manager) waitForPsbt(intent *chanfunding.PsbtIntent,
 		// At this point, we'll see if there's an AuxFundingDesc we
 		// need to deliver so the funding process can continue
 		// properly.
-		auxFundingDesc, err := fn.MapOptionZ(
-			f.cfg.AuxFundingController,
-			func(c AuxFundingController) AuxFundingDescResult {
-				return c.DescFromPendingChanID(
-					cid.tempChanID,
-					lnwallet.NewAuxChanState(
-						resCtx.reservation.ChanState(),
-					),
-					resCtx.reservation.CommitmentKeyRings(),
-					true,
-				)
-			},
-		).Unpack()
+		auxFundingDesc, err := f.auxFundingDesc(
+			cid.tempChanID, resCtx.reservation,
+		)
 		if err != nil {
 			failFlow("error continuing PSBT flow", err)
 			return
@@ -2382,6 +2382,22 @@ func (f *Manager) waitForPsbt(intent *chanfunding.PsbtIntent,
 			cid.tempChanID)
 		return
 	}
+}
+
+// auxFundingDesc returns any aux funding descriptor for the pending channel.
+func (f *Manager) auxFundingDesc(pid PendingChanID,
+	reservation *lnwallet.ChannelReservation) (
+	fn.Option[lnwallet.AuxFundingDesc], error) {
+
+	return fn.MapOptionZ(
+		f.cfg.AuxFundingController,
+		func(c AuxFundingController) AuxFundingDescResult {
+			return c.DescFromPendingChanID(
+				pid, reservation.AuxChanState(),
+				reservation.CommitmentKeyRings(), true,
+			)
+		},
+	).Unpack()
 }
 
 // continueFundingAccept continues the channel funding flow once our
@@ -2529,17 +2545,9 @@ func (f *Manager) fundeeProcessFundingCreated(peer lnpeer.Peer,
 
 	// At this point, we'll see if there's an AuxFundingDesc we need to
 	// deliver so the funding process can continue properly.
-	auxFundingDesc, err := fn.MapOptionZ(
-		f.cfg.AuxFundingController,
-		func(c AuxFundingController) AuxFundingDescResult {
-			return c.DescFromPendingChanID(
-				cid.tempChanID, lnwallet.NewAuxChanState(
-					resCtx.reservation.ChanState(),
-				), resCtx.reservation.CommitmentKeyRings(),
-				true,
-			)
-		},
-	).Unpack()
+	auxFundingDesc, err := f.auxFundingDesc(
+		cid.tempChanID, resCtx.reservation,
+	)
 	if err != nil {
 		log.Errorf("error continuing PSBT flow: %v", err)
 		f.failFundingFlow(peer, cid, err)
@@ -3647,7 +3655,7 @@ func (f *Manager) receivedChannelReady(node *btcec.PublicKey,
 
 	// If we haven't insert the next revocation point, we haven't finished
 	// processing the channel ready message.
-	if channel.RemoteNextRevocation == nil {
+	if channel.RemoteNextRevocation.IsNone() {
 		return false, nil
 	}
 
@@ -4122,14 +4130,14 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer,
 		return
 	}
 
-	// If the RemoteNextRevocation is non-nil, then the channel has
+	// If the RemoteNextRevocation is set, then the channel has
 	// already been fully established and we've processed channel_ready
 	// for it at least once. We short-circuit inline to avoid redoing the
 	// heavy work in processChannelReady (DB writes, nonce generation,
 	// AddNewChannel) on every duplicate channel_ready the peer sends.
 	// Note that the happy path where the channel is actively being
 	// funded goes through the localDiscoverySignal branch above.
-	if channel.RemoteNextRevocation != nil {
+	if channel.RemoteNextRevocation.IsSome() {
 		// Even though we're ignoring the rest of the message, we
 		// still need to refresh the peer's alias if they negotiated
 		// the option_scid_alias feature and sent a (possibly updated)
@@ -4291,7 +4299,7 @@ func (f *Manager) processChannelReady(peer lnpeer.Peer,
 		}
 	}
 
-	// If the RemoteNextRevocation is non-nil, it means that we have
+	// If the RemoteNextRevocation is set, it means that we have
 	// already processed channelReady for this channel, so ignore. This
 	// check is after the alias logic so we store the peer's most recent
 	// alias. The spec requires us to validate that subsequent
@@ -4300,7 +4308,7 @@ func (f *Manager) processChannelReady(peer lnpeer.Peer,
 	// ignoring it. We are, however, required to *send* the same per
 	// commitment point, since another pedantic implementation might
 	// verify it.
-	if channel.RemoteNextRevocation != nil {
+	if channel.RemoteNextRevocation.IsSome() {
 		log.Infof("Received duplicate channelReady for "+
 			"ChannelID(%v), ignoring.", chanID)
 		return
@@ -4367,7 +4375,7 @@ func (f *Manager) processChannelReady(peer lnpeer.Peer,
 	// need to create the next commitment state for the remote party. So
 	// we'll insert that into the channel now before passing it along to
 	// other sub-systems.
-	err = channel.InsertNextRevocation(msg.NextPerCommitmentPoint)
+	err = channel.InsertNextRevocation(*msg.NextPerCommitmentPoint)
 	if err != nil {
 		log.Errorf("unable to insert next commitment point: %v", err)
 		return
@@ -4958,9 +4966,9 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 	// wallet doesn't have enough funds to commit to this channel, then the
 	// request will fail, and be aborted.
 	//
-	// Before we init the channel, we'll also check to see what commitment
-	// format we can use with this peer. This is dependent on *both* us and
-	// the remote peer are signaling the proper feature bit.
+	// Before initializing the reservation, validate the caller-requested
+	// channel type or select a default from the peers' mutually supported
+	// commitment features.
 	chanType, commitType, err := negotiateCommitmentType(
 		msg.ChannelType, msg.Peer.LocalFeatures(),
 		msg.Peer.RemoteFeatures(),
@@ -4971,28 +4979,23 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 		return
 	}
 
-	var (
-		zeroConf bool
-		scid     bool
-	)
+	// Since we always negotiate an explicit channel type now, chanType is
+	// guaranteed to be non-nil.
+	//
+	// Check if the returned chanType includes either the zero-conf or
+	// scid-alias bits.
+	featureVec := lnwire.RawFeatureVector(*chanType)
+	zeroConf := featureVec.IsSet(lnwire.ZeroConfRequired)
+	scid := featureVec.IsSet(lnwire.ScidAliasRequired)
 
-	if chanType != nil {
-		// Check if the returned chanType includes either the zero-conf
-		// or scid-alias bits.
-		featureVec := lnwire.RawFeatureVector(*chanType)
-		zeroConf = featureVec.IsSet(lnwire.ZeroConfRequired)
-		scid = featureVec.IsSet(lnwire.ScidAliasRequired)
+	// The option-scid-alias channel type for a public channel is disallowed
+	if scid && !msg.Private {
+		err = fmt.Errorf("option-scid-alias chantype for public " +
+			"channel")
+		log.Error(err)
+		msg.Err <- err
 
-		// The option-scid-alias channel type for a public channel is
-		// disallowed.
-		if scid && !msg.Private {
-			err = fmt.Errorf("option-scid-alias chantype for " +
-				"public channel")
-			log.Error(err)
-			msg.Err <- err
-
-			return
-		}
+		return
 	}
 
 	// The current variant of taproot channels can only be used with
@@ -5022,6 +5025,10 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 
 		commitFeePerKw = f.cfg.MaxAnchorsCommitFeeRate
 	}
+
+	// Never propose a commitment fee rate below the floor, as our peer
+	// would reject it. The floor takes precedence over a lower anchor cap.
+	commitFeePerKw = max(commitFeePerKw, chainfee.FeePerKwFloor)
 
 	var scidFeatureVal bool
 	if hasFeatures(

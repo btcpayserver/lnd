@@ -115,6 +115,14 @@ func (b *readWriteBucket) NestedReadWriteBucket(
 		return nil
 	}
 
+	if id, ok := b.tx.bucketIDs.get(b.id, key); ok {
+		if id == nil {
+			return nil
+		}
+
+		return newReadWriteBucket(b.tx, id)
+	}
+
 	var id int64
 	row, cancel := b.tx.QueryRow(
 		"SELECT id FROM "+b.table+" WHERE "+parentSelector(b.id)+
@@ -125,11 +133,15 @@ func (b *readWriteBucket) NestedReadWriteBucket(
 
 	switch {
 	case err == sql.ErrNoRows:
+		b.tx.bucketIDs.put(b.id, key, nil)
+
 		return nil
 
 	case err != nil:
 		panic(err)
 	}
+
+	b.tx.bucketIDs.put(b.id, key, &id)
 
 	return newReadWriteBucket(b.tx, &id)
 }
@@ -183,6 +195,8 @@ func (b *readWriteBucket) CreateBucket(key []byte) (
 		return nil, err
 	}
 
+	b.tx.bucketIDs.put(b.id, key, &id)
+
 	return newReadWriteBucket(b.tx, &id), nil
 }
 
@@ -231,6 +245,8 @@ func (b *readWriteBucket) CreateBucketIfNotExists(key []byte) (
 		return nil, err
 	}
 
+	b.tx.bucketIDs.put(b.id, key, &id)
+
 	return newReadWriteBucket(b.tx, &id), nil
 }
 
@@ -241,6 +257,10 @@ func (b *readWriteBucket) DeleteNestedBucket(key []byte) error {
 	if len(key) == 0 {
 		return walletdb.ErrIncompatibleValue
 	}
+
+	// The delete cascades to all sub-buckets, so cached ids of any of them
+	// are no longer valid.
+	b.tx.bucketIDs.clear()
 
 	result, err := b.tx.Exec(
 		"DELETE FROM "+b.table+" WHERE "+parentSelector(b.id)+
@@ -444,20 +464,33 @@ func (b *readWriteBucket) Prefetch(paths ...[]string) {}
 // additional queries can be executed within the callback.
 func (b *readWriteBucket) ForAll(cb func(k, v []byte) error) error {
 	rows, cancel, err := b.tx.Query(
-		"SELECT key, value FROM " + b.table + " WHERE " +
-			parentSelector(b.id) + " ORDER BY key",
+		"SELECT key, value, " +
+			"CASE WHEN value IS NULL THEN 1 ELSE 0 END " +
+			"FROM " + b.table + " WHERE " + parentSelector(b.id) +
+			" ORDER BY key",
 	)
 	if err != nil {
 		return err
 	}
 	defer cancel()
+	defer rows.Close()
 
 	for rows.Next() {
-		var key, value []byte
+		var (
+			key      []byte
+			value    []byte
+			isBucket int
+		)
 
-		err := rows.Scan(&key, &value)
+		err := rows.Scan(&key, &value, &isBucket)
 		if err != nil {
 			return err
+		}
+
+		// SQLite decodes an empty BLOB into nil. Preserve the distinction
+		// between empty leaf values and the SQL NULL used for buckets.
+		if isBucket == 0 && value == nil {
+			value = []byte{}
 		}
 
 		err = cb(key, value)
@@ -466,5 +499,5 @@ func (b *readWriteBucket) ForAll(cb func(k, v []byte) error) error {
 		}
 	}
 
-	return nil
+	return rows.Err()
 }

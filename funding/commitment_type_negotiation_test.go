@@ -25,7 +25,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 		expectsErr        error
 	}{
 		{
-			name: "explicit missing remote negotiation feature",
+			name: "explicit type without remote negotiation bit",
 			channelFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxRequired,
@@ -33,16 +33,19 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 			),
-			//nolint:ll
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType:   nil,
-			expectsErr:        nil,
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+					lnwire.AnchorsZeroFeeHtlcTxRequired,
+				),
+			),
+			expectsErr: nil,
 		},
 		{
 			name: "explicit missing remote commitment feature",
@@ -53,11 +56,9 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsErr: errUnsupportedChannelType,
 		},
@@ -74,14 +75,12 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ZeroConfOptional,
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeScriptEnforcedLease,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -106,13 +105,11 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ZeroConfOptional,
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ZeroConfOptional,
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -138,14 +135,12 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ScidAliasOptional,
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeScriptEnforcedLease,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -170,13 +165,11 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ScidAliasOptional,
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ScidAliasOptional,
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -198,12 +191,10 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -222,12 +213,10 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeTweakless,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -238,39 +227,34 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			expectsErr: nil,
 		},
 		{
-			name:            "explicit legacy",
+			// An empty channel type asks for the legacy commitment
+			// type, which we no longer open. Note that this used to
+			// be accepted with no feature check at all.
+			name:            "explicit legacy rejected",
 			channelFeatures: lnwire.NewRawFeatureVector(),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
-			expectsCommitType: lnwallet.CommitmentTypeLegacy,
-			expectsChanType: (*lnwire.ChannelType)(
-				lnwire.NewRawFeatureVector(),
-			),
-			expectsErr: nil,
+			expectsErr: lnwire.ErrChanTypeDeprecated,
 		},
-		// Both sides signal the explicit chan type bit, so we expect
-		// that we return the corresponding chan type feature bits,
-		// even though we didn't set a desired channel type.
+		// No desired channel type is set, so we expect the default
+		// selection to return the corresponding chan type feature bits,
+		// which are then signaled on the wire.
 		{
-			name:            "default explicit anchors",
+			name:            "default anchors",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
 			expectsChanType: (*lnwire.ChannelType)(
@@ -282,7 +266,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			expectsErr: nil,
 		},
 		{
-			name:            "implicit tweakless",
+			name:            "default tweakless",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyRequired,
@@ -292,20 +276,26 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.StaticRemoteKeyOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeTweakless,
-			expectsChanType:   nil,
-			expectsErr:        nil,
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+				),
+			),
+			expectsErr: nil,
 		},
 		{
-			name:            "implicit legacy",
+			// Without mutual support for static remote key there is
+			// nothing left to fall back on but the legacy type.
+			// Note that the test runs both peer orderings, so it
+			// covers either side being the one that lacks it.
+			name:            "default legacy rejected",
 			channelFeatures: nil,
 			localFeatures:   lnwire.NewRawFeatureVector(),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 			),
-			expectsCommitType: lnwallet.CommitmentTypeLegacy,
-			expectsChanType:   nil,
-			expectsErr:        nil,
+			expectsErr: ErrDeprecatedChanType,
 		},
 
 		// Test cases for final taproot channels with explicit
@@ -317,11 +307,9 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeSimpleTaprootFinal, //nolint:ll
 			expectsChanType: (*lnwire.ChannelType)(
@@ -340,12 +328,10 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ScidAliasOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ScidAliasOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeSimpleTaprootFinal, //nolint:ll
 			expectsChanType: (*lnwire.ChannelType)(
@@ -366,12 +352,10 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ZeroConfOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ZeroConfOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeSimpleTaprootFinal, //nolint:ll
 			expectsChanType: (*lnwire.ChannelType)(
@@ -395,13 +379,11 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ScidAliasOptional,
 				lnwire.ZeroConfOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.ScidAliasOptional,
 				lnwire.ZeroConfOptional,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeSimpleTaprootFinal, //nolint:ll
 			expectsChanType: (*lnwire.ChannelType)(
@@ -423,32 +405,28 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalFinal,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.SimpleTaprootChannelsOptionalStaging,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsErr: errUnsupportedChannelType,
 		},
 
-		// Test cases for implicit negotiation ignoring taproot feature
+		// Test cases for default negotiation ignoring taproot feature
 		// bits. Taproot channels require an explicit channel type.
 		{
 			//nolint:ll
-			name:            "implicit anchors preferred over taproot",
+			name:            "default anchors preferred over taproot",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.SimpleTaprootChannelsOptionalStaging,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.SimpleTaprootChannelsOptionalStaging,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx, //nolint:ll
 			expectsChanType: (*lnwire.ChannelType)(
@@ -461,38 +439,42 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 		},
 		{
 			//nolint:ll
-			name:            "implicit ignores staging taproot without anchors",
+			name:            "default ignores staging taproot without anchors",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
+				lnwire.StaticRemoteKeyOptional,
 				lnwire.SimpleTaprootChannelsOptionalFinal,
 				lnwire.SimpleTaprootChannelsOptionalStaging,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
+				lnwire.StaticRemoteKeyOptional,
 				lnwire.SimpleTaprootChannelsOptionalStaging,
-				lnwire.ExplicitChannelTypeOptional,
 			),
-			expectsCommitType: lnwallet.CommitmentTypeLegacy,
+			expectsCommitType: lnwallet.CommitmentTypeTweakless,
 			expectsChanType: (*lnwire.ChannelType)(
-				lnwire.NewRawFeatureVector(),
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+				),
 			),
 			expectsErr: nil,
 		},
 		{
 			//nolint:ll
-			name:            "implicit ignores final taproot without anchors",
+			name:            "default ignores final taproot without anchors",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
+				lnwire.StaticRemoteKeyOptional,
 				lnwire.SimpleTaprootChannelsOptionalFinal,
-				lnwire.ExplicitChannelTypeOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
+				lnwire.StaticRemoteKeyOptional,
 				lnwire.SimpleTaprootChannelsOptionalFinal,
-				lnwire.ExplicitChannelTypeOptional,
 			),
-			expectsCommitType: lnwallet.CommitmentTypeLegacy,
+			expectsCommitType: lnwallet.CommitmentTypeTweakless,
 			expectsChanType: (*lnwire.ChannelType)(
-				lnwire.NewRawFeatureVector(),
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+				),
 			),
 			expectsErr: nil,
 		},

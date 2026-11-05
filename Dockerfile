@@ -1,10 +1,6 @@
 # If you change this please also update GO_VERSION in Makefile (then run
 # `make lint` to see where else it needs to be updated as well).
-FROM golang:1.26.6-alpine as builder
-
-# Force Go to use the cgo based DNS resolver. This is required to ensure DNS
-# queries required to connect to linked containers succeed.
-ENV GODEBUG netdns=cgo
+FROM golang:1.27.3-alpine as builder
 
 # Pass a tag, branch or a commit using build-arg.  This allows a docker
 # image to be built from a specified Git state.  The default image
@@ -21,7 +17,7 @@ RUN apk add --no-cache --update alpine-sdk \
 &&  cd /go/src/github.com/lightningnetwork/lnd \
 &&  git checkout $checkout \
 &&  make release-install
- 
+
 # Start a new, final image.
 FROM alpine as final
 

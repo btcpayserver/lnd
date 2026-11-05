@@ -3246,9 +3246,21 @@ func restartChannel(channelOld *LightningChannel) (*LightningChannel, error) {
 		return nil, err
 	}
 
+	// The aux components are re-applied every time a channel is loaded in
+	// production, so a restart must not silently drop them here either.
+	// Otherwise the restarted side stops producing aux signatures while
+	// its peer still expects them.
+	var chanOpts []ChannelOpt
+	channelOld.leafStore.WhenSome(func(s AuxLeafStore) {
+		chanOpts = append(chanOpts, WithLeafStore(s))
+	})
+	channelOld.auxSigner.WhenSome(func(s AuxSigner) {
+		chanOpts = append(chanOpts, WithAuxSigner(s))
+	})
+
 	channelNew, err := NewLightningChannel(
 		channelOld.Signer, nodeChannels[0],
-		channelOld.sigPool,
+		channelOld.sigPool, chanOpts...,
 	)
 	if err != nil {
 		return nil, err
@@ -3492,10 +3504,16 @@ func testChanSyncOweCommitment(t *testing.T,
 	// At this point, we should be able to resume the prior state update
 	// without any issues, resulting in Alice settling the 3 htlc's, and
 	// adding one of her own.
+	// The link carries the aux signatures across from the wire message, so
+	// a faithful simulation of the restart has to do so as well.
+	aliceReAuxBlob, err := aliceReCommitSig.CustomRecords.Serialize()
+	require.NoError(t, err, "unable to serialize aux sig blob")
+
 	err = bobChannel.ReceiveNewCommitment(&CommitSigs{
 		CommitSig:  aliceReCommitSig.CommitSig,
 		HtlcSigs:   aliceReCommitSig.HtlcSigs,
 		PartialSig: aliceReCommitSig.PartialSig,
+		AuxSigBlob: aliceReAuxBlob,
 	})
 	require.NoError(t, err, "bob unable to process alice's commitment")
 	bobRevocation, _, _, err := bobChannel.RevokeCurrentCommitment()
@@ -4828,10 +4846,14 @@ func testChanSyncOweRevocationAndCommitForceTransition(t *testing.T,
 	// message to Bob.
 	_, _, err = aliceChannel.ReceiveRevocation(bobRevocation)
 	require.NoError(t, err, "alice unable to recv revocation")
+	bobAuxBlob, err := bobSigMsg.CustomRecords.Serialize()
+	require.NoError(t, err, "unable to serialize aux sig blob")
+
 	err = aliceChannel.ReceiveNewCommitment(&CommitSigs{
 		CommitSig:  bobSigMsg.CommitSig,
 		HtlcSigs:   bobSigMsg.HtlcSigs,
 		PartialSig: bobSigMsg.PartialSig,
+		AuxSigBlob: bobAuxBlob,
 	})
 	require.NoError(t, err, "alice unable to rev bob's commitment")
 	aliceRevocation, _, _, err = aliceChannel.RevokeCurrentCommitment()
@@ -5377,8 +5399,9 @@ func TestFeeUpdateOldDiskFormat(t *testing.T) {
 				err)
 		}
 	}
-	// Check that the expected number of items is found in the logs.
-	expFee := numHTLCs / 5
+	// Replacement semantics retain the final pending fee value alongside
+	// all of the HTLCs.
+	expFee := 1
 	assertLogItems(expFee, numHTLCs)
 
 	// Now, Alice will send a new commitment to Bob, but we'll simulate a
@@ -6075,13 +6098,191 @@ func TestSignCommitmentFailNotLockedIn(t *testing.T) {
 
 	// Next, we'll modify Alice's internal state to omit knowledge of Bob's
 	// next revocation point.
-	aliceChannel.channelState.RemoteNextRevocation = nil
+	aliceState := aliceChannel.channelState
+	aliceState.RemoteNextRevocation = fn.None[btcec.PublicKey]()
 
 	// If we now try to initiate a state update, then it should fail as
 	// Alice is unable to actually create a new state.
 	_, err = aliceChannel.SignNextCommitment(ctxb)
 	if err != ErrNoWindow {
 		t.Fatalf("expected ErrNoWindow, instead have: %v", err)
+	}
+}
+
+// TestReceiveRevocationInvalidState tests that rejected revocations leave the
+// channel state unchanged and don't prevent a later valid transition.
+func TestReceiveRevocationInvalidState(t *testing.T) {
+	t.Parallel()
+
+	noNextPoint := fn.None[btcec.PublicKey]()
+
+	testCases := []struct {
+		name     string
+		chanType channeldb.ChannelType
+
+		// dropNextPoint clears Alice's copy of Bob's next revocation
+		// point.
+		dropNextPoint bool
+	}{
+		{
+			name:     "tweakless",
+			chanType: channeldb.SingleFunderTweaklessBit,
+		},
+		{
+			name:          "tweakless no next point",
+			chanType:      channeldb.SingleFunderTweaklessBit,
+			dropNextPoint: true,
+		},
+		{
+			name: "taproot",
+			chanType: channeldb.SimpleTaprootFeatureBit |
+				channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit,
+		},
+		{
+			name: "taproot no next point",
+			chanType: channeldb.SimpleTaprootFeatureBit |
+				channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit,
+			dropNextPoint: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			aliceChannel, bobChannel, err := CreateTestChannels(
+				t, tc.chanType,
+			)
+			require.NoError(t, err)
+
+			aliceState := aliceChannel.channelState
+			if tc.dropNextPoint {
+				aliceState.RemoteNextRevocation = noNextPoint
+			}
+
+			// Generate a revocation message for the
+			// current commitment state.
+			bobHeight := bobChannel.commitChains.Local.tail().height
+			revMsg, err := bobChannel.generateRevocation(bobHeight)
+			require.NoError(t, err)
+
+			curPoint := aliceState.RemoteCurrentRevocation
+			nextPoint := aliceState.RemoteNextRevocation
+
+			_, _, err = aliceChannel.ReceiveRevocation(revMsg)
+			require.ErrorIs(t, err, ErrUnexpectedRevocation)
+
+			// The rejected transition must leave the
+			// revocation state unchanged.
+			require.Equal(
+				t, curPoint, aliceState.RemoteCurrentRevocation,
+			)
+			require.Equal(
+				t, nextPoint, aliceState.RemoteNextRevocation,
+			)
+			_, err = aliceState.RevocationStore.LookUp(bobHeight)
+			require.Error(t, err)
+
+			if tc.dropNextPoint {
+				return
+			}
+
+			// A normal state transition should still
+			// succeed afterwards.
+			require.NoError(
+				t, ForceStateTransition(
+					aliceChannel, bobChannel,
+				),
+			)
+			_, err = aliceState.RevocationStore.LookUp(bobHeight)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestReceiveRevocationWrongSecret tests that a revocation for the wrong
+// commitment point is rejected before the remote party's revocation state is
+// modified, and that the correct revocation can still be processed afterwards.
+func TestReceiveRevocationWrongSecret(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		chanType channeldb.ChannelType
+	}{
+		{
+			name:     "tweakless",
+			chanType: channeldb.SingleFunderTweaklessBit,
+		},
+		{
+			name: "taproot",
+			chanType: channeldb.SimpleTaprootFeatureBit |
+				channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			aliceChannel, bobChannel, err := CreateTestChannels(
+				t, tc.chanType,
+			)
+			require.NoError(t, err)
+
+			// Give Alice an outstanding commitment for Bob so the
+			// revocation reaches the secret validation.
+			commitSigs, err := aliceChannel.SignNextCommitment(ctxb)
+			require.NoError(t, err)
+			err = bobChannel.ReceiveNewCommitment(
+				commitSigs.CommitSigs,
+			)
+			require.NoError(t, err)
+
+			bobHeight := bobChannel.commitChains.Local.tail().height
+			bobRevocation, _, _, err := bobChannel.
+				RevokeCurrentCommitment()
+			require.NoError(t, err)
+
+			aliceState := aliceChannel.channelState
+			currentPoint := aliceState.RemoteCurrentRevocation
+			nextPoint := aliceState.RemoteNextRevocation
+
+			// Corrupt the revealed secret so it no longer
+			// derives the remote party's current revocation
+			// point.
+			wrongRevocation := *bobRevocation
+			wrongRevocation.Revocation[0] ^= 1
+
+			_, _, err = aliceChannel.ReceiveRevocation(
+				&wrongRevocation,
+			)
+			require.EqualError(t, err, "revocation key mismatch")
+
+			// The rejected revocation must not advance
+			// either point or enter the bad secret in the
+			// revocation store.
+			require.Equal(
+				t, currentPoint,
+				aliceState.RemoteCurrentRevocation,
+			)
+			require.Equal(
+				t, nextPoint, aliceState.RemoteNextRevocation,
+			)
+			_, err = aliceState.RevocationStore.LookUp(bobHeight)
+			require.Error(t, err)
+
+			// The real revocation should still be accepted
+			// afterwards.
+			_, _, err = aliceChannel.ReceiveRevocation(
+				bobRevocation,
+			)
+			require.NoError(t, err)
+			_, err = aliceState.RevocationStore.LookUp(bobHeight)
+			require.NoError(t, err)
+		})
 	}
 }
 
@@ -6437,6 +6638,56 @@ func TestInvalidCommitSigError(t *testing.T) {
 	}
 }
 
+// TestInvalidPartialCommitSigError tests that if the remote party sends us an
+// invalid musig2 partial signature for a taproot channel, then we'll reject it
+// and return an InvalidPartialCommitSigError carrying the commitment details.
+// The error must also match *InvalidCommitSigError, as that's what the link
+// uses to decide whether to send the debug data to the remote party.
+func TestInvalidPartialCommitSigError(t *testing.T) {
+	t.Parallel()
+
+	// First, we'll make a taproot channel between Alice and Bob.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit|
+			channeldb.AnchorOutputsBit|
+			channeldb.SimpleTaprootFeatureBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	// With the channel established, we'll now send a single HTLC from
+	// Alice to Bob.
+	var htlcAmt lnwire.MilliSatoshi = 100000
+	htlc, _ := createHTLC(0, htlcAmt)
+	addAndReceiveHTLC(t, aliceChannel, bobChannel, htlc, nil)
+
+	// Alice will now attempt to initiate a state transition.
+	aliceNewCommit, err := aliceChannel.SignNextCommitment(ctxb)
+	require.NoError(t, err, "unable to sign new commit")
+
+	// Before the partial signature gets to Bob, we'll mutate it, such
+	// that the signature is now actually invalid.
+	partialSig, err := aliceNewCommit.PartialSig.UnwrapOrErrV(
+		errNoPartialSig,
+	)
+	require.NoError(t, err)
+	partialSig.Sig.SetInt(1)
+	aliceNewCommit.PartialSig = lnwire.MaybePartialSigWithNonce(
+		&partialSig,
+	)
+
+	// Bob should reject this new state, and return the proper error.
+	err = bobChannel.ReceiveNewCommitment(aliceNewCommit.CommitSigs)
+	require.Error(t, err)
+
+	var partialSigErr *InvalidPartialCommitSigError
+	require.ErrorAs(t, err, &partialSigErr)
+	require.EqualValues(t, 1, partialSigErr.commitHeight)
+	require.NotEmpty(t, partialSigErr.commitTx)
+
+	var commitSigErr *InvalidCommitSigError
+	require.ErrorAs(t, err, &commitSigErr)
+}
+
 // TestChannelUnilateralCloseHtlcResolution tests that in the case of a
 // unilateral channel closure, then the party that didn't broadcast the
 // commitment is able to properly sweep all relevant outputs.
@@ -6643,11 +6894,13 @@ func TestChannelUnilateralClosePendingCommit(t *testing.T) {
 	// properly populated.
 	aliceRemoteChainTip, err := aliceChannel.channelState.RemoteCommitChainTip()
 	require.NoError(t, err, "unable to fetch remote chain tip")
+	bobNextPoint := aliceChannel.channelState.RemoteNextRevocation.
+		UnwrapOrFail(t)
 	aliceCloseSummary, err := NewUnilateralCloseSummary(
 		aliceChannel.channelState, aliceChannel.Signer,
 		spendDetail,
 		aliceRemoteChainTip.Commitment,
-		aliceChannel.channelState.RemoteNextRevocation,
+		&bobNextPoint,
 		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 		fn.Some[AuxContractResolver](&MockAuxContractResolver{}),
 	)
@@ -8402,18 +8655,22 @@ func TestChannelMaxFeeRate(t *testing.T) {
 func TestIdealCommitFeeRate(t *testing.T) {
 	t.Parallel()
 
-	// propertyTest tests that the validateFeeRate function always passes
-	// for the output returned by IdealCommitFeeRate for any valid random
-	// inputs fed to IdealCommitFeeRate.
+	// propertyTest checks that validateFeeRate passes for the output of
+	// IdealCommitFeeRate. The minimum relay fee is floored to match the
+	// value passed by the link.
 	propertyTest := func(c *LightningChannel) func(ma maxAlloc,
 		netFee, minRelayFee, maxAnchorFee fee) bool {
 
 		return func(ma maxAlloc, netFee, minRelayFee,
 			maxAnchorFee fee) bool {
 
+			minRelay := max(
+				chainfee.SatPerKWeight(minRelayFee),
+				chainfee.FeePerKwFloor,
+			)
 			idealFeeRate := c.IdealCommitFeeRate(
 				chainfee.SatPerKWeight(netFee),
-				chainfee.SatPerKWeight(minRelayFee),
+				minRelay,
 				chainfee.SatPerKWeight(maxAnchorFee),
 				float64(ma),
 			)
@@ -8719,6 +8976,70 @@ func TestChannelFeeRateFloor(t *testing.T) {
 		t.Fatalf("bob unable to process alice's new commitment: %v",
 			err)
 	}
+}
+
+// TestFeeUpdateRejectBelowFloor tests that a fee selected for a pre-existing
+// below-floor channel is rejected before it is added to the update log.
+func TestFeeUpdateRejectBelowFloor(t *testing.T) {
+	t.Parallel()
+
+	const (
+		channelCapacity = btcutil.Amount(500_000)
+		aliceBalance    = btcutil.Amount(5_045)
+	)
+
+	chanType := channeldb.SingleFunderTweaklessBit |
+		channeldb.AnchorOutputsBit | channeldb.ZeroHtlcTxFeeBit
+	feePerKw := chainfee.FeePerKwFloor - 3
+	commitFee := feePerKw.FeeForWeight(CommitWeight(chanType))
+	aliceBalanceBeforeFees := aliceBalance + commitFee + 2*AnchorSize
+
+	aliceChannel, _, err := createTestChannels(
+		t, chanType, channelCapacity, aliceBalanceBeforeFees, feePerKw,
+	)
+	require.NoError(t, err, "unable to create test channels")
+	localBalance := aliceChannel.channelState.LocalCommitment.LocalBalance
+	require.Equal(t, aliceBalance, localBalance.ToSatoshis())
+
+	absoluteMaxFee, _ := aliceChannel.MaxFeeRate(1)
+	require.Equal(t, chainfee.SatPerKWeight(251), absoluteMaxFee)
+
+	idealFeeRate := aliceChannel.IdealCommitFeeRate(
+		chainfee.FeePerKwFloor, chainfee.FeePerKwFloor, feePerKw, 0.5,
+	)
+	require.Equal(t, absoluteMaxFee, idealFeeRate)
+
+	initialLogIndex := aliceChannel.updateLogs.Local.logIndex
+	require.False(t, aliceChannel.OweCommitment())
+
+	err = aliceChannel.UpdateFee(idealFeeRate)
+	require.ErrorContains(t, err, "below fee floor")
+	require.Equal(t, initialLogIndex,
+		aliceChannel.updateLogs.Local.logIndex)
+	require.False(t, aliceChannel.OweCommitment())
+}
+
+// TestReceiveUpdateFeeRejectBelowFloor tests that an incoming fee update
+// below the floor is rejected before it is added to the remote update log.
+func TestReceiveUpdateFeeRejectBelowFloor(t *testing.T) {
+	t.Parallel()
+
+	_, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	initialLogIndex := bobChannel.updateLogs.Remote.logIndex
+
+	err = bobChannel.ReceiveUpdateFee(chainfee.FeePerKwFloor - 1)
+	require.ErrorContains(t, err, "below fee floor")
+	require.Equal(t, initialLogIndex,
+		bobChannel.updateLogs.Remote.logIndex)
+	require.Zero(t, bobChannel.updateLogs.Remote.Len())
+
+	// A fee update at the floor is still accepted.
+	require.NoError(t, bobChannel.ReceiveUpdateFee(chainfee.FeePerKwFloor))
+	require.Equal(t, 1, bobChannel.updateLogs.Remote.Len())
 }
 
 // TestFetchParent tests lookup of an entry's parent in the appropriate log.
@@ -10411,6 +10732,85 @@ func TestCreateBreachRetributionLegacy(t *testing.T) {
 	require.Equal(t, theirOp.Value, theirAmt)
 }
 
+// TestCreateBreachRetributionLegacyDustHtlcs tests that
+// `createBreachRetributionLegacy` skips dust HTLCs without leaving blank
+// entries in the returned retributions. A blank entry carries a nil sign
+// descriptor output, which downstream consumers don't expect.
+func TestCreateBreachRetributionLegacyDustHtlcs(t *testing.T) {
+	t.Parallel()
+
+	// Create dummy values for the test.
+	dummyPrivate, _ := btcec.PrivKeyFromBytes([]byte{1})
+
+	// Create a test channel.
+	aliceChannel, _, err := CreateTestChannels(
+		t, channeldb.ZeroHtlcTxFeeBit,
+	)
+	require.NoError(t, err)
+
+	chanState := aliceChannel.channelState
+
+	// Prepare the params needed to call the function. Note that the values
+	// here are not necessary "cryptography-correct", we just use them to
+	// construct the retribution.
+	leaseExpiry, keyRing, _ := deriveDummyRetributionParams(chanState)
+
+	// Use the remote commitment as our revocation log.
+	revokedLog := chanState.RemoteCommitment
+
+	ourOp := revokedLog.CommitTx.TxOut[0]
+	theirOp := revokedLog.CommitTx.TxOut[1]
+
+	// Create the dummy scripts.
+	ourScript := &WitnessScriptDesc{
+		OutputScript: ourOp.PkScript,
+	}
+	theirScript := &WitnessScriptDesc{
+		OutputScript: theirOp.PkScript,
+	}
+
+	// Add three HTLCs to the revocation log: one dust HTLC marked as
+	// trimmed via its stored output index, one dust HTLC by amount with a
+	// non-negative output index, and one non-dust HTLC. The channel type
+	// has zero HTLC transaction fees, so an HTLC is dust iff its amount is
+	// below the remote party's dust limit.
+	dustLimit := chanState.RemoteChanCfg.DustLimit
+	nonDustAmt := dustLimit + 1000
+	revokedLog.Htlcs = []channeldb.HTLC{
+		{
+			Incoming:    true,
+			Amt:         lnwire.NewMSatFromSatoshis(dustLimit - 1),
+			OutputIndex: -1,
+		},
+		{
+			Incoming:    true,
+			Amt:         lnwire.NewMSatFromSatoshis(dustLimit - 1),
+			OutputIndex: 3,
+		},
+		{
+			Incoming:    true,
+			Amt:         lnwire.NewMSatFromSatoshis(nonDustAmt),
+			OutputIndex: 2,
+		},
+	}
+
+	// Create the breach retribution using the legacy format.
+	br, _, _, err := createBreachRetributionLegacy(
+		&revokedLog, chanState, keyRing, dummyPrivate, ourScript,
+		theirScript, leaseExpiry,
+	)
+	require.NoError(t, err)
+
+	// Both dust HTLCs must be skipped entirely, leaving a single, fully
+	// populated retribution behind.
+	require.Len(t, br.HtlcRetributions, 1)
+
+	hr := br.HtlcRetributions[0]
+	require.NotNil(t, hr.SignDesc.Output)
+	require.EqualValues(t, nonDustAmt, hr.SignDesc.Output.Value)
+	require.EqualValues(t, 2, hr.OutPoint.Index)
+}
+
 // TestNewBreachRetribution tests that the function `NewBreachRetribution`
 // behaves as expected.
 func TestNewBreachRetribution(t *testing.T) {
@@ -11966,4 +12366,305 @@ func TestEvaluateNoOpHtlc(t *testing.T) {
 
 		require.Equal(t, tc.expectedDeltas, tc.balanceDeltas)
 	}
+}
+
+// taprootOverlayChanType is the channel type of a taproot overlay channel. The
+// tapscript root bit is what marks it as one, and therefore as a channel whose
+// peer owes us an aux signature for every HTLC.
+var taprootOverlayChanType = channeldb.SingleFunderTweaklessBit |
+	channeldb.AnchorOutputsBit | channeldb.SimpleTaprootFeatureBit |
+	channeldb.TapscriptRootBit
+
+// auxHtlcAmt is the amount of the HTLCs added by createAuxHtlcChannels. It is
+// well above both channels' dust limit, so each such HTLC gets its own
+// commitment output and therefore its own signature.
+const auxHtlcAmt = btcutil.Amount(20000)
+
+// auxDustHtlcAmt is an amount below Bob's dust limit, so an HTLC of this size
+// gets no output on the commitment Alice signs for Bob, and therefore no
+// signature of either kind.
+const auxDustHtlcAmt = btcutil.Amount(1000)
+
+// addAuxHtlc adds a single HTLC of the given amount, offered by Alice and
+// received by Bob. The index seeds the payment preimage, so callers must pass a
+// distinct index for each HTLC added to the same pair of channels.
+func addAuxHtlc(t *testing.T, aliceChannel, bobChannel *LightningChannel,
+	idx int, amt btcutil.Amount) {
+
+	var fakeOnionBlob [lnwire.OnionPacketSize]byte
+	copy(
+		fakeOnionBlob[:],
+		bytes.Repeat([]byte{0x05}, lnwire.OnionPacketSize),
+	)
+
+	var preimage [32]byte
+	copy(preimage[:], bytes.Repeat([]byte{byte(idx)}, 32))
+
+	htlc := &lnwire.UpdateAddHTLC{
+		PaymentHash: sha256.Sum256(preimage[:]),
+		Amount:      lnwire.NewMSatFromSatoshis(amt),
+		Expiry:      uint32(10),
+		OnionBlob:   fakeOnionBlob,
+	}
+
+	htlcIndex, err := aliceChannel.AddHTLC(htlc, nil)
+	require.NoError(t, err, "unable to add htlc")
+
+	htlc.ID = htlcIndex
+	_, err = bobChannel.ReceiveHTLC(htlc)
+	require.NoError(t, err, "unable to recv htlc")
+}
+
+// createAuxHtlcChannels creates a pair of channels of the given type, with the
+// given number of HTLCs offered by Alice and received by Bob. The HTLCs are
+// well above the dust limit, so each of them gets its own commitment output
+// and therefore its own signature.
+func createAuxHtlcChannels(t *testing.T, chanType channeldb.ChannelType,
+	numHtlcs int) (*LightningChannel, *LightningChannel) {
+
+	aliceChannel, bobChannel, err := CreateTestChannels(t, chanType)
+	require.NoError(t, err, "unable to create test channels")
+
+	for idx := range numHtlcs {
+		addAuxHtlc(t, aliceChannel, bobChannel, idx, auxHtlcAmt)
+	}
+
+	return aliceChannel, bobChannel
+}
+
+// mockAuxSignerWithSigs installs an aux signer on the given channel that
+// reports the given number of unpacked signature slots, regardless of what the
+// remote party actually sent. That stands in for a peer whose commit_sig
+// carried that many aux signatures.
+func mockAuxSignerWithSigs(channel *LightningChannel,
+	numSigs int) *MockAuxSigner {
+
+	auxSigner := NewAuxSignerMock(EmptyMockJobHandler)
+	channel.auxSigner = fn.Some[AuxSigner](auxSigner)
+
+	slots := make([]fn.Option[tlv.Blob], numSigs)
+	for idx := range slots {
+		slots[idx] = fn.Some(tlv.Blob{0x01})
+	}
+
+	auxSigner.On("UnpackSigs", mock.Anything).Return(fn.Ok(slots))
+	auxSigner.On(
+		"VerifySecondLevelSigs", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(nil)
+
+	return auxSigner
+}
+
+// TestAuxSigCount tests that a taproot overlay commitment is accepted only
+// when the remote party supplied exactly one aux signature per HTLC.
+//
+// A peer can otherwise withhold the aux signature for an HTLC: no verification
+// job is produced for it, nothing reports the omission, and the commitment
+// becomes our state carrying a signature we never received. At force close the
+// resolver then reads an empty signature out of that HTLC's custom records and
+// the second level HTLC cannot be swept.
+func TestAuxSigCount(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		numHtlcs     int
+		numDustHtlcs int
+		numSigs      int
+		expectErr    bool
+	}{{
+		// The honest case: an aux signer emits one signature per
+		// non-dust HTLC, so the counts line up.
+		name:     "one signature per htlc",
+		numHtlcs: 2,
+		numSigs:  2,
+	}, {
+		name:      "all signatures withheld",
+		numHtlcs:  1,
+		numSigs:   0,
+		expectErr: true,
+	}, {
+		// The subtler withholding: enough signatures to look
+		// plausible, but one HTLC left unsigned.
+		name:      "one signature withheld",
+		numHtlcs:  2,
+		numSigs:   1,
+		expectErr: true,
+	}, {
+		name:      "more signatures than htlcs",
+		numHtlcs:  1,
+		numSigs:   2,
+		expectErr: true,
+	}, {
+		// A dust HTLC has no output on the commitment, so it gets
+		// neither a BTC level nor an aux signature. This pins the
+		// invariant the count check relies on: the aux signatures are
+		// emitted on the same non-dust basis as the BTC level ones.
+		name:         "dust htlc gets no signature",
+		numHtlcs:     1,
+		numDustHtlcs: 1,
+		numSigs:      1,
+	}, {
+		// Signing the dust HTLC as well is exactly the divergence that
+		// the count check is there to catch.
+		name:         "dust htlc signed anyway",
+		numHtlcs:     1,
+		numDustHtlcs: 1,
+		numSigs:      2,
+		expectErr:    true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			aliceChannel, bobChannel := createAuxHtlcChannels(
+				t, taprootOverlayChanType, tc.numHtlcs,
+			)
+			for idx := range tc.numDustHtlcs {
+				addAuxHtlc(
+					t, aliceChannel, bobChannel,
+					tc.numHtlcs+idx, auxDustHtlcAmt,
+				)
+			}
+
+			mockAuxSignerWithSigs(bobChannel, tc.numSigs)
+
+			aliceNewCommit, err := aliceChannel.SignNextCommitment(
+				ctxb,
+			)
+			require.NoError(t, err, "unable to sign commitment")
+
+			err = bobChannel.ReceiveNewCommitment(
+				aliceNewCommit.CommitSigs,
+			)
+			if !tc.expectErr {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorContains(
+				t, err, "number of aux htlc sig mismatch",
+			)
+		})
+	}
+}
+
+// TestAuxSigBlobOmittedFailsCommitment tests the same rejection, but driven by
+// the field a remote party actually controls: a commit_sig that carries no aux
+// signature custom record at all. ReceiveNewCommitment turns a nil AuxSigBlob
+// into fn.None, and a real aux signer unpacks that into no signatures.
+func TestAuxSigBlobOmittedFailsCommitment(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel := createAuxHtlcChannels(
+		t, taprootOverlayChanType, 1,
+	)
+
+	// Bob's aux signer mirrors the real one: an absent blob unpacks to no
+	// signatures at all. We record what it was handed, so the test can
+	// show it exercised the absent blob branch rather than assuming it.
+	auxSigner := NewAuxSignerMock(EmptyMockJobHandler)
+	bobChannel.auxSigner = fn.Some[AuxSigner](auxSigner)
+
+	var unpackedBlob fn.Option[tlv.Blob]
+	auxSigner.On("UnpackSigs", mock.Anything).Run(func(a mock.Arguments) {
+		blob, ok := a.Get(0).(fn.Option[tlv.Blob])
+		require.True(t, ok)
+		unpackedBlob = blob
+	}).Return(fn.Ok[[]fn.Option[tlv.Blob]](nil))
+
+	aliceNewCommit, err := aliceChannel.SignNextCommitment(ctxb)
+	require.NoError(t, err, "unable to sign commitment")
+
+	// Alice's commit_sig does carry an aux signature blob. Stripping it is
+	// precisely what a peer omitting the custom record looks like here.
+	require.NotNil(t, aliceNewCommit.AuxSigBlob)
+	aliceNewCommit.AuxSigBlob = nil
+
+	err = bobChannel.ReceiveNewCommitment(aliceNewCommit.CommitSigs)
+	require.ErrorContains(t, err, "number of aux htlc sig mismatch")
+
+	// The blob really was absent by the time lnd asked the aux signer to
+	// unpack it, so this was the wire level case.
+	require.True(t, unpackedBlob.IsNone())
+}
+
+// TestAuxSigNotRequiredOnPlainChannel tests that a channel without the
+// tapscript root bit still accepts commitments carrying no aux signatures. The
+// aux signer is configured node wide, so a node running one also attaches it to
+// its plain channels, whose peers correctly send none. Requiring them there
+// would force close those channels.
+func TestAuxSigNotRequiredOnPlainChannel(t *testing.T) {
+	t.Parallel()
+
+	// The same channel type as the overlay one, minus the tapscript root
+	// bit, which is the only thing that marks a channel as an overlay.
+	plainChanType := taprootOverlayChanType &^ channeldb.TapscriptRootBit
+	aliceChannel, bobChannel := createAuxHtlcChannels(t, plainChanType, 1)
+
+	mockAuxSignerWithSigs(bobChannel, 0)
+
+	aliceNewCommit, err := aliceChannel.SignNextCommitment(ctxb)
+	require.NoError(t, err, "unable to sign commitment")
+
+	require.NoError(t, bobChannel.ReceiveNewCommitment(
+		aliceNewCommit.CommitSigs,
+	))
+}
+
+// TestAuxSigNotRequiredWithoutAuxSigner tests that an overlay channel on a node
+// with no aux signer configured still accepts commitments carrying no aux
+// signatures. Without a signer there is nothing that could consume them, so
+// demanding them would only strand the channel.
+func TestAuxSigNotRequiredWithoutAuxSigner(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel := createAuxHtlcChannels(
+		t, taprootOverlayChanType, 1,
+	)
+
+	bobChannel.auxSigner = fn.None[AuxSigner]()
+
+	aliceNewCommit, err := aliceChannel.SignNextCommitment(ctxb)
+	require.NoError(t, err, "unable to sign commitment")
+
+	require.NoError(t, bobChannel.ReceiveNewCommitment(
+		aliceNewCommit.CommitSigs,
+	))
+}
+
+// TestAuxSigRejectionFailsCommitment tests that when the aux signer rejects a
+// verification job, the new commitment is rejected as a whole. The count check
+// only establishes that a signature arrived for every HTLC; this is what makes
+// the aux signer's verdict on those signatures binding.
+func TestAuxSigRejectionFailsCommitment(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel := createAuxHtlcChannels(
+		t, taprootOverlayChanType, 1,
+	)
+
+	auxSigner := NewAuxSignerMock(EmptyMockJobHandler)
+	bobChannel.auxSigner = fn.Some[AuxSigner](auxSigner)
+
+	// The peer sends a well formed blob with one entry for the single
+	// HTLC, so the count check passes and the aux signer gets to weigh in
+	// on the signature itself. It rejects.
+	auxSigner.On("UnpackSigs", mock.Anything).Return(
+		fn.Ok([]fn.Option[tlv.Blob]{fn.Some(tlv.Blob{0x01})}),
+	)
+	auxSigner.On(
+		"VerifySecondLevelSigs", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(fmt.Errorf("second level sig verification failed"))
+
+	aliceNewCommit, err := aliceChannel.SignNextCommitment(ctxb)
+	require.NoError(t, err, "unable to sign commitment")
+
+	err = bobChannel.ReceiveNewCommitment(aliceNewCommit.CommitSigs)
+	require.ErrorContains(t, err, "unable to validate aux sigs")
+	require.ErrorContains(t, err, "second level sig verification failed")
 }
