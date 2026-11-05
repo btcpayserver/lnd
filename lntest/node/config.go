@@ -47,10 +47,6 @@ var (
 		"btcdexec", "", "full path to btcd binary",
 	)
 
-	// CfgLegacy specifies the config used to create a node that uses the
-	// legacy channel format.
-	CfgLegacy = []string{"--protocol.legacy.committweak"}
-
 	// CfgStaticRemoteKey specifies the config used to create a node that
 	// uses the static remote key feature.
 	CfgStaticRemoteKey = []string{}
@@ -73,7 +69,7 @@ var (
 		"--protocol.simple-taproot-chans",
 	}
 
-	// CfgRbfCoopClose specifies the config used to create a node that
+	// CfgRbfClose specifies the config used to create a node that
 	// supports the new RBF close protocol.
 	CfgRbfClose = []string{
 		"--protocol.rbf-coop-close",

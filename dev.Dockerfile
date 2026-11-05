@@ -1,12 +1,8 @@
 # If you change this please also update GO_VERSION in Makefile (then run
 # `make lint` to see where else it needs to be updated as well).
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.27.3-alpine AS builder
 
 LABEL maintainer="Olaoluwa Osuntokun <laolu@lightning.engineering>"
-
-# Force Go to use the cgo based DNS resolver. This is required to ensure DNS
-# queries required to connect to linked containers succeed.
-ENV GODEBUG netdns=cgo
 
 # Install dependencies.
 RUN apk add --no-cache --update alpine-sdk \
@@ -20,7 +16,7 @@ COPY . /go/src/github.com/lightningnetwork/lnd
 #  Install/build lnd.
 RUN cd /go/src/github.com/lightningnetwork/lnd \
     &&  make \
-    &&  make install-all tags="signrpc walletrpc chainrpc invoicesrpc peersrpc kvdb_sqlite"
+    &&  make release-install manpages
 
 # Start a new, final image to reduce size.
 FROM alpine AS final

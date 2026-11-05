@@ -1,6 +1,6 @@
 # builder pinned to the host platform: go cross-compiles via GOARCH, so arm
 # builds stay native-speed under buildx/QEMU instead of emulating the compile
-FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm as builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm as builder
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.

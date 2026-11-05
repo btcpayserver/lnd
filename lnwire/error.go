@@ -26,6 +26,18 @@ const (
 	// FundingOpen request for a channel that is above their current
 	// soft-limit.
 	ErrChanTooLarge FundingError = 2
+
+	// ErrChanTypeRequired is returned by a remote peer that receives a
+	// FundingOpen request which doesn't specify an explicit channel type,
+	// as mandated by BOLT-02.
+	ErrChanTypeRequired FundingError = 3
+
+	// ErrChanTypeDeprecated is returned by a remote peer that receives a
+	// FundingOpen request for the legacy commitment type, which it no
+	// longer opens. It is kept terse on purpose: which type the peer
+	// should use instead is our local policy, not something the remote can
+	// act on.
+	ErrChanTypeDeprecated FundingError = 4
 )
 
 // String returns a human readable version of the target FundingError.
@@ -35,6 +47,10 @@ func (e FundingError) String() string {
 		return "Number of pending channels exceed maximum"
 	case ErrChanTooLarge:
 		return "channel too large"
+	case ErrChanTypeRequired:
+		return "channel type required"
+	case ErrChanTypeDeprecated:
+		return "channel type deprecated"
 	default:
 		return "unknown error"
 	}

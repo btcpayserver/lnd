@@ -1,10 +1,21 @@
-# BTCPayServer LND 
+# BTCPayServer LND
 
 This repository is used to build LND Docker container images that are distributed with BTCPayServer by default.
 
 Docker images are published to https://hub.docker.com/r/btcpayserver/lnd/
 
 Versions:
+ - [0.21.6-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.6-beta-1/images/sha256-159795c4cbd9c698e9e8a4c483bc374c90fc7d867f37c9016f9e15d4a30cdbd1?context=repo)
+    - Includes 0.33.3-beta Loop
+    - Reaps the startup helper through tini to prevent zombie processes (btcpayserver/lnd#21)
+ - [0.21.6-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.6-beta/images/sha256-42714892377c56d8a9e309e77cd6fda639704d1ca84d0e03f5f2d14d3863edf8?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.5-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.5-beta/images/sha256-789055db6de10b227f37152cd2cf0488e35e61066b500c988f9b8e26adfc41c6?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.5-beta.rc1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.5-beta.rc1/images/sha256-b2d8472e021d69bb05f00249ece1e4d38a9caaf8bd497e390d46cfe7fc622c4e?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.3-beta-2](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta-2/images/sha256-ea1241a94fea814b98c4142639b02357c36c2ed238ee743c1125f3f7646d4375?context=repo)
+    - Includes 0.33.3-beta Loop
  - [0.21.3-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta-1/images/sha256-3ed36ae52c85385f40785aa94bfc6c55343a99aea7b297c66638445a3c4a722f?context=repo)
     - Adds RPCUSER_FILE support for file-based Bitcoin RPC passwords (btcpayserver/lnd#14)
  - [0.21.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta/images/sha256-348fcb4b52b03008b42f0b53ea84211456cf712cd1a9a7963634c904a7e2879a?context=repo)

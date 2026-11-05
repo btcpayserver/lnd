@@ -2312,9 +2312,11 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 			return nil, fmt.Errorf("use anchors for zero-conf")
 		}
 
+	// The legacy commitment type is no longer opened at all. Reject it here
+	// so the caller gets a clear error before we touch the wallet or the
+	// peer, rather than one from deep inside the funding flow.
 	case lnrpc.CommitmentType_LEGACY:
-		channelType = new(lnwire.ChannelType)
-		*channelType = lnwire.ChannelType(*lnwire.NewRawFeatureVector())
+		return nil, funding.ErrDeprecatedChanType
 
 	case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
 		channelType = new(lnwire.ChannelType)
@@ -2862,7 +2864,16 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 		numConfs := uint32(1)
 
 		go peer.WaitForChanToClose(
-			uint32(bestHeight), notifier, errChan, chanPoint,
+			uint32(bestHeight), notifier, func(err error) {
+				// Deliver without waiting, so that a reader
+				// that has already gone cannot hold up the
+				// notification.
+				select {
+				case errChan <- err:
+
+				default:
+				}
+			}, chanPoint,
 			&closingTxid, closingTx.TxOut[0].PkScript, numConfs,
 			func() {
 				// Respond to the local subsystem which
@@ -3024,7 +3035,9 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 			}
 
 			updateChan = closeUpdates.UpdateChan
-			errChan = closeUpdates.ErrChan
+			errChan = closeUpdates.ErrChan(
+				updateStream.Context(),
+			)
 		} else {
 			maxFee := chainfee.SatPerKVByte(
 				in.MaxFeePerVbyte * 1000,
@@ -4199,16 +4212,15 @@ func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceClose,
 				historical.ChanType,
 			)
 
-			// Get the number of forwarding packages from the
-			// historical channel.
-			fwdPkgs, err := historical.LoadFwdPkgs()
+			numFwdPkgs, err := historical.CountFwdPkgs()
 			if err != nil {
-				rpcsLog.Errorf("unable to load forwarding "+
+				rpcsLog.Errorf("unable to count forwarding "+
 					"packages for channel:%s, %v",
 					historical.ShortChannelID, err)
+
 				return nil, 0, err
 			}
-			channel.NumForwardingPackages = int64(len(fwdPkgs))
+			channel.NumForwardingPackages = int64(numFwdPkgs)
 
 			channel.RemoteBalance = int64(
 				historical.LocalCommitment.RemoteBalance.ToSatoshis(),
@@ -4398,11 +4410,12 @@ func (r *rpcServer) fetchWaitingCloseChannels(
 			)
 		}
 
-		fwdPkgs, err := waitingClose.LoadFwdPkgs()
+		numForwardingPackages, err := waitingClose.CountFwdPkgs()
 		if err != nil {
-			rpcsLog.Errorf("unable to load forwarding packages "+
+			rpcsLog.Errorf("unable to count forwarding packages "+
 				"for channel:%s, %v",
 				waitingClose.ShortChannelID, err)
+
 			return nil, 0, err
 		}
 
@@ -4447,7 +4460,7 @@ func (r *rpcServer) fetchWaitingCloseChannels(
 			CommitmentType: rpcCommitmentType(
 				waitingClose.ChanType,
 			),
-			NumForwardingPackages: int64(len(fwdPkgs)),
+			NumForwardingPackages: int64(numForwardingPackages),
 			ChanStatusFlags:       chanStatus.String(),
 			Private:               isPrivate(waitingClose),
 			Memo:                  string(waitingClose.Memo),

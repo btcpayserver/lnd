@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/clock"
@@ -123,11 +124,73 @@ type ChanClose struct {
 	// execution of the close channel request.
 	Updates chan interface{}
 
-	// Err is used by request creator to receive request execution error.
-	Err chan error
+	// Err is completed by whichever path ends this close, so that the
+	// request creator can learn how it ended. The promise is completed at
+	// most once, and a second writer is told it did not win: two paths
+	// racing to resolve one close cannot report two different outcomes to
+	// the same caller. Nothing blocks on completion, so a path that
+	// resolves the close cannot be held up by a creator that has stopped
+	// reading. A successful close is reported through Updates instead, so
+	// this is completed with a nil error only to end the request without
+	// an error.
+	Err actor.Promise[error]
 
 	// Ctx is a context linked to the lifetime of the caller.
 	Ctx context.Context //nolint:containedctx
+}
+
+// CompleteErr resolves this close request with err. Only the first completion
+// takes effect, so a close that several paths race to resolve reports exactly
+// one outcome, and completion never blocks. A request without a promise, or a
+// nil request, is a no-op.
+func (c *ChanClose) CompleteErr(err error) {
+	if c == nil || c.Err == nil {
+		return
+	}
+
+	actor.CompleteWith(c.Err, err)
+}
+
+// Done returns a channel that is closed when the caller's lifetime ends, or
+// nil when the request has no caller context. A request built without one is
+// not tied to any caller, so it never ends that way; a nil channel is exactly
+// that in a select, where the case simply never fires.
+func (c *ChanClose) Done() <-chan struct{} {
+	if c == nil || c.Ctx == nil {
+		return nil
+	}
+
+	return c.Ctx.Done()
+}
+
+// ErrChan returns a channel that carries the error this close request ended
+// with, and stays silent when it ends without one.
+//
+// It exists so that a caller which waits on channels sees no change: the
+// promise behind it is awaited on the caller's behalf, and only a non-nil
+// result is forwarded. A close that succeeds signals through Updates, so
+// nothing is sent here for it, and the channel is deliberately left open
+// rather than closed, because a closed channel would read as an immediate nil
+// error and cut a wait short before the close had finished.
+func (c *ChanClose) ErrChan(ctx context.Context) chan error {
+	errChan := make(chan error, 1)
+	if c == nil || c.Err == nil {
+		return errChan
+	}
+
+	go func() {
+		err, ctxErr := actor.AwaitFuture[error](ctx, c.Err.Future())
+
+		switch {
+		case ctxErr != nil:
+			errChan <- ctxErr
+
+		case err != nil:
+			errChan <- err
+		}
+	}()
+
+	return errChan
 }
 
 // Config defines the configuration for the service. ALL elements within the
@@ -165,6 +228,20 @@ type Config struct {
 	// active channels. This gives the switch the ability to read arbitrary
 	// forwarding packages, and ack settles and fails contained within them.
 	SwitchPackager channeldb.FwdOperator
+
+	// CheckFwdResponse reports whether a persisted off-chain response
+	// exists for the given outgoing circuit key.
+	CheckFwdResponse func(outKey *CircuitKey) error
+
+	// FetchFwdResponses returns all persisted off-chain responses.
+	FetchFwdResponses func() ([]*channeldb.FwdResponse, error)
+
+	// DeleteFwdResponse removes a persisted response from the store.
+	// Startup replay is its only caller; it reaps records whose circuit is
+	// already gone. Delivery itself does not delete the record. A delivered
+	// record is collected on the next startup, after its circuit has been
+	// torn down.
+	DeleteFwdResponse func(outKey *CircuitKey) error
 
 	// ExtractErrorEncrypter is an interface allowing switch to reextract
 	// error encrypters stored in the circuit map on restarts, since they
@@ -358,6 +435,19 @@ type Switch struct {
 
 // New creates the new instance of htlc switch.
 func New(cfg Config, currentHeight uint32) (*Switch, error) {
+	// These are dereferenced unconditionally during startup, so a missing
+	// one must fail here rather than panic mid-recovery.
+	switch {
+	case cfg.CheckFwdResponse == nil:
+		return nil, errors.New("forwarding response checker is nil")
+
+	case cfg.FetchFwdResponses == nil:
+		return nil, errors.New("forwarding response fetcher is nil")
+
+	case cfg.DeleteFwdResponse == nil:
+		return nil, errors.New("forwarding response deleter is nil")
+	}
+
 	resStore := newResolutionStore(cfg.DB)
 
 	circuitMap, err := NewCircuitMap(&CircuitMapConfig{
@@ -366,6 +456,7 @@ func New(cfg Config, currentHeight uint32) (*Switch, error) {
 		FetchClosedChannels:   cfg.FetchClosedChannels,
 		ExtractErrorEncrypter: cfg.ExtractErrorEncrypter,
 		CheckResolutionMsg:    resStore.checkResolutionMsg,
+		CheckFwdResponse:      cfg.CheckFwdResponse,
 	})
 	if err != nil {
 		return nil, err
@@ -1436,8 +1527,13 @@ func (s *Switch) CloseLink(ctx context.Context, chanPoint *wire.OutPoint,
 	deliveryScript lnwire.DeliveryAddress) (chan interface{}, chan error) {
 
 	// TODO(roasbeef) abstract out the close updates.
-	updateChan := make(chan interface{}, 2)
-	errChan := make(chan error, 1)
+	//
+	// The buffer holds the terminal update as well as a pending update from
+	// each side of the negotiation, so that a caller which has stopped
+	// reading cannot cause a close to block on delivering them.
+	updateChan := make(chan interface{}, 3)
+
+	errPromise := actor.NewPromise[error]()
 
 	command := &ChanClose{
 		CloseType:      closeType,
@@ -1445,19 +1541,19 @@ func (s *Switch) CloseLink(ctx context.Context, chanPoint *wire.OutPoint,
 		Updates:        updateChan,
 		TargetFeePerKw: targetFeePerKw,
 		DeliveryScript: deliveryScript,
-		Err:            errChan,
+		Err:            errPromise,
 		MaxFee:         maxFee,
 		Ctx:            ctx,
 	}
 
 	select {
 	case s.chanCloseRequests <- command:
-		return updateChan, errChan
+		return updateChan, command.ErrChan(ctx)
 
 	case <-s.quit:
-		errChan <- ErrSwitchExiting
+		actor.CompleteWith(errPromise, ErrSwitchExiting)
 		close(updateChan)
-		return updateChan, errChan
+		return updateChan, command.ErrChan(ctx)
 	}
 }
 
@@ -1567,8 +1663,8 @@ out:
 			if !ok {
 				s.indexMtx.RUnlock()
 
-				req.Err <- fmt.Errorf("no peer for channel with "+
-					"chan_id=%x", chanID[:])
+				req.CompleteErr(fmt.Errorf("no peer for "+
+					"channel with chan_id=%x", chanID[:]))
 				continue
 			}
 			s.indexMtx.RUnlock()
@@ -1787,6 +1883,17 @@ func (s *Switch) Start() error {
 		return err
 	}
 
+	// Process persisted off-chain responses before contract-court
+	// resolutions so the original wire message takes precedence when both
+	// stores contain an entry for the same circuit.
+	if err := s.reforwardFwdResponses(); err != nil {
+		// We are already stopping so we can ignore the error.
+		_ = s.Stop()
+		log.Errorf("unable to reforward persisted responses: %v", err)
+
+		return err
+	}
+
 	if err := s.reforwardResolutions(); err != nil {
 		// We are already stopping so we can ignore the error.
 		_ = s.Stop()
@@ -1795,6 +1902,57 @@ func (s *Switch) Start() error {
 	}
 
 	return nil
+}
+
+// fwdResponsePacket converts a persisted response into the packet shape
+// consumed by ForwardPackets. The packet has no destination reference because
+// package acknowledgement is handled by the persistence transition.
+func fwdResponsePacket(response *channeldb.FwdResponse) *htlcPacket {
+	return &htlcPacket{
+		outgoingChanID: response.OutKey.ChanID,
+		outgoingHTLCID: response.OutKey.HtlcID,
+		htlc:           response.Message,
+	}
+}
+
+// reforwardFwdResponses loads persisted off-chain responses during startup.
+// Entries without an open circuit are reaped in the same way as orphaned
+// resolution messages.
+func (s *Switch) reforwardFwdResponses() error {
+	responses, err := s.cfg.FetchFwdResponses()
+
+	// A decode or index error leaves recovery state uncertain. Abort
+	// startup rather than mistaking corruption for an empty response set.
+	if err != nil {
+		return fmt.Errorf("fetch persisted responses: %w", err)
+	}
+
+	switchPackets := make([]*htlcPacket, 0, len(responses))
+	for _, response := range responses {
+		outKey := response.OutKey
+
+		if s.circuits.LookupOpenCircuit(outKey) == nil {
+			log.Debugf("Reaping persisted response with no open "+
+				"circuit: %v", outKey)
+
+			err := s.cfg.DeleteFwdResponse(&outKey)
+			if err != nil {
+				return fmt.Errorf("reap response %v: %w",
+					outKey, err)
+			}
+
+			continue
+		}
+
+		switchPackets = append(
+			switchPackets, fwdResponsePacket(response),
+		)
+	}
+
+	log.Debugf("Reforwarding %d persisted responses",
+		len(switchPackets))
+
+	return s.ForwardPackets(nil, switchPackets...)
 }
 
 // reforwardResolutions fetches the set of resolution messages stored on-disk
@@ -3179,6 +3337,15 @@ func (s *Switch) handlePacketFail(packet *htlcPacket,
 	// If the source of this packet has not been set, use the circuit map
 	// to lookup the origin.
 	circuit, err := s.closeCircuit(packet)
+
+	// A competing response already closed the circuit but has not finished
+	// tearing it down. Treat this duplicate as the same benign no-op as the
+	// settle path does.
+	if errors.Is(err, ErrCircuitClosing) {
+		log.Debugf("Circuit is closing for packet=%v", packet)
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}

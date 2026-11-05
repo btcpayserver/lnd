@@ -20,6 +20,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -42,11 +43,13 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/stretchr/testify/require"
 )
 
@@ -276,6 +279,60 @@ func (m *mockZeroConfAcceptor) Accept(
 	}
 }
 
+// mockAuxFundingController records the aux channel state passed by the funding
+// manager.
+type mockAuxFundingController struct {
+	auxChanStates chan lnwallet.AuxChanState
+}
+
+// Name returns the name of the mock endpoint.
+func (m *mockAuxFundingController) Name() msgmux.EndpointName {
+	return "mock-aux-funding"
+}
+
+// CanHandle returns false as the mock does not handle any peer messages.
+func (m *mockAuxFundingController) CanHandle(msg msgmux.PeerMsg) bool {
+	return false
+}
+
+// SendMessage is a no-op that reports the message as not handled.
+func (m *mockAuxFundingController) SendMessage(_ context.Context,
+	msg msgmux.PeerMsg) bool {
+
+	return false
+}
+
+// DescFromPendingChanID records the aux channel state it was called with
+// and returns an empty funding descriptor.
+func (m *mockAuxFundingController) DescFromPendingChanID(pid PendingChanID,
+	openChan lnwallet.AuxChanState,
+	keyRing lntypes.Dual[lnwallet.CommitmentKeyRing],
+	initiator bool) AuxFundingDescResult {
+
+	m.auxChanStates <- openChan
+
+	return fn.Ok(fn.None[lnwallet.AuxFundingDesc]())
+}
+
+// DeriveTapscriptRoot returns no tapscript root.
+func (m *mockAuxFundingController) DeriveTapscriptRoot(
+	PendingChanID) AuxTapscriptResult {
+
+	return fn.Ok(fn.None[chainhash.Hash]())
+}
+
+// ChannelReady is a no-op.
+func (m *mockAuxFundingController) ChannelReady(
+	lnwallet.AuxChanState) error {
+
+	return nil
+}
+
+// ChannelFinalized is a no-op.
+func (m *mockAuxFundingController) ChannelFinalized(PendingChanID) error {
+	return nil
+}
+
 type newChannelMsg struct {
 	channel *lnpeer.NewChannel
 	err     chan error
@@ -410,6 +467,12 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 
 	netParams := fundingNetParams.Params
 	estimator := chainfee.NewStaticEstimator(62500, 0)
+
+	// Like a node running with the default config, cap the commitment fee
+	// rate of anchor channels at 10 sat/vbyte.
+	maxAnchorsCommitFeeRate := chainfee.SatPerVByte(
+		lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
+	).FeePerKWeight()
 
 	chainNotifier := &mockNotifier{
 		oneConfChannel:   make(chan *chainntnfs.TxConfirmation, 1),
@@ -570,6 +633,7 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		MaxChanSize:                   MaxBtcFundingAmount,
 		MaxLocalCSVDelay:              defaultMaxLocalCSVDelay,
 		MaxPendingChannels:            lncfg.DefaultMaxPendingChannels,
+		MaxAnchorsCommitFeeRate:       maxAnchorsCommitFeeRate,
 		NotifyOpenChannelEvent:        evt.NotifyOpenChannelEvent,
 		OpenChannelPredicate:          chainedAcceptor,
 		NotifyPendingOpenChannelEvent: evt.NotifyPendingOpenChannelEvent,
@@ -616,6 +680,17 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		shutdownChannel: shutdownChan,
 		reportScidChan:  reportScidChan,
 		addr:            addr,
+
+		// Default both sides to static remote key. Without any
+		// features at all these nodes used to negotiate the legacy
+		// commitment type, which we no longer open. Tests that care
+		// about a specific type overwrite these.
+		localFeatures: []lnwire.FeatureBit{
+			lnwire.StaticRemoteKeyOptional,
+		},
+		remoteFeatures: []lnwire.FeatureBit{
+			lnwire.StaticRemoteKeyOptional,
+		},
 	}
 
 	f.cfg.NotifyWhenOnline = func(peer [33]byte,
@@ -687,9 +762,10 @@ func recreateAliceFundingManager(t *testing.T, alice *testNode) {
 			FeeRate:       1000,
 			TimeLockDelta: 10,
 		},
-		DefaultMinHtlcIn:       5,
-		RequiredRemoteMaxValue: oldCfg.RequiredRemoteMaxValue,
-		ReportShortChanID:      oldCfg.ReportShortChanID,
+		DefaultMinHtlcIn:        5,
+		RequiredRemoteMaxValue:  oldCfg.RequiredRemoteMaxValue,
+		ReportShortChanID:       oldCfg.ReportShortChanID,
+		MaxAnchorsCommitFeeRate: oldCfg.MaxAnchorsCommitFeeRate,
 		PublishTransaction: func(txn *wire.MsgTx, _ string) error {
 			publishChan <- txn
 			return nil
@@ -1598,7 +1674,7 @@ func testNormalWorkflow(t *testing.T, chanType *lnwire.ChannelType) {
 	})
 
 	// If the channel type is set, then we need to make sure both parties
-	// support explicit channel type negotiation.
+	// support the features underlying that type.
 	if chanType != nil {
 		// Alice and Bob will have the same set of feature bits in our
 		// test.
@@ -1906,6 +1982,49 @@ func testLocalCSVLimit(t *testing.T, aliceMaxCSV, bobRequiredCSV uint16) {
 	case <-time.After(time.Second * 5):
 		t.Fatal("funding flow was not failed")
 	}
+}
+
+// TestFundingManagerFundeeReservationCleanup checks that the fundee releases
+// its wallet reservation when it declines an open_channel message.
+func TestFundingManagerFundeeReservationCleanup(t *testing.T) {
+	t.Parallel()
+
+	alice, bob := setupFundingManagers(t)
+	t.Cleanup(func() {
+		tearDownFundingManagers(t, alice, bob)
+	})
+
+	// Make Bob require a CSV delay above Alice's maximum, so that Alice
+	// declines the channel.
+	alice.fundingMgr.cfg.MaxLocalCSVDelay = 400
+	bob.fundingMgr.cfg.RequiredRemoteDelay = func(_ btcutil.Amount) uint16 {
+		return 500
+	}
+
+	initReq := &InitFundingMsg{
+		Peer:            alice,
+		TargetPubkey:    alice.privKey.PubKey(),
+		ChainHash:       *fundingNetParams.GenesisHash,
+		LocalFundingAmt: 200000,
+		FundingFeePerKw: 1000,
+		Updates:         make(chan *lnrpc.OpenStatusUpdate),
+		Err:             make(chan error, 1),
+	}
+	bob.fundingMgr.InitFundingWorkflow(initReq)
+
+	openChannelReq, ok := assertFundingMsgSent(
+		t, bob.msgChan, "OpenChannel",
+	).(*lnwire.OpenChannel)
+	require.True(t, ok)
+
+	alice.fundingMgr.ProcessFundingMsg(openChannelReq, bob)
+	assertFundingMsgSent(t, alice.msgChan, "Error")
+
+	// Alice must not have any reservations left in her wallet.
+	wallet := alice.fundingMgr.cfg.Wallet
+	require.Eventually(t, func() bool {
+		return len(wallet.ActiveReservations()) == 0
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 func TestFundingManagerRestartBehavior(t *testing.T) {
@@ -3147,12 +3266,122 @@ func TestFundingManagerPrivateRestart(t *testing.T) {
 	assertNoFwdingPolicy(t, alice, bob, channelReadyAlice.ChanID)
 }
 
+// TestFundingManagerAuxChanStatePsbt checks that the PSBT initiator path passes
+// the fully negotiated channel configs to the aux funding controller.
+func TestFundingManagerAuxChanStatePsbt(t *testing.T) {
+	t.Parallel()
+
+	auxController := &mockAuxFundingController{
+		auxChanStates: make(chan lnwallet.AuxChanState, 1),
+	}
+	alice, bob := setupFundingManagers(t, func(cfg *Config) {
+		cfg.AuxFundingController = fn.Some[AuxFundingController](
+			auxController,
+		)
+	})
+	t.Cleanup(func() {
+		tearDownFundingManagers(t, alice, bob)
+	})
+
+	const fundingAmt = btcutil.Amount(5_000_000)
+	updateChan := make(chan *lnrpc.OpenStatusUpdate, 1)
+	errChan := make(chan error, 1)
+	assembler := chanfunding.NewPsbtAssembler(
+		fundingAmt, nil, fundingNetParams.Params, false,
+	)
+	initReq := &InitFundingMsg{
+		Peer:            bob,
+		TargetPubkey:    bob.privKey.PubKey(),
+		ChainHash:       *fundingNetParams.GenesisHash,
+		LocalFundingAmt: fundingAmt,
+		ChanFunder:      assembler,
+		Updates:         updateChan,
+		Err:             errChan,
+	}
+
+	alice.fundingMgr.InitFundingWorkflow(initReq)
+	openChannel, ok := assertFundingMsgSent(
+		t, alice.msgChan, "OpenChannel",
+	).(*lnwire.OpenChannel)
+	require.True(t, ok)
+	bob.fundingMgr.ProcessFundingMsg(openChannel, alice)
+	acceptChannel, ok := assertFundingMsgSent(
+		t, bob.msgChan, "AcceptChannel",
+	).(*lnwire.AcceptChannel)
+	require.True(t, ok)
+	alice.fundingMgr.ProcessFundingMsg(acceptChannel, bob)
+
+	var psbtUpdate *lnrpc.ReadyForPsbtFunding
+	select {
+	case update := <-updateChan:
+		psbtFund, ok := update.Update.(*lnrpc.OpenStatusUpdate_PsbtFund)
+		require.True(t, ok)
+		psbtUpdate = psbtFund.PsbtFund
+
+	case err := <-errChan:
+		require.NoError(t, err)
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("PSBT funding update not received")
+	}
+
+	packet, err := psbt.NewFromRawBytes(
+		bytes.NewReader(psbtUpdate.Psbt), false,
+	)
+	require.NoError(t, err)
+	packet.UnsignedTx.TxIn = []*wire.TxIn{{
+		PreviousOutPoint: wire.OutPoint{Index: 0},
+	}}
+	packet.Inputs = []psbt.PInput{{
+		WitnessUtxo: &wire.TxOut{
+			Value:    int64(fundingAmt + 1),
+			PkScript: append([]byte{0, 20}, make([]byte, 20)...),
+		},
+	}}
+
+	resCtx, err := alice.fundingMgr.getReservationCtx(
+		bobPubKey, openChannel.PendingChannelID,
+	)
+	require.NoError(t, err)
+	localCfg := *resCtx.reservation.OurContribution().ChannelConfig
+	remoteCfg := *resCtx.reservation.TheirContribution().ChannelConfig
+
+	err = alice.fundingMgr.cfg.Wallet.PsbtFundingVerify(
+		openChannel.PendingChannelID, packet, false,
+	)
+	require.NoError(t, err)
+
+	// Finalizing separately ensures verification, including the reserved
+	// value check, completes before the funding manager resumes.
+	packet.UnsignedTx.TxIn[0].Witness = wire.TxWitness{[]byte{1}}
+	err = alice.fundingMgr.cfg.Wallet.PsbtFundingFinalize(
+		openChannel.PendingChannelID, nil, packet.UnsignedTx,
+	)
+	require.NoError(t, err)
+
+	select {
+	case auxState := <-auxController.auxChanStates:
+		require.Equal(t, localCfg, auxState.LocalChanCfg)
+		require.Equal(t, remoteCfg, auxState.RemoteChanCfg)
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("aux funding controller was not called")
+	}
+}
+
 // TestFundingManagerCustomChannelParameters checks that custom requirements we
 // specify during the channel funding flow is preserved correctly on both sides.
 func TestFundingManagerCustomChannelParameters(t *testing.T) {
 	t.Parallel()
 
-	alice, bob := setupFundingManagers(t)
+	auxController := &mockAuxFundingController{
+		auxChanStates: make(chan lnwallet.AuxChanState, 2),
+	}
+	alice, bob := setupFundingManagers(t, func(cfg *Config) {
+		cfg.AuxFundingController = fn.Some[AuxFundingController](
+			auxController,
+		)
+	})
 	t.Cleanup(func() {
 		tearDownFundingManagers(t, alice, bob)
 	})
@@ -3287,6 +3516,23 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 		t, alice.msgChan, "FundingCreated",
 	).(*lnwire.FundingCreated)
 
+	// Helper method for checking that the aux funding controller received
+	// the negotiated channel configs of both parties.
+	assertAuxChanState := func(localCfg,
+		remoteCfg channeldb.ChannelConfig) {
+
+		t.Helper()
+
+		select {
+		case auxState := <-auxController.auxChanStates:
+			require.Equal(t, localCfg, auxState.LocalChanCfg)
+			require.Equal(t, remoteCfg, auxState.RemoteChanCfg)
+
+		case <-time.After(time.Second * 5):
+			t.Fatalf("aux funding controller was not called")
+		}
+	}
+
 	// Helper method for checking the CSV delay stored for a reservation.
 	assertDelay := func(resCtx *reservationWithCtx,
 		ourDelay, theirDelay uint16) error {
@@ -3416,8 +3662,18 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Snapshot the negotiated configs before resuming the funding flow.
+	// The aux controller must receive exactly these values even though
+	// they have not yet been copied into the pending channel state.
+	localCfg := *resCtx.reservation.OurContribution().ChannelConfig
+	remoteCfg := *resCtx.reservation.TheirContribution().ChannelConfig
+
 	// Give the message to Bob.
 	bob.fundingMgr.ProcessFundingMsg(fundingCreated, alice)
+
+	// Bob's aux funding controller must have been handed the negotiated
+	// configs as part of the aux channel state.
+	assertAuxChanState(localCfg, remoteCfg)
 
 	// Finally, Bob should send the FundingSigned message.
 	fundingSigned := assertFundingMsgSent(
@@ -5009,6 +5265,477 @@ func TestFundingManagerNoEchoChanType(t *testing.T) {
 	acceptChanMsg.ChannelType = nil
 	alice.fundingMgr.ProcessFundingMsg(acceptChanMsg, bob)
 	assertFundingMsgSent(t, alice.msgChan, "Error")
+}
+
+// TestFundingManagerRejectMissingChanType verifies that the fundee rejects an
+// OpenChannel message that omits the ChannelType field.
+func TestFundingManagerRejectMissingChanType(t *testing.T) {
+	t.Parallel()
+
+	alice, bob := setupFundingManagers(t)
+	t.Cleanup(func() {
+		tearDownFundingManagers(t, alice, bob)
+	})
+
+	// Build an OpenChannel with the ChannelType field omitted.
+	openChannelReq := &lnwire.OpenChannel{
+		ChainHash:            *fundingNetParams.GenesisHash,
+		PendingChannelID:     [32]byte{0x01},
+		FundingAmount:        btcutil.Amount(10000000),
+		PushAmount:           0,
+		DustLimit:            btcutil.Amount(546),
+		MaxValueInFlight:     lnwire.MilliSatoshi(100000000),
+		ChannelReserve:       btcutil.Amount(10000),
+		HtlcMinimum:          lnwire.MilliSatoshi(1000),
+		FeePerKiloWeight:     15000,
+		CsvDelay:             144,
+		MaxAcceptedHTLCs:     483,
+		FundingKey:           alice.privKey.PubKey(),
+		RevocationPoint:      alice.privKey.PubKey(),
+		PaymentPoint:         alice.privKey.PubKey(),
+		DelayedPaymentPoint:  alice.privKey.PubKey(),
+		HtlcPoint:            alice.privKey.PubKey(),
+		FirstCommitmentPoint: alice.privKey.PubKey(),
+		ChannelType:          nil,
+	}
+	bob.fundingMgr.ProcessFundingMsg(openChannelReq, alice)
+
+	// Bob should reject the OpenChannel message with an Error.
+	errMsg := assertFundingMsgSent(t, bob.msgChan, "Error")
+	err, ok := errMsg.(*lnwire.Error)
+	require.True(t, ok)
+	require.Equal(t, lnwire.ErrChanTypeRequired.Error(), string(err.Data))
+	assertNumPendingReservations(t, bob, alicePubKey, 0)
+}
+
+// TestFundingManagerRejectLegacyChanType verifies that the fundee rejects an
+// OpenChannel message carrying an empty ChannelType, which asks for the legacy
+// commitment type.
+//
+// This branch used to perform no feature check whatsoever, since the legacy
+// type predates feature bits entirely, so any peer could obtain a legacy
+// channel from us no matter what either side signalled.
+func TestFundingManagerRejectLegacyChanType(t *testing.T) {
+	t.Parallel()
+
+	alice, bob := setupFundingManagers(t)
+	t.Cleanup(func() {
+		tearDownFundingManagers(t, alice, bob)
+	})
+
+	// Both peers support better than the legacy type, which is exactly the
+	// case that used to slip through.
+	featureBits := []lnwire.FeatureBit{
+		lnwire.StaticRemoteKeyOptional,
+		lnwire.AnchorsZeroFeeHtlcTxOptional,
+	}
+	alice.localFeatures = featureBits
+	alice.remoteFeatures = featureBits
+	bob.localFeatures = featureBits
+	bob.remoteFeatures = featureBits
+
+	emptyChanType := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector())
+
+	openChannelReq := &lnwire.OpenChannel{
+		ChainHash:            *fundingNetParams.GenesisHash,
+		PendingChannelID:     [32]byte{0x01},
+		FundingAmount:        btcutil.Amount(10000000),
+		PushAmount:           0,
+		DustLimit:            btcutil.Amount(546),
+		MaxValueInFlight:     lnwire.MilliSatoshi(100000000),
+		ChannelReserve:       btcutil.Amount(10000),
+		HtlcMinimum:          lnwire.MilliSatoshi(1000),
+		FeePerKiloWeight:     15000,
+		CsvDelay:             144,
+		MaxAcceptedHTLCs:     483,
+		FundingKey:           alice.privKey.PubKey(),
+		RevocationPoint:      alice.privKey.PubKey(),
+		PaymentPoint:         alice.privKey.PubKey(),
+		DelayedPaymentPoint:  alice.privKey.PubKey(),
+		HtlcPoint:            alice.privKey.PubKey(),
+		FirstCommitmentPoint: alice.privKey.PubKey(),
+		ChannelType:          emptyChanType,
+	}
+	bob.fundingMgr.ProcessFundingMsg(openChannelReq, alice)
+
+	// Bob should reject the OpenChannel message instead of echoing the
+	// empty channel type back in an AcceptChannel.
+	errMsg := assertFundingMsgSent(t, bob.msgChan, "Error")
+	err, ok := errMsg.(*lnwire.Error)
+	require.True(t, ok)
+	require.Equal(t, lnwire.ErrChanTypeDeprecated.Error(), string(err.Data))
+	assertNumPendingReservations(t, bob, alicePubKey, 0)
+}
+
+// TestFundingManagerAcceptChanType verifies that the fundee accepts an
+// OpenChannel message that includes the ChannelType field and echoes it back
+// in AcceptChannel, even when neither peer advertises the explicit channel
+// type feature bit.
+func TestFundingManagerAcceptChanType(t *testing.T) {
+	t.Parallel()
+
+	alice, bob := setupFundingManagers(t)
+	t.Cleanup(func() {
+		tearDownFundingManagers(t, alice, bob)
+	})
+
+	// Set up only the features underlying the requested channel type.
+	featureBits := []lnwire.FeatureBit{
+		lnwire.StaticRemoteKeyOptional,
+		lnwire.AnchorsZeroFeeHtlcTxOptional,
+	}
+	alice.localFeatures = featureBits
+	alice.remoteFeatures = featureBits
+	bob.localFeatures = featureBits
+	bob.remoteFeatures = featureBits
+
+	expectedChanType := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector(
+		lnwire.StaticRemoteKeyRequired,
+		lnwire.AnchorsZeroFeeHtlcTxRequired,
+	))
+
+	// Build an OpenChannel with the ChannelType field properly set.
+	openChannelReq := &lnwire.OpenChannel{
+		ChainHash:            *fundingNetParams.GenesisHash,
+		PendingChannelID:     [32]byte{0x01},
+		FundingAmount:        btcutil.Amount(10000000),
+		PushAmount:           0,
+		DustLimit:            btcutil.Amount(546),
+		MaxValueInFlight:     lnwire.MilliSatoshi(100000000),
+		ChannelReserve:       btcutil.Amount(10000),
+		HtlcMinimum:          lnwire.MilliSatoshi(1000),
+		FeePerKiloWeight:     15000,
+		CsvDelay:             144,
+		MaxAcceptedHTLCs:     483,
+		FundingKey:           alice.privKey.PubKey(),
+		RevocationPoint:      alice.privKey.PubKey(),
+		PaymentPoint:         alice.privKey.PubKey(),
+		DelayedPaymentPoint:  alice.privKey.PubKey(),
+		HtlcPoint:            alice.privKey.PubKey(),
+		FirstCommitmentPoint: alice.privKey.PubKey(),
+		ChannelType:          expectedChanType,
+	}
+	bob.fundingMgr.ProcessFundingMsg(openChannelReq, alice)
+
+	// Bob should accept the OpenChannel message and send AcceptChannel.
+	acceptChannelResponse, ok := assertFundingMsgSent(
+		t, bob.msgChan, "AcceptChannel",
+	).(*lnwire.AcceptChannel)
+	require.True(t, ok)
+
+	// Verify the channel type is echoed back.
+	require.Equal(t, expectedChanType, acceptChannelResponse.ChannelType)
+
+	// Bob should have a new pending reservation.
+	assertNumPendingReservations(t, bob, alicePubKey, 1)
+}
+
+// countingAcceptor is a channel acceptor that accepts every channel and counts
+// how often it's consulted.
+type countingAcceptor struct {
+	calls atomic.Int32
+}
+
+// Accept counts the call and accepts the channel with our default parameters.
+//
+// NOTE: This is part of the chanacceptor.ChannelAcceptor interface.
+func (c *countingAcceptor) Accept(
+	*acpt.ChannelAcceptRequest) *acpt.ChannelAcceptResponse {
+
+	c.calls.Add(1)
+
+	return &acpt.ChannelAcceptResponse{}
+}
+
+// TestFundingManagerCommitFeeRateFloor checks that the fundee rejects an
+// OpenChannel message proposing a commitment fee rate below the floor that the
+// channel state machine enforces for every later commitment, without
+// consulting the channel acceptor, and accepts one at or above the floor.
+func TestFundingManagerCommitFeeRateFloor(t *testing.T) {
+	t.Parallel()
+
+	staticRemoteKey := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector(
+		lnwire.StaticRemoteKeyRequired,
+	))
+	anchors := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector(
+		lnwire.StaticRemoteKeyRequired,
+		lnwire.AnchorsZeroFeeHtlcTxRequired,
+	))
+
+	floor := chainfee.FeePerKwFloor
+
+	// newOpenChannel returns an otherwise valid OpenChannel message from
+	// Alice that proposes the given channel type and commitment fee rate.
+	newOpenChannel := func(chanType *lnwire.ChannelType,
+		feeRate chainfee.SatPerKWeight) *lnwire.OpenChannel {
+
+		return &lnwire.OpenChannel{
+			ChainHash:            *fundingNetParams.GenesisHash,
+			PendingChannelID:     [32]byte{0x01},
+			FundingAmount:        btcutil.Amount(10000000),
+			DustLimit:            btcutil.Amount(546),
+			MaxValueInFlight:     lnwire.MilliSatoshi(100000000),
+			ChannelReserve:       btcutil.Amount(10000),
+			HtlcMinimum:          lnwire.MilliSatoshi(1000),
+			FeePerKiloWeight:     uint32(feeRate),
+			CsvDelay:             144,
+			MaxAcceptedHTLCs:     483,
+			FundingKey:           alicePubKey,
+			RevocationPoint:      alicePubKey,
+			PaymentPoint:         alicePubKey,
+			DelayedPaymentPoint:  alicePubKey,
+			HtlcPoint:            alicePubKey,
+			FirstCommitmentPoint: alicePubKey,
+			ChannelType:          chanType,
+		}
+	}
+
+	testCases := []struct {
+		name     string
+		chanType *lnwire.ChannelType
+		feeRate  chainfee.SatPerKWeight
+		accept   bool
+	}{
+		{
+			name:     "zero",
+			chanType: staticRemoteKey,
+			feeRate:  0,
+		},
+		{
+			name:     "one",
+			chanType: staticRemoteKey,
+			feeRate:  1,
+		},
+		{
+			// A max-commit-fee-rate-anchors of 1 sat/vbyte
+			// converts to this rate.
+			name:     "one sat per vbyte",
+			chanType: staticRemoteKey,
+			feeRate:  chainfee.SatPerVByte(1).FeePerKWeight(),
+		},
+		{
+			name:     "just below the floor",
+			chanType: staticRemoteKey,
+			feeRate:  floor - 1,
+		},
+		{
+			name:     "at the floor",
+			chanType: staticRemoteKey,
+			feeRate:  floor,
+			accept:   true,
+		},
+		{
+			name:     "above the floor",
+			chanType: staticRemoteKey,
+			feeRate:  floor + 1,
+			accept:   true,
+		},
+		{
+			// The zero-fee HTLC transactions of anchor channels
+			// don't exempt the commitment transaction.
+			name:     "anchors just below the floor",
+			chanType: anchors,
+			feeRate:  floor - 1,
+		},
+		{
+			name:     "anchors at the floor",
+			chanType: anchors,
+			feeRate:  floor,
+			accept:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			acceptor := &countingAcceptor{}
+			useAcceptor := func(cfg *Config) {
+				cfg.OpenChannelPredicate = acceptor
+			}
+
+			alice, bob := setupFundingManagers(t, useAcceptor)
+			t.Cleanup(func() {
+				tearDownFundingManagers(t, alice, bob)
+			})
+
+			// Both peers support anchors, so the static remote key
+			// channel type explicitly asks for a channel without
+			// anchor outputs.
+			featureBits := []lnwire.FeatureBit{
+				lnwire.StaticRemoteKeyOptional,
+				lnwire.AnchorsZeroFeeHtlcTxOptional,
+			}
+			alice.localFeatures = featureBits
+			alice.remoteFeatures = featureBits
+			bob.localFeatures = featureBits
+			bob.remoteFeatures = featureBits
+
+			openChannelReq := newOpenChannel(
+				tc.chanType, tc.feeRate,
+			)
+			bob.fundingMgr.ProcessFundingMsg(openChannelReq, alice)
+
+			if tc.accept {
+				assertFundingMsgSent(
+					t, bob.msgChan, "AcceptChannel",
+				)
+				assertNumPendingReservations(
+					t, bob, alicePubKey, 1,
+				)
+				require.EqualValues(t, 1, acceptor.calls.Load())
+
+				return
+			}
+
+			// Bob should reject the channel with an error naming
+			// the fee rate, without consulting his channel acceptor
+			// or creating a reservation.
+			errMsg, ok := assertFundingMsgSent(
+				t, bob.msgChan, "Error",
+			).(*lnwire.Error)
+			require.True(t, ok)
+
+			expectedErr := lnwallet.ErrCommitFeeRateTooLow(
+				tc.feeRate, floor,
+			)
+			require.Equal(
+				t, expectedErr.Error(), string(errMsg.Data),
+			)
+
+			pendingChanID := lnwire.ChannelID(
+				openChannelReq.PendingChannelID,
+			)
+			require.Equal(t, pendingChanID, errMsg.ChanID)
+			require.Zero(t, acceptor.calls.Load())
+			assertNumPendingReservations(t, bob, alicePubKey, 0)
+		})
+	}
+}
+
+// TestFundingManagerProposedCommitFeeRate checks the commitment fee rate that
+// the initiator proposes: the fee estimate, capped for anchor channels, but
+// never below the floor. The fundee should store the proposed rate unchanged.
+func TestFundingManagerProposedCommitFeeRate(t *testing.T) {
+	t.Parallel()
+
+	staticRemoteKey := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector(
+		lnwire.StaticRemoteKeyRequired,
+	))
+	anchors := (*lnwire.ChannelType)(lnwire.NewRawFeatureVector(
+		lnwire.StaticRemoteKeyRequired,
+		lnwire.AnchorsZeroFeeHtlcTxRequired,
+	))
+
+	floor := chainfee.FeePerKwFloor
+
+	// A max-commit-fee-rate-anchors of 1 sat/vbyte converts to a cap below
+	// the floor.
+	lowCap := chainfee.SatPerVByte(1).FeePerKWeight()
+
+	// assertCommitFeeRate asserts that both commitments of the node's only
+	// pending channel use the given fee rate.
+	assertCommitFeeRate := func(t *testing.T, node *testNode,
+		feeRate chainfee.SatPerKWeight) {
+
+		t.Helper()
+
+		db := node.fundingMgr.cfg.Wallet.Cfg.Database
+		channels, err := db.FetchPendingChannels()
+		require.NoError(t, err)
+		require.Len(t, channels, 1)
+
+		channel := channels[0]
+		require.Equal(
+			t, btcutil.Amount(feeRate),
+			channel.LocalCommitment.FeePerKw,
+		)
+		require.Equal(
+			t, btcutil.Amount(feeRate),
+			channel.RemoteCommitment.FeePerKw,
+		)
+	}
+
+	testCases := []struct {
+		name       string
+		chanType   *lnwire.ChannelType
+		estimate   chainfee.SatPerKWeight
+		anchorsCap chainfee.SatPerKWeight
+		expected   chainfee.SatPerKWeight
+	}{
+		{
+			name:       "anchors capped",
+			chanType:   anchors,
+			estimate:   62500,
+			anchorsCap: 2500,
+			expected:   2500,
+		},
+		{
+			name:       "anchors cap below floor",
+			chanType:   anchors,
+			estimate:   62500,
+			anchorsCap: lowCap,
+			expected:   floor,
+		},
+		{
+			name:       "anchors estimate below floor",
+			chanType:   anchors,
+			estimate:   floor - 1,
+			anchorsCap: 2500,
+			expected:   floor,
+		},
+		{
+			name:       "static remote key ignores anchors cap",
+			chanType:   staticRemoteKey,
+			estimate:   62500,
+			anchorsCap: 2500,
+			expected:   62500,
+		},
+		{
+			name:       "static remote key estimate below floor",
+			chanType:   staticRemoteKey,
+			estimate:   floor - 1,
+			anchorsCap: 2500,
+			expected:   floor,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			estimator := chainfee.NewStaticEstimator(
+				tc.estimate, 0,
+			)
+			setFeePolicy := func(cfg *Config) {
+				cfg.FeeEstimator = estimator
+				cfg.MaxAnchorsCommitFeeRate = tc.anchorsCap
+			}
+
+			alice, bob := setupFundingManagers(t, setFeePolicy)
+			t.Cleanup(func() {
+				tearDownFundingManagers(t, alice, bob)
+			})
+
+			featureBits := []lnwire.FeatureBit{
+				lnwire.StaticRemoteKeyOptional,
+				lnwire.AnchorsZeroFeeHtlcTxOptional,
+			}
+			alice.localFeatures = featureBits
+			alice.remoteFeatures = featureBits
+			bob.localFeatures = featureBits
+			bob.remoteFeatures = featureBits
+
+			updateChan := make(chan *lnrpc.OpenStatusUpdate)
+			openChannel(
+				t, alice, bob, 500000, 0, 1, updateChan, true,
+				tc.chanType,
+			)
+
+			assertCommitFeeRate(t, alice, tc.expected)
+			assertCommitFeeRate(t, bob, tc.expected)
+		})
+	}
 }
 
 // TestFundingManagerZeroConf tests that the fundingmanager properly handles
