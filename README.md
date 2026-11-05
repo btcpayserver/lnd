@@ -1,101 +1,82 @@
-## Lightning Network Daemon
+# BTCPayServer LND
 
-[![Release build](https://github.com/lightningnetwork/lnd/actions/workflows/release.yaml/badge.svg)](https://github.com/lightningnetwork/lnd/actions/workflows/release.yaml)
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/lightningnetwork/lnd/blob/master/LICENSE)
-[![Irc](https://img.shields.io/badge/chat-on%20libera-brightgreen.svg)](https://web.libera.chat/#lnd)
-[![Godoc](https://godoc.org/github.com/lightningnetwork/lnd?status.svg)](https://godoc.org/github.com/lightningnetwork/lnd)
-[![Go Report Card](https://goreportcard.com/badge/github.com/lightningnetwork/lnd)](https://goreportcard.com/report/github.com/lightningnetwork/lnd)
+This repository is used to build LND Docker container images that are distributed with BTCPayServer by default.
 
-<img src="logo.png">
+Docker images are published to https://hub.docker.com/r/btcpayserver/lnd/
 
-The Lightning Network Daemon (`lnd`) - is a complete implementation of a
-[Lightning Network](https://lightning.network) node.  `lnd` has several pluggable back-end
-chain services including [`btcd`](https://github.com/btcsuite/btcd) (a
-full-node), [`bitcoind`](https://github.com/bitcoin/bitcoin), and
-[`neutrino`](https://github.com/lightninglabs/neutrino) (a new experimental light client). The project's codebase uses the
-[btcsuite](https://github.com/btcsuite/) set of Bitcoin libraries, and also
-exports a large set of isolated re-usable Lightning Network related libraries
-within it.  In the current state `lnd` is capable of:
-* Creating channels.
-* Closing channels.
-* Completely managing all channel states (including the exceptional ones!).
-* Maintaining a fully authenticated+validated channel graph.
-* Performing path finding within the network, passively forwarding incoming payments.
-* Sending outgoing [onion-encrypted payments](https://github.com/lightningnetwork/lightning-onion)
-through the network.
-* Updating advertised fee schedules.
-* Automatic channel management ([`autopilot`](https://github.com/lightningnetwork/lnd/tree/master/autopilot)).
+Versions:
+ - [0.21.6-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.6-beta-1/images/sha256-159795c4cbd9c698e9e8a4c483bc374c90fc7d867f37c9016f9e15d4a30cdbd1?context=repo)
+    - Includes 0.33.3-beta Loop
+    - Reaps the startup helper through tini to prevent zombie processes (btcpayserver/lnd#21)
+ - [0.21.6-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.6-beta/images/sha256-42714892377c56d8a9e309e77cd6fda639704d1ca84d0e03f5f2d14d3863edf8?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.5-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.5-beta/images/sha256-789055db6de10b227f37152cd2cf0488e35e61066b500c988f9b8e26adfc41c6?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.5-beta.rc1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.5-beta.rc1/images/sha256-b2d8472e021d69bb05f00249ece1e4d38a9caaf8bd497e390d46cfe7fc622c4e?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.3-beta-2](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta-2/images/sha256-ea1241a94fea814b98c4142639b02357c36c2ed238ee743c1125f3f7646d4375?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.3-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta-1/images/sha256-3ed36ae52c85385f40785aa94bfc6c55343a99aea7b297c66638445a3c4a722f?context=repo)
+    - Adds RPCUSER_FILE support for file-based Bitcoin RPC passwords (btcpayserver/lnd#14)
+ - [0.21.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.3-beta/images/sha256-348fcb4b52b03008b42f0b53ea84211456cf712cd1a9a7963634c904a7e2879a?context=repo)
+    - Includes 0.33.3-beta Loop
+    - Wallets are migrated off the shared default password to a per-instance random password
+ - [0.21.2-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.2-beta/images/sha256-809977c805455196dc6f9334ac4ee666002cc244eb5b58224a0d6c2d167f0afc?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.1-beta/images/sha256-cac93abe645c6bf4bca2c9c7118bd089976c1d6c08045f922775a31864165a6c?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.21.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.21.0-beta/images/sha256-70de68dc14e34826f25496f6ec294b096b294698670e2ecc8555e0790e7383e5?context=repo)
+    - Includes 0.33.3-beta Loop
+ - [0.19.3-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.19.3-beta-1/images/sha256-d5f1cb925128d2fd9cd5454b4e2e2a8dff28d8def6018827349ae07d8fe386c6?context=repo)
+    - Includes 0.31.2-beta Loop
+ - [0.19.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.19.1-beta/images/sha256-d56f6e57794ebc4aa0119e5ec91b1aa076ceaa324cad0d816cbf282fb0a3a2d0?context=repo)
+    - Includes 0.29.0-beta Loop
+ - [0.18.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.3-beta/images/sha256-513ddd55a5af44a14e27110ee14cb28f1c7a69205bcaa2fba4e66275c1f725e5?context=repo)
+    - Includes 0.28.7-beta Loop
+    - [Fix for lnd unlock password \n problem](https://github.com/btcpayserver/lnd/pull/7)
+ - [0.18.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.1-beta/images/sha256-5fbfa76a218ab59bf9206485f4c0c071a525f9f0906255a5672054741d043b79?context=repo)
+    - Includes 0.28.5-beta Loop
+ - [0.18.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.18.0-beta/images/sha256-e6043dddf0bdbd5c740e882447c441b37f87f2c736ebb08747a4aff5e100d9bf?context=repo)
+    - Includes 0.28.2-beta Loop
+ - [0.17.4-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.4-beta/images/sha256-b62ecff5ca71d37f9b4846f35b4d86ddc4faa3fc1dd0618ae9221d99f47708bd?context=explore)
+    - Includes 0.26.6-beta Loop
+ - [0.17.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.3-beta/images/sha256-141611de6c062835e9513dd1ec4155c779d7a7b55258eb1fe06e228b0835fa56?context=repo)
+    - Includes 0.26.6-beta Loop
+ - [0.17.2-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.2-beta/images/sha256-936767369b703a67daf6db6a008a3b53c15f407d29a7ad2327a0de28f5951b30?context=explore)
+    - Includes 0.26.5-beta Loop
+ - [0.17.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.1-beta/images/sha256-b5c106136bd33a422463c736a1db8bd3541f95ac6f277dae86ab2a01b0c3445a?context=explore)
+    - Includes 0.26.5-beta Loop
+ - [0.17.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.0-beta/images/sha256-58b98f983cd786bcb4d48ea8586144cafd44d58dc3018e26bfbfcf875f495368?context=explore)
+    - Includes 0.26.4-beta Loop
+ - [0.17.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.17.0-beta/images/sha256-58b98f983cd786bcb4d48ea8586144cafd44d58dc3018e26bfbfcf875f495368?context=explore)
+    - Includes 0.26.4-beta Loop
+ - [0.16.4-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.16.4-beta-1/images/sha256-9dd204b62d6c892485b3dd8a76e8f48545ceda5702c9d47329ba4bcbc535a8b4?context=explore)
+ - [0.16.3-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.16.3-beta/images/sha256-9ff34769378cfca18664c7d1da3747e7ad7fb7f38a9a7b82a3d4f85e5bfef7bf?context=explore)
+ - [0.16.2-beta-1](https://hub.docker.com/layers/btcpayserver/lnd/v0.16.2-beta-1/images/sha256-bfff9de84a0a4af9d643ff555125358861b70374976b970cc00d1e7fc44ed520?context=explore)
+ - [0.16.1-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.16.0-beta/images/sha256-f0eb70c20691aaa2ffc34fd5bd6c284299c84e96152cda5e46882a3aa4a3c6a2?context=explore)
+ - [0.16.0-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.16.0-beta/images/sha256-f0eb70c20691aaa2ffc34fd5bd6c284299c84e96152cda5e46882a3aa4a3c6a2?context=explore)
+ - [0.15.4-beta](https://hub.docker.com/layers/btcpayserver/lnd/v0.15.4-beta-1/images/sha256-cadbbff93cf36146e24fa4f32170b4b9d278a2e1acfdc50470790a94506ee9c3?context=explore)
+ - [Other versions are tagged](https://github.com/btcpayserver/lnd/tags), but obsoleted and not supported.
+    - All LND versions prior to 0.15.4 contain a consensus bug that prevents them from properly parsing transactions with more than 500,000 witness items per input (https://github.com/btcsuite/btcd/issues/1906)
+    - All LND versions prior to 0.15.2 contain a bug that prevents them from properly parsing Taproot transactions with script size over 11000 bytes (https://github.com/lightningnetwork/lnd/issues/7002)
+    - LND version 0.14.0-beta shipped with check that made it incompatable with c-lightning and eclair (https://github.com/lightningnetwork/lnd/issues/5890)
+    - All LND versions prior to 0.13.3 contain specification-level vulnerability (https://lists.linuxfoundation.org/pipermail/lightning-dev/2021-October/003257.html)
+    - All LND versions prior to 0.7 contain critical vulnerability (https://lists.linuxfoundation.org/pipermail/lightning-dev/2019-September/002174.html)
 
-## Lightning Network Specification Compliance
-`lnd` _fully_ conforms to the [Lightning Network specification
-(BOLTs)](https://github.com/lightningnetwork/lightning-rfc). BOLT stands for:
-Basis of Lightning Technology. The specifications are currently being drafted
-by several groups of implementers based around the world including the
-developers of `lnd`. The set of specification documents as well as our
-implementation of the specification are still a work-in-progress. With that
-said, the current status of `lnd`'s BOLT compliance is:
+Each version is marked with appropriate `basedon-vX.X.X-beta` tags. We are using `basedon` prefix in order not to conflict with LND tags from source repository.
 
-  - [X] BOLT 1: Base Protocol
-  - [X] BOLT 2: Peer Protocol for Channel Management
-  - [X] BOLT 3: Bitcoin Transaction and Script Formats
-  - [X] BOLT 4: Onion Routing Protocol
-  - [X] BOLT 5: Recommendations for On-chain Transaction Handling
-  - [X] BOLT 7: P2P Node and Channel Discovery
-  - [X] BOLT 8: Encrypted and Authenticated Transport
-  - [X] BOLT 9: Assigned Feature Flags
-  - [X] BOLT 10: DNS Bootstrap and Assisted Node Location
-  - [X] BOLT 11: Invoice Protocol for Lightning Payments
+## Updating LND version in BTCPay Server
 
-## Developer Resources
+Follow the [LND maintenance procedure](https://github.com/btcpayserver/image-maintenance/blob/master/docs/lnd.md)
+in [image-maintenance](https://github.com/btcpayserver/image-maintenance) for
+upstream bumps, patch preservation, image publication and downstream validation.
+Start maintenance agents from that repository so they load the shared instructions.
 
-The daemon has been designed to be as developer friendly as possible in order
-to facilitate application development on top of `lnd`. Two primary RPC
-interfaces are exported: an HTTP REST API, and a [gRPC](https://grpc.io/)
-service. The exported APIs are not yet stable, so be warned: they may change
-drastically in the near future.
+## Source repository
 
-An automatically generated set of documentation for the RPC APIs can be found
-at [api.lightning.community](https://api.lightning.community). A set of developer
-resources including guides, articles, example applications and community resources can be found at:
-[docs.lightning.engineering](https://docs.lightning.engineering).
+https://github.com/lightningnetwork/lnd
 
-Finally, we also have an active
-[Slack](https://lightning.engineering/slack.html) where protocol developers, application developers, testers and users gather to
-discuss various aspects of `lnd` and also Lightning in general.
-
-First-time contributors are [highly encouraged to start with code review
-first](docs/review.md), before creating their own Pull Requests.
-
-## Installation
-  In order to build from source, please see [the installation
-  instructions](docs/INSTALL.md).
-
-## Docker
-  To run lnd from Docker, please see the main [Docker instructions](docs/DOCKER.md)
-
-## IRC
-  * irc.libera.chat
-  * channel #lnd
-  * [webchat](https://web.libera.chat/#lnd)
-
-## Safety
-
-When operating a mainnet `lnd` node, please refer to our [operational safety
-guidelines](docs/safety.md). It is important to note that `lnd` is still
-**beta** software and that ignoring these operational guidelines can lead to
-loss of funds.
-
-## Security
-
-The developers of `lnd` take security _very_ seriously. The disclosure of
-security vulnerabilities helps us secure the health of `lnd`, privacy of our
-users, and also the health of the Lightning Network as a whole.  If you find
-any issues regarding security or privacy, please disclose the information
-responsibly by sending an email to security at lightning dot engineering,
-preferably encrypted using our designated PGP key
-(`91FE464CD75101DA6B6BAB60555C6465E5BCB3AF`) which can be found
-[here](https://gist.githubusercontent.com/Roasbeef/6fb5b52886183239e4aa558f83d085d3/raw/1ecb328bbcf36f76ead67f08008f8db1da07e60e/security@lightning.engineering).
-
-## Further reading
-* [Step-by-step send payment guide with docker](https://github.com/lightningnetwork/lnd/tree/master/docker)
-* [Contribution guide](https://github.com/lightningnetwork/lnd/blob/master/docs/code_contribution_guidelines.md)
+## Links
+* [BTCPayServer main repo](https://github.com/btcpayserver/btcpayserver)
+* [BTCPayServer-Docker repo](https://github.com/btcpayserver/btcpayserver-docker)
+* [BTCPayServer.Lightning](https://github.com/btcpayserver/BTCPayServer.Lightning)
