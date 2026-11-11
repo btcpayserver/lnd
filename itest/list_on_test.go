@@ -11,6 +11,10 @@ import (
 
 var allTestCases = []*lntest.TestCase{
 	{
+		Name:     "link failure force close",
+		TestFunc: testLinkFailureForceClose,
+	},
+	{
 		Name:     "update channel status",
 		TestFunc: testUpdateChanStatus,
 	},
@@ -33,6 +37,10 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "data loss protection",
 		TestFunc: testDataLossProtection,
+	},
+	{
+		Name:     "breach conf hint isolated by script",
+		TestFunc: testBreachConfHintPoisonedByFakeFunding,
 	},
 	{
 		Name:     "send all coins",

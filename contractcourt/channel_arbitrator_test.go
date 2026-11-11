@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -27,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 	"github.com/stretchr/testify/require"
 )
 
@@ -3594,6 +3596,8 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 		expectedState ArbitratorState
 
 		expectedStartup bool
+
+		synchronousRestart bool
 	}{
 		{
 			name: "Commitment is rejected because of low mempool " +
@@ -3603,11 +3607,18 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 			expectedStartup: true,
 		},
 		{
-			// We map a rejected rbf transaction to ErrDoubleSpend
-			// in lnd.
-			name: "Commitment is rejected because of a " +
-				"rbf transaction not succeeding",
+			name: "Commitment is rejected because it is " +
+				"already spent",
 			broadcastErr:    lnwallet.ErrDoubleSpend,
+			expectedState:   StateCommitmentBroadcasted,
+			expectedStartup: true,
+		},
+		{
+			// The wallet returns ErrInsufficientFee when another
+			// commitment is already in the mempool.
+			name: "Commitment replacement pays " +
+				"insufficient fee",
+			broadcastErr:    chain.ErrInsufficientFee,
 			expectedState:   StateCommitmentBroadcasted,
 			expectedStartup: true,
 		},
@@ -3622,14 +3633,20 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 			expectedStartup: true,
 		},
 
-		// We started after the DLP was triggered, and try to force
-		// close. This is rejected as we can't force close with local
-		// data loss. We should still be able to start up however.
+		// A restored channel restarts after its force-close state was
+		// persisted. The restored shell returns the local-data-loss
+		// sentinel because it has no commitment to broadcast. Startup
+		// must leave the arbitrator waiting for the remote close.
 		{
-			name:            "ignore force close local data loss",
-			forceCloseErr:   lnwallet.ErrForceCloseLocalDataLoss,
-			expectedState:   StateBroadcastCommit,
-			expectedStartup: true,
+			name: "restored channel waits for remote close " +
+				"after restart",
+			forceCloseErr: fmt.Errorf(
+				"restored channel: %w",
+				lnwallet.ErrForceCloseLocalDataLoss,
+			),
+			expectedState:      StateBroadcastCommit,
+			expectedStartup:    true,
+			synchronousRestart: true,
 		},
 	}
 
@@ -3663,6 +3680,17 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 			)
 
 			chanArb := chanArbCtx.chanArb
+
+			if test.synchronousRestart {
+				chanArb.state = test.expectedState
+				err = chanArb.progressStateMachineAfterRestart(
+					0, nil,
+				)
+				require.NoError(t, err)
+				chanArbCtx.AssertState(test.expectedState)
+
+				return
+			}
 
 			// Customize the PublishTx function of the arbitrator.
 			chanArb.cfg.PublishTx = func(*wire.MsgTx,
@@ -3759,4 +3787,115 @@ func newBeatFromHeight(height int32) *chainio.Beat {
 	}
 
 	return chainio.NewBeat(epoch)
+}
+
+// TestChannelArbitratorAMPPreimageAvailable asserts that the channel
+// arbitrator goes on-chain to claim an incoming AMP HTLC once the invoice
+// registry has settled it. AMP HTLCs are paid to a child hash and their
+// invoices have no invoice-level preimage, so neither the preimage cache nor
+// the invoice lookup by hash can find the preimage.
+func TestChannelArbitratorAMPPreimageAvailable(t *testing.T) {
+	t.Parallel()
+
+	const (
+		broadcastDelta = 10
+		expiry         = 200
+		height         = expiry - broadcastDelta
+	)
+
+	setID := [32]byte{1}
+	preimage := lntypes.Preimage{2}
+	knownPreimage := lntypes.Preimage{4}
+
+	registry := &mockRegistry{}
+	witnessBeacon := newMockWitnessBeacon()
+	witnessBeacon.lookupPreimage[knownPreimage.Hash()] = knownPreimage
+	onionProcessor := &mockOnionProcessor{
+		isExit: true,
+		amp:    record.NewAMP([32]byte{3}, setID, 0),
+	}
+	chanArb := &ChannelArbitrator{
+		cfg: ChannelArbitratorConfig{
+			ChainArbitratorConfig: ChainArbitratorConfig{
+				PreimageDB:             witnessBeacon,
+				Registry:               registry,
+				OnionProcessor:         onionProcessor,
+				IncomingBroadcastDelta: broadcastDelta,
+				OutgoingBroadcastDelta: broadcastDelta,
+			},
+		},
+	}
+
+	htlc := channeldb.HTLC{
+		RHash:         preimage.Hash(),
+		Incoming:      true,
+		RefundTimeout: expiry,
+		OutputIndex:   0,
+	}
+	htlcs := newHtlcSet([]channeldb.HTLC{htlc})
+
+	// Before the HTLC enters its broadcast window, there is no reason to
+	// decode its onion to look for an AMP preimage.
+	actions, err := chanArb.checkCommitChainActions(
+		height-1, chainTrigger, htlcs,
+	)
+	require.NoError(t, err)
+	require.Empty(t, actions)
+	require.Nil(t, onionProcessor.offeredOnionBlob)
+
+	// While the AMP set isn't settled, there is nothing to claim and we
+	// must not go on-chain.
+	actions, err = chanArb.checkCommitChainActions(
+		height, chainTrigger, htlcs,
+	)
+	require.NoError(t, err)
+	require.Empty(t, actions)
+	require.NotNil(t, onionProcessor.offeredOnionBlob)
+
+	// A failed AMP lookup must not block another HTLC whose preimage is
+	// already known.
+	knownHtlc := channeldb.HTLC{
+		RHash:         knownPreimage.Hash(),
+		Incoming:      true,
+		RefundTimeout: expiry,
+		OutputIndex:   1,
+		HtlcIndex:     1,
+	}
+	htlcs = newHtlcSet([]channeldb.HTLC{htlc, knownHtlc})
+
+	registry.ampLookupErr = errors.New("lookup failed")
+	actions, err = chanArb.checkCommitChainActions(
+		height, chainTrigger, htlcs,
+	)
+	require.NoError(t, err)
+	require.Len(t, actions[HtlcIncomingWatchAction], 2)
+
+	// Once the lookup recovers and the registry has settled the AMP HTLC,
+	// the next block evaluation must take action for it even without the
+	// unrelated HTLC.
+	registry.ampLookupErr = nil
+	registry.ampPreimages = map[[32]byte][]lntypes.Preimage{
+		setID: {preimage},
+	}
+	htlcs = newHtlcSet([]channeldb.HTLC{htlc})
+	actions, err = chanArb.checkCommitChainActions(
+		height, chainTrigger, htlcs,
+	)
+	require.NoError(t, err)
+	require.Len(t, actions[HtlcIncomingWatchAction], 1)
+	require.Equal(t, preimage.Hash(),
+		lntypes.Hash(actions[HtlcIncomingWatchAction][0].RHash))
+
+	// The invoice registry only answers for HTLCs offered to us. An
+	// outgoing HTLC must not be claimed with an AMP child preimage, even if
+	// its payload decodes as an exit AMP hop whose child preimage the
+	// registry released.
+	outgoing := htlc
+	outgoing.Incoming = false
+	onionProcessor.offeredOnionBlob = nil
+
+	available, err := chanArb.incomingPreimageAvailable(outgoing)
+	require.NoError(t, err)
+	require.False(t, available)
+	require.Nil(t, onionProcessor.offeredOnionBlob)
 }

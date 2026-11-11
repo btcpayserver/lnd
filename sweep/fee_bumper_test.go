@@ -2,6 +2,7 @@ package sweep
 
 import (
 	"fmt"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1076,13 +1077,13 @@ func TestBroadcast(t *testing.T) {
 	require.Equal(t, req, record.req)
 }
 
-// TestBroadcastImmediate checks the public `Broadcast` method can successfully
-// register a broadcast request and publish the tx when `Immediate` flag is
-// set.
+// TestBroadcastImmediate checks immediate requests initialize synchronously
+// and preserve fatal errors that occur before mempool acceptance.
 func TestBroadcastImmediate(t *testing.T) {
 	t.Parallel()
 
-	// Create a publisher using the mocks.
+	// Arrange an immediate request whose estimator fails before a candidate
+	// reaches the backend, separating local failure from RPC uncertainty.
 	tp, m := createTestPublisher(t)
 
 	// Create a test feerate.
@@ -1101,24 +1102,188 @@ func TestBroadcastImmediate(t *testing.T) {
 		Immediate:       true,
 	}
 
-	// Mock the fee estimator to return an error.
-	//
-	// NOTE: We are not testing `handleInitialBroadcast` here, but only
-	// interested in checking that this method is indeed called when
-	// `Immediate` is true. Thus we mock the method to return an error to
-	// quickly abort. As long as this mocked method is called, we know the
-	// `Immediate` flag works.
+	// Estimation is the first initialization step; no backend call is
+	// expected when it fails, and fixture cleanup verifies the sole call.
 	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
 		chainfee.SatPerKWeight(0), errDummy).Once()
 
-	// Send the req and expect no error.
+	// Act through the public interface without starting block processing;
+	// the immediate flag must deliver the initialization outcome now.
 	resultChan := tp.Broadcast(req)
 	require.NotNil(t, resultChan)
 
-	// Validate the record was removed due to an error returned in initial
-	// broadcast.
+	// Assert that local initialization failure stays fatal and removes its
+	// request rather than entering the backend-error retry path. Bound the
+	// receive so missing delivery fails before the suite timeout.
+	var result *BumpResult
+	select {
+	case result = <-resultChan:
+
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for initial broadcast result")
+	}
+
+	require.Equal(t, TxFatal, result.Event)
+	require.ErrorIs(t, result.Err, errDummy)
 	require.Empty(t, tp.records.Len())
 	require.Empty(t, tp.subscriberChans.Len())
+}
+
+// TestBroadcastRetryMempoolErrors checks backend uncertainty and transient
+// policy rejections return retry metadata even at the fee ceiling.
+func TestBroadcastRetryMempoolErrors(t *testing.T) {
+	t.Parallel()
+
+	// Arrange an unknown reason and recognized reversible policy
+	// failures; only the final case varies the available fee headroom.
+	unknownErr := fmt.Errorf("%w: unknown rejection", chain.ErrUndefined)
+	testCases := []struct {
+		name      string
+		err       error
+		atCeiling bool
+	}{
+		{
+			name: "unknown rejection",
+			err:  unknownErr,
+		},
+		{
+			name: "RPC transport failure",
+			err:  io.EOF,
+		},
+		{
+			name: "mempool full",
+			err:  chain.ErrMempoolFull,
+		},
+		{
+			name: "mempool chain limit",
+			err:  chain.ErrMempoolChainTooLong,
+		},
+		{
+			name: "replacement count limit",
+			err:  chain.ErrTooManyReplacements,
+		},
+		{
+			name: "replacement unconfirmed input",
+			err:  chain.ErrReplacementAddsUnconfirmed,
+		},
+		{
+			name: "unconfirmed conflicting spend",
+			err:  chain.ErrMempoolConflict,
+		},
+		{
+			name:      "unknown rejection at fee ceiling",
+			err:       unknownErr,
+			atCeiling: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange one funded singleton and an explicit starting
+			// rate so the fee function needs no estimator calls.
+			tp, m := createTestPublisher(t)
+			inp := createTestInput(100_000, input.WitnessKeyHash)
+			feeRate := chainfee.SatPerKWeight(1000)
+			maxFeeRate := feeRate * 10
+			deadline := int32(10)
+
+			// A one-block deadline initializes directly at the cap.
+			// This checks retry metadata. A distant capped start
+			// still takes the zero-delta path, which permits
+			// re-estimation on the next block.
+			if tc.atCeiling {
+				deadline = 1
+			}
+			req := &BumpRequest{
+				DeliveryAddress: changePkScript,
+				Inputs:          []input.Input{&inp},
+				Budget:          btcutil.Amount(10_000),
+				MaxFeeRate:      maxFeeRate,
+				StartingFeeRate: fn.Some(feeRate),
+				DeadlineHeight:  deadline,
+				Immediate:       true,
+			}
+			m.signer.On(
+				"ComputeInputScript",
+				mock.Anything, mock.Anything,
+			).Return(&input.Script{}, nil).Once()
+			m.wallet.On(
+				"CheckMempoolAcceptance", mock.Anything,
+			).Return(tc.err).Once()
+
+			// Act with one public broadcast; the failed acceptance
+			// must return without trying to publish the candidate.
+			resultChan := tp.Broadcast(req)
+
+			// Assert retry preserves cause and next fee, keeping
+			// the cap when no further increase is possible. Bound
+			// missing delivery so a regression fails promptly.
+			var result *BumpResult
+			select {
+			case result = <-resultChan:
+
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for retry result")
+			}
+
+			require.Equal(t, TxFailed, result.Event)
+			require.ErrorIs(t, result.Err, tc.err)
+			if tc.atCeiling {
+				require.Equal(t, maxFeeRate, result.FeeRate)
+			} else {
+				require.Greater(t, result.FeeRate, feeRate)
+			}
+		})
+	}
+}
+
+// TestBroadcastAlreadyInMempool checks an accepted initial transaction reaches
+// publication so the existing tracking path can continue managing its inputs.
+func TestBroadcastAlreadyInMempool(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a funded immediate request with an explicit rate, isolating
+	// acceptance handling from estimation. The wallet wraps its sentinel,
+	// as the acceptance adapter does before returning to the publisher.
+	tp, m := createTestPublisher(t)
+	inp := createTestInput(100_000, input.WitnessKeyHash)
+	feeRate := chainfee.SatPerKWeight(1000)
+	req := &BumpRequest{
+		DeliveryAddress: changePkScript,
+		Inputs:          []input.Input{&inp},
+		Budget:          btcutil.Amount(10_000),
+		MaxFeeRate:      feeRate * 10,
+		StartingFeeRate: fn.Some(feeRate),
+		DeadlineHeight:  10,
+		Immediate:       true,
+	}
+	acceptanceErr := fmt.Errorf("check: %w", chain.ErrTxAlreadyInMempool)
+	m.signer.On(
+		"ComputeInputScript", mock.Anything, mock.Anything,
+	).Return(&input.Script{}, nil).Once()
+	m.wallet.On(
+		"CheckMempoolAcceptance", mock.Anything,
+	).Return(acceptanceErr).Once()
+	m.wallet.On(
+		"PublishTransaction", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	// Act through the public immediate interface; an already accepted
+	// candidate must still reach idempotent publication and registration.
+	resultChan := tp.Broadcast(req)
+
+	// Assert the public result keeps the transaction managed instead of
+	// reporting a fatal rejection. Fixture cleanup verifies publication was
+	// called once; bounded delivery exposes notification regressions.
+	select {
+	case result := <-resultChan:
+		require.Equal(t, TxPublished, result.Event)
+		require.NoError(t, result.Err)
+		require.NotNil(t, result.Tx)
+
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for already accepted broadcast result")
+	}
 }
 
 // TestCreateAndPublishFail checks all the error cases are handled properly in
@@ -1887,7 +2052,8 @@ func TestHandleInitialBroadcastSuccess(t *testing.T) {
 func TestHandleInitialBroadcastFail(t *testing.T) {
 	t.Parallel()
 
-	// Create a publisher using the mocks.
+	// Arrange a permanent script rejection followed by a publication
+	// failure, keeping their different terminal/retry outcomes explicit.
 	tp, m := createTestPublisher(t)
 
 	// Create a test feerate.
@@ -1920,13 +2086,18 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 	// Signer check and always assume the tx has a valid sig.
 	script := &input.Script{}
 	m.signer.On("ComputeInputScript", mock.Anything,
-		mock.Anything).Return(script, nil)
+		mock.Anything).Return(script, nil).Twice()
 
-	// Mock the testmempoolaccept to return an error.
+	// Both attempts reach acceptance, but only the second can publish.
+	// Fixture cleanup verifies each required call exactly once.
 	m.wallet.On("CheckMempoolAcceptance",
-		mock.Anything).Return(errDummy).Once()
+		mock.Anything).Return(chain.ErrScriptVerifyFlag).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("PublishTransaction",
+		mock.Anything, mock.Anything).Return(errDummy).Once()
 
-	// Register the testing record use `Broadcast`.
+	// Act by registering a deferred request and driving its first attempt
+	// directly, so no background block processing is needed.
 	resultChan := tp.Broadcast(req)
 
 	// Grab the monitor record from the map.
@@ -1938,33 +2109,104 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 	tp.wg.Add(1)
 	tp.handleInitialBroadcast(rec)
 
-	// Check the result is sent back.
+	// Assert recognized script failure remains fatal rather than being
+	// normalized as backend uncertainty, and its record is removed.
 	select {
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for subscriber to receive result")
 
 	case result := <-resultChan:
-		// We expect the first result to be TxFatal.
 		require.Equal(t, TxFatal, result.Event)
+		require.ErrorIs(t, result.Err, chain.ErrScriptVerifyFlag)
 	}
 
 	// Validate the record was NOT stored.
 	require.Equal(t, 0, tp.records.Len())
 	require.Equal(t, 0, tp.subscriberChans.Len())
 
-	// Mock the testmempoolaccept again, this time it passes.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
-
-	// Mock the wallet to fail on publish.
-	m.wallet.On("PublishTransaction",
-		mock.Anything, mock.Anything).Return(errDummy).Once()
-
-	// Register the testing record use `Broadcast`.
+	// Act with the separately arranged accepted candidate whose publication
+	// fails, exercising the existing retry contract after acceptance.
 	resultChan = tp.Broadcast(req)
 
 	// Grab the monitor record from the map.
 	rid = tp.requestCounter.Load()
 	rec, ok = tp.records.Load(rid)
+	require.True(t, ok)
+
+	// Call the method under test.
+	tp.wg.Add(1)
+	tp.handleInitialBroadcast(rec)
+
+	// Assert publication still returns the original retryable error and
+	// releases this attempt's monitoring records for later re-offering.
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for subscriber to receive result")
+
+	case result := <-resultChan:
+		// We expect the result to be TxFailed and the error is set in
+		// the result.
+		require.Equal(t, TxFailed, result.Event)
+		require.ErrorIs(t, result.Err, errDummy)
+	}
+
+	// Validate the record was removed.
+	require.Equal(t, 0, tp.records.Len())
+	require.Equal(t, 0, tp.subscriberChans.Len())
+}
+
+// TestHandleInitialBroadcastTxTooLarge tests that when the initial tx is
+// rejected for exceeding the standardness weight limit, a TxFailed event is
+// sent back so the inputs can be retried, instead of a TxFatal event.
+func TestHandleInitialBroadcastTxTooLarge(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create a test feerate.
+	feerate := chainfee.SatPerKWeight(1000)
+
+	// Create a test request.
+	inp := createTestInput(1000, input.WitnessKeyHash)
+
+	// Create a testing bump request.
+	req := &BumpRequest{
+		DeliveryAddress: changePkScript,
+		Inputs:          []input.Input{&inp},
+		Budget:          btcutil.Amount(1000),
+		MaxFeeRate:      feerate * 10,
+		DeadlineHeight:  10,
+	}
+
+	// Mock the fee estimator to return the testing fee rate.
+	//
+	// We are not testing `NewLinearFeeFunction` here, so the actual params
+	// used are irrelevant.
+	m.estimator.On("EstimateFeePerKW", mock.Anything).Return(
+		feerate, nil).Once()
+	m.estimator.On("RelayFeePerKW").Return(chainfee.FeePerKwFloor).Once()
+
+	// Mock the signer to always return a valid script.
+	//
+	// NOTE: we are not testing the utility of creating valid txes here, so
+	// this is fine to be mocked. This behaves essentially as skipping the
+	// Signer check and always assume the tx has a valid sig.
+	script := &input.Script{}
+	m.signer.On("ComputeInputScript", mock.Anything,
+		mock.Anything).Return(script, nil)
+
+	// Mock the testmempoolaccept to reject the tx for exceeding the
+	// standardness weight limit.
+	m.wallet.On("CheckMempoolAcceptance",
+		mock.Anything).Return(chain.ErrTxTooLarge).Once()
+
+	// Register the testing record use `Broadcast`.
+	resultChan := tp.Broadcast(req)
+
+	// Grab the monitor record from the map.
+	rid := tp.requestCounter.Load()
+	rec, ok := tp.records.Load(rid)
 	require.True(t, ok)
 
 	// Call the method under test.
@@ -1977,10 +2219,11 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 		t.Fatal("timeout waiting for subscriber to receive result")
 
 	case result := <-resultChan:
-		// We expect the result to be TxFailed and the error is set in
-		// the result.
+		// We expect a TxFailed event so the inputs are retried, with
+		// the current fee rate attached for the next attempt.
 		require.Equal(t, TxFailed, result.Event)
-		require.ErrorIs(t, result.Err, errDummy)
+		require.ErrorIs(t, result.Err, chain.ErrTxTooLarge)
+		require.Equal(t, feerate, result.FeeRate)
 	}
 
 	// Validate the record was removed.
@@ -2085,13 +2328,81 @@ func TestHasInputsSpent(t *testing.T) {
 	}
 
 	// Call the method under test.
-	result := tp.getSpentInputs(record)
+	result, err := tp.getSpentInputs(record)
+	require.NoError(t, err)
 
 	// Assert the expected map is created.
 	expected := map[wire.OutPoint]*wire.MsgTx{
 		op1: spendingTx1,
 	}
 	require.Equal(t, expected, result)
+}
+
+// TestSpendNotificationFailure ensures failed checks never classify inputs.
+func TestSpendNotificationFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		closed bool
+	}{
+		{name: "registration", err: fmt.Errorf("registration failed")},
+		{
+			name: "shutdown",
+			err:  chainntnfs.ErrChainNotifierShuttingDown,
+		},
+		{
+			name: "closed", closed: true,
+			err: chainntnfs.ErrChainNotifierShuttingDown,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, m := createTestPublisher(t)
+			req := createTestBumpRequest()
+			op := req.Inputs[0].OutPoint()
+			var event *chainntnfs.SpendEvent
+			err := tc.err
+			if tc.closed {
+				spends := make(chan *chainntnfs.SpendDetail)
+				close(spends)
+				event = &chainntnfs.SpendEvent{
+					Spend: spends, Cancel: func() {},
+				}
+				err = nil
+			}
+			m.notifier.On("RegisterSpendNtfn", &op, mock.Anything,
+				mock.Anything).Return(event, err).Twice()
+			r := &monitorRecord{requestID: 1, req: req}
+			result := tp.handleMissingInputs(r)
+			require.Equal(t, TxFailed, result.Event)
+			if tc.closed {
+				require.ErrorContains(t, result.Err, "closed")
+			} else {
+				require.ErrorIs(t, result.Err, tc.err)
+			}
+
+			// An inconclusive check during record processing must
+			// not stop a broadcast record from being fee bumped.
+			r.tx = &wire.MsgTx{LockTime: 1}
+			r.feeFunction = m.feeFunc
+
+			bumped := make(chan struct{})
+			m.feeFunc.On("IncreaseFeeRate", mock.Anything).Run(
+				func(mock.Arguments) { close(bumped) },
+			).Return(false, nil).Once()
+
+			tp.records.Store(r.requestID, r)
+			tp.processRecords()
+
+			select {
+			case <-bumped:
+			case <-time.After(time.Second):
+				t.Fatal("record was not fee bumped")
+			}
+
+			_, found := tp.records.Load(r.requestID)
+			require.True(t, found)
+		})
+	}
 }
 
 // createTestSpendEvent creates a SpendEvent which places the specified tx in

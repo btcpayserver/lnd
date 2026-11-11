@@ -6,7 +6,7 @@ if [[ "$1" == "lnd" ]]; then
 
     # removing noseedbackup=1 flag, adding it below if needed for legacy
     LND_EXTRA_ARGS=${LND_EXTRA_ARGS/noseedbackup=1/}
-    
+
 	cat <<-EOF > "$LND_DATA/lnd.conf"
 	${LND_EXTRA_ARGS}
     listen=0.0.0.0:${LND_PORT}
