@@ -27,7 +27,7 @@ WORKDIR /go/src/github.com/lightninglabs/loop/cmd
 
 RUN go install ./...
 # eof
-    
+
 
 # Force the builder machine to take make an arm runtime image. This is fine as long as the builder does not run any program
 FROM --platform=linux/arm/v7 arm32v7/debian:bookworm-slim as final
